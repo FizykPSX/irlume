@@ -2538,8 +2538,10 @@ fn doctor() -> std::process::ExitCode {
     // prompt; wiring pam_irlume into polkit-1 is what lets a face satisfy it.
     // Bitwarden's polkit action file doubles as the tell that the user expects
     // biometric unlock to work (its flatpak/snap can't install it themselves).
-    let bitwarden_action =
-        std::path::Path::new("/usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy").exists();
+    // Counts both the filename Bitwarden's own setup writes AND the one snapd
+    // installs for a snap; keying on only the former made doctor tell snap users
+    // to run `bitwarden setup`, which then refuses (snapd owns that file).
+    let bitwarden_action = bitwarden::action_present();
     // The consent gesture is a head NOD by default (no calibration). Only the
     // opt-in closure gesture needs a per-user calibration; wired-but-uncalibrated
     // then silently falls to the password on every polkit prompt.
@@ -2611,10 +2613,26 @@ fn doctor() -> std::process::ExitCode {
     // pam-auth-update on Debian) and dropped irlume's lines. Face still falls
     // back to the password, so this is not a lockout, but face login silently
     // stopped working. Surface it with the one-command fix.
-    let enrolled = matches!(
-        daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }),
-        Ok(irlume_common::Response::Enrollment { ref profiles, .. }) if !profiles.is_empty()
-    );
+    let (enrolled, ir_depth_floored) =
+        match daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }) {
+            Ok(irlume_common::Response::Enrollment {
+                ref profiles,
+                ir_depth_floored,
+                ..
+            }) => (!profiles.is_empty(), ir_depth_floored),
+            _ => (false, false),
+        };
+    // An IR enrollment made before the per-user depth floor existed carries no
+    // recorded IR depth, so the personalized anti-print 3D-structure check never
+    // engages (new IR enrollments fit it automatically). Nudge a re-enroll to
+    // activate it. Secure/IR hardware only, and only when actually enrolled.
+    if enrolled && !ir_depth_floored && irlume_camera::capabilities().ir_pair {
+        println!(
+            "[doctor] {user}'s face enrollment predates the per-user IR depth floor (an\n     \
+             anti-print 3D-structure check that new IR enrollments fit automatically).\n     \
+             Re-enroll to activate it: the TUI Profiles tab, or `sudo irlume enroll`."
+        );
+    }
     if enrolled && !crate::pamwire::login_wired() {
         println!(
             "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \
@@ -2622,6 +2640,19 @@ fn doctor() -> std::process::ExitCode {
              PAM stacks. The irlume-reconcile.path unit re-applies this automatically\n     \
              once login was enabled; if it persists, re-wire with:\n     \
              sudo irlume login enable --apply"
+        );
+    }
+    // A brand-new or renamed display manager irlume has no PAM mapping for:
+    // `login enable` can't target it, so face login there quietly stays on the
+    // password no matter how the reconcile self-heal runs. `active_display_manager`
+    // still resolves the symlink, so name the DM and point at the tracker; adding
+    // one line to dm_pam_services is all support takes.
+    if let Some((dm, false)) = crate::pamwire::active_dm_recognized() {
+        println!(
+            "[doctor] ⚠ the active display manager '{dm}' is not recognized by irlume,\n     \
+             so face login cannot be wired for it (your password still works). This is\n     \
+             usually a display manager that is new, or was renamed by an update. Please\n     \
+             report it at https://github.com/archledger/irlume/issues so we can add it."
         );
     }
     // authselect / pam-auth-update awareness: on hosts where a distro tool owns

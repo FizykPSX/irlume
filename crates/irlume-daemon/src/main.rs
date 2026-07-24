@@ -273,7 +273,19 @@ fn main() {
                 eprintln!("irlumed: socket restricted to root:irlume (0660)");
             }
         }
-        None => set_mode(&socket, 0o666),
+        None => {
+            // No `irlume` group: the socket is world-connectable. Privileged ops
+            // still require the peer-credential check, but the unprivileged
+            // endpoints (health tier, self-scoped identify) are now open to any
+            // local uid. A normal packaged install creates the group; warn loudly
+            // so a hand-rolled deployment notices it skipped that step.
+            eprintln!(
+                "irlumed: WARNING: no `irlume` group; socket left world-connectable (0666). \
+                 Create the group and restart so only greeters/users can connect: \
+                 groupadd -r irlume"
+            );
+            set_mode(&socket, 0o666);
+        }
     }
     eprintln!("irlumed: listening on {socket}");
     if irlume_common::dbglog::on() {
@@ -799,8 +811,17 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             engine.set_devices(&rgb, &ir);
             let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
+            // Record each node's stable device identity (vid:pid:serial) next to
+            // its path so select_pair can survive a udev renumber: after an
+            // upgrade shuffles /dev/videoN, the identity re-anchors the pin to the
+            // right sensor instead of trusting a now-stale number. An empty value
+            // clears a stale id when the current node has no USB descriptor.
+            let rgb_id = irlume_auth::device_identity(&rgb).unwrap_or_default();
+            let ir_id = irlume_auth::device_identity(&ir).unwrap_or_default();
             if let Err(e) = irlume_common::config::write_kv("cameras.conf", "rgb", &rgb)
                 .and_then(|_| irlume_common::config::write_kv("cameras.conf", "ir", &ir))
+                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "rgb_id", &rgb_id))
+                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "ir_id", &ir_id))
             {
                 msg = format!("{msg} (live only; could not persist: {e})");
             }
@@ -1177,12 +1198,14 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                             .is_usable()
                         })
                         .unwrap_or(false),
+                    ir_depth_floored: enr.ir_depth_floor().is_some(),
                 },
                 Ok(None) => Response::Enrollment {
                     profiles: vec![],
                     require_eyes_open: false,
                     require_challenge: false,
                     closure_calibrated: false,
+                    ir_depth_floored: false,
                 },
                 Err(e) => Response::Error(e.to_string()),
             }
