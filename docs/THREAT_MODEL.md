@@ -23,7 +23,7 @@ formal certification stays optional.
 |---|---|---|
 | **CVE-2021-34466** (CyberArk): inject a spoofed IR frame from a fake USB camera | Hello trusts any USB device as camera root-of-trust; descriptors unauthenticated | **Device pinning** (topology + descriptor + `fixed`) defeats *software* virtual-camera injection; a malicious *hardware* USB device needs crypto attestation (out of scope). See [Camera trust](#camera-trust-device-pinning). |
 | Same, but real IR + arbitrary RGB ("SpongeBob") passes | Only IR validated, RGB ignored | **Cross-spectrum RGB↔IR spatial overlap**: face must align in both streams |
-| Weak frame-transition liveness | Trivial transition check | **IR reflectance floor** + **depth (center/edge) ratio** + **cross-spectrum overlap** |
+| Weak frame-transition liveness | Trivial transition check | **IR reflectance floor** + **center/edge brightness ratio** + **cross-spectrum overlap** |
 
 ## Camera trust: device pinning
 
@@ -78,9 +78,12 @@ classifier, and is Apache-2.0, so the clean-BOM claim holds.)
 Physically-grounded cues, hard gate (any failure rejects):
 
 - **IR reflectance floor**: emitter-lit skin brightness (with a per-user
-  depth-calibrated floor for opt-in re-enrollments).
-- **Depth (center/edge) ratio**: a real face is closer to the emitter at the
-  nose than at the cheeks; flat media are not.
+  calibrated floor for opt-in re-enrollments).
+- **Center/edge brightness ratio**: a real face is closer to the emitter at the
+  nose than at the cheeks, so the face region falls off toward its rim; flat
+  matte media are uniform. This is a brightness ratio and nothing measures
+  range: a glossy print with a hot specular center produces the same reading,
+  which is what the 2026-06-30 result below records.
 - **Cross-spectrum RGB↔IR overlap** (anti-injection).
 - **Frontality** (yaw/pitch bounds from landmarks).
 - **Corneal glint**: *supporting only* (standalone-glint liveness was refuted).
@@ -101,7 +104,7 @@ The decision to stay single-frame (no rPPG / no licensed PAD CNN) and the accept
 **CONFIRMED BREACH (2026-06-30):** the self-test found that a **life-size glossy
 vinyl print** (graduation banner) defeats the gate at **98.6% APCER**: vinyl
 reflects 850 nm (defeating `face_in_ir`) and a large flat print mimics the
-brightness-ratio depth cue (banner depth 1.02–1.58 *overlaps and exceeds* genuine
+brightness-ratio cue (banner center/edge 1.02–1.58 *overlaps and exceeds* genuine
 1.37–1.40, so no threshold separates them). Screen replays and matte-paper prints
 were still fully rejected. This is a demonstrated instance of the accepted
 IR-approximating-spoof residual risk. The mitigation, **passive-blink
@@ -139,7 +142,7 @@ requires a daemon-verified live biometric even against root).
 **Fingerprint presentation attacks: scope.** The fingerprint path's
 anti-spoofing is whatever the sensor and `fprintd` provide, which for common
 match-on-host readers is **none**. irlume's IR liveness gates (emitter
-ratio/glint/depth cues, eyes-open, blink challenge) apply to the **face path
+ratio/glint/center-edge cues, eyes-open, blink challenge) apply to the **face path
 only** and do not transfer. For reference, Windows Hello certification
 *requires* fingerprint anti-spoofing; irlume's fingerprint companion makes no
 equivalent claim. Treat it as convenience-tier against a determined attacker
@@ -181,6 +184,43 @@ with a fabricated print.
   extra challenge beyond the gesture and the default IR liveness gate: adding
   one would impose latency and false rejects on a factor whose fallback (the
   password) is always one keystroke away.
+- **Credential release requires a temporal gesture (default on).** Releasing the
+  TPM-sealed login-keyring password is treated as a stronger operation than
+  logging in, and it is the one place where the single-frame IR gate is not
+  considered sufficient on its own. A session grant buys an attacker that
+  session; a released keyring password is a reusable secret that outlives the
+  attempt and unlocks a password manager. So on the `UnsealPassword` path the
+  match must be followed by a deliberate gesture the user performs on request: a
+  head nod, or a calibrated eye closure (the same gate polkit prompts use). A
+  print lying on a desk cannot produce one. Login, the lock screen, `sudo` and
+  polkit are unchanged. A nod needs no calibration, so existing enrollments keep
+  working without re-enrolling. Every way the gesture can fail to happen (no
+  gesture in the window, no IR camera, FaceMesh not deployed, camera busy,
+  closure-only mode without a calibration) ends in the typed-password path, never
+  a lockout, and the keyring then unlocks from the typed password exactly as it
+  would have from a released one. Operators who accept the weaker posture can
+  turn it off with `sudo irlume credential-release-challenge off`, which warns
+  and requires confirmation; `irlume doctor` reports the state and flags a gate
+  that is enabled but cannot run. This is a replay-resistance measure, not proof
+  of physical liveness: it raises the cost of a static-presentation attack on the
+  credential path, and it does not make a face grant equivalent to a live person.
+
+  **What it was measured to do (2026-07-25, one camera, seated user, 17 attempts
+  against the real greeter stack).** Nodding continuously released 4 times out of
+  4. A single nod released 0 times out of 3, which is why the instruction asks
+  the user to keep nodding rather than to nod. Holding still, with consent
+  deliberately withheld, released 1 time out of 10; counting gesture detections
+  rather than releases the detector fired twice in those ten, one of which was
+  refused only because the face match failed for an unrelated reason. An earlier
+  run in a less stable posture released 2 of 5, so incidental body movement
+  drives that number.
+
+  **What it has NOT been measured against: a hand-held print.** The detections
+  above show the nod detector responding to incidental motion, and a photo held
+  in the hand produces exactly that. Until that case is measured, treat this gate
+  as raising the cost of the attack rather than closing it, and do not read the
+  9-in-10 refusal above as an anti-spoofing figure. Tracked in
+  [#101](https://github.com/archledger/irlume/issues/101).
 - **Consecutive-failure throttle.** After a run of failed face attempts (5 by
   default, `IRLUME_RATE_LIMIT`), the daemon stops firing the camera on the
   gesture for a cooldown (30s, `IRLUME_RATE_COOLDOWN_SECS`) and PAM falls

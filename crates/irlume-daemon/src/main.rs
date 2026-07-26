@@ -169,15 +169,23 @@ fn main() {
                 entry.name.to_string(),
             ))
         });
-    let mut engine = match irlume_auth::Engine::load(&det, &model)
-        .map(|e| e.with_devices(&rgb_dev, &ir_dev))
-        .and_then(|e| e.with_ir_adapter(&adapter))
-        .and_then(|e| e.with_mesh(&mesh))
-        .and_then(|e| e.with_blaze_rescue(&blaze))
-        .and_then(|e| match &tp_pad {
-            Some((path, thr, name)) => e.with_thirdparty_pad(path, *thr, name),
-            None => Ok(e),
-        }) {
+    // Engine factory: (re)loads the models and rebinds devices/adapters. Used
+    // once at startup and again by the accept loop to rebuild the engine after a
+    // caught connection-handler panic, so a fresh request never runs against ONNX
+    // sessions left in an unproven state by an unwind. It only borrows the load
+    // inputs, so it is Fn and callable repeatedly.
+    let build_engine = || {
+        irlume_auth::Engine::load(&det, &model)
+            .map(|e| e.with_devices(&rgb_dev, &ir_dev))
+            .and_then(|e| e.with_ir_adapter(&adapter))
+            .and_then(|e| e.with_mesh(&mesh))
+            .and_then(|e| e.with_blaze_rescue(&blaze))
+            .and_then(|e| match &tp_pad {
+                Some((path, thr, name)) => e.with_thirdparty_pad(path, *thr, name),
+                None => Ok(e),
+            })
+    };
+    let mut engine = match build_engine() {
         Ok(e) => {
             eprintln!(
                 "irlumed: IR adapter {}",
@@ -311,8 +319,48 @@ fn main() {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                if let Err(e) = handle(stream, &mut engine) {
-                    eprintln!("irlumed: connection error: {e}");
+                // Isolate each connection behind catch_unwind. A panic deep in
+                // frame decode or inference (e.g. a V4L2 driver echoing back a
+                // 0-dimension or short-buffered frame) must deny THIS one request
+                // and let PAM fall back to the password, never unwind out of the
+                // single-threaded accept loop and take down all face auth for
+                // every user. The panicking handler dropped the stream, so the
+                // client sees EOF and PAM treats it as a fail-safe decline.
+                //
+                // On a caught panic we REBUILD the engine before serving the next
+                // request rather than reuse it: AssertUnwindSafe only silences the
+                // compiler, it does not prove the ONNX sessions are in a supported
+                // state after an unwind, so a fresh engine removes that doubt. This
+                // is chosen over exiting-and-letting-systemd-restart because a
+                // reproducible panic would otherwise become a restart loop that
+                // takes the login path down entirely; a rebuild keeps the daemon
+                // up. It only runs on a real panic (the known frame-math panic
+                // sources are guarded at their site), so the reload cost is not on
+                // any normal path. If the rebuild itself fails, the old engine is
+                // kept: still better than a dead daemon.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle(stream, &mut engine)
+                }));
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => eprintln!("irlumed: connection error: {e}"),
+                    Err(_) => {
+                        eprintln!(
+                            "irlumed: connection handler PANICKED; this request was denied \
+                             (PAM falls back to the password). Rebuilding the engine for a \
+                             clean state; please report this with the backtrace above."
+                        );
+                        match build_engine() {
+                            Ok(fresh) => {
+                                engine = fresh;
+                                eprintln!("irlumed: engine rebuilt after panic");
+                            }
+                            Err(e) => eprintln!(
+                                "irlumed: engine rebuild after panic FAILED ({e}); continuing \
+                                 with the existing engine"
+                            ),
+                        }
+                    }
                 }
             }
             Err(e) => eprintln!("irlumed: accept error: {e}"),
@@ -412,6 +460,41 @@ fn rate_record(user: &str, granted: bool, faced: bool) {
     }
 }
 
+/// Minimum interval in seconds between unprivileged Identify captures. Two
+/// seconds bounds how often one local peer can occupy the camera pipeline
+/// without affecting a real login.
+const IDENTIFY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+// Keep this separate from the failure throttle: Identify has no authentication
+// outcome to strike or reset, and its caller identity is the peer uid.
+type IdentifyRateState = std::sync::Mutex<std::collections::HashMap<u32, std::time::Instant>>;
+
+fn identify_rate_state() -> &'static IdentifyRateState {
+    static S: std::sync::OnceLock<IdentifyRateState> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Admit and record an Identify attempt atomically. Root is the PAM/greeter
+/// trust boundary and must never be delayed by an unprivileged convenience
+/// request.
+fn identify_rate_limited(uid: u32) -> bool {
+    if uid == 0 {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    let mut map = identify_rate_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if map
+        .get(&uid)
+        .is_some_and(|last| now.duration_since(*last) < IDENTIFY_MIN_INTERVAL)
+    {
+        return true;
+    }
+    map.insert(uid, now);
+    false
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.into())
 }
@@ -473,6 +556,30 @@ fn authorized_for(peer: &Peer, target_user: &str) -> bool {
     peer.uid == 0 || uid_of(target_user).is_some_and(|u| u == peer.uid)
 }
 
+/// The daemon's OWN AppArmor confinement label (e.g. "irlumed (enforce)",
+/// "irlumed (complain)", "unconfined") from /proc/self/attr, or None when
+/// AppArmor is not enabled on this boot. Reported in Health so the TUI shows the
+/// real confinement of the running daemon instead of inferring it from the
+/// on-disk profile file, which stays present even if `apparmor_parser` failed to
+/// load it and the daemon is actually unconfined.
+fn apparmor_confinement() -> Option<String> {
+    // The attr node exists whenever the kernel built AppArmor; only trust it when
+    // AppArmor is actually live this boot.
+    let enabled = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+        .map(|s| s.trim() == "Y")
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    // Newer kernels expose the label at attr/apparmor/current, older ones at
+    // attr/current; the value is "profile (mode)\n" or "unconfined\n".
+    let raw = std::fs::read_to_string("/proc/self/attr/apparmor/current")
+        .or_else(|_| std::fs::read_to_string("/proc/self/attr/current"))
+        .ok()?;
+    let label = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    (!label.is_empty()).then(|| label.to_string())
+}
+
 // libxcrypt's one-way hash (glibc moved `crypt` out of libc into libcrypt).
 #[link(name = "crypt")]
 extern "C" {
@@ -488,14 +595,27 @@ extern "C" {
 /// non-password field), in which case the caller does NOT block, since absence
 /// of proof is not proof of a wrong password. Root-only (`/etc/shadow`).
 fn password_matches_login(user: &str, password: &[u8]) -> Option<bool> {
-    let shadow = std::fs::read_to_string("/etc/shadow").ok()?;
-    let stored = verifiable_shadow_hash(&shadow, user)?;
+    // The whole shadow file (every user's hash), the target hash, and the
+    // plaintext password are wrapped in Zeroizing so they are scrubbed on drop
+    // rather than left in freed heap that could page to swap or a core dump.
+    // The rest of the daemon keeps this discipline via SecretBytes; this path
+    // (a raw /etc/shadow read + a crypt() call) is the one place that bypassed
+    // it.
+    let shadow = zeroize::Zeroizing::new(std::fs::read_to_string("/etc/shadow").ok()?);
+    let stored = zeroize::Zeroizing::new(verifiable_shadow_hash(&shadow, user)?);
     // An interior NUL can't be a shadow password; treat as unverifiable.
-    let key = std::ffi::CString::new(password).ok()?;
+    if password.contains(&0) {
+        return None;
+    }
+    // A NUL-terminated, zeroizing copy of the password for crypt(): scrubbed on
+    // drop, unlike the CString this replaces.
+    let mut key = zeroize::Zeroizing::new(Vec::with_capacity(password.len() + 1));
+    key.extend_from_slice(password);
+    key.push(0);
     let setting = std::ffi::CString::new(stored.as_str()).ok()?;
     // SAFETY: single-threaded daemon (crypt's static buffer is not shared); the
     // pointers are valid NUL-terminated C strings for the call's duration.
-    let out = unsafe { crypt(key.as_ptr(), setting.as_ptr()) };
+    let out = unsafe { crypt(key.as_ptr() as *const libc::c_char, setting.as_ptr()) };
     if out.is_null() {
         return None; // unsupported hash format on this libcrypt
     }
@@ -529,9 +649,12 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 fn handle(stream: UnixStream, engine: &mut irlume_auth::Engine) -> std::io::Result<()> {
     let peer = peer_cred(&stream)?;
     // A read/write deadline stops one wedged peer from blocking the single-
-    // threaded daemon (and thus ALL logins) forever.
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
+    // threaded daemon (and thus ALL logins) forever. Propagate a setsockopt
+    // failure (drop this one connection) rather than swallow it: a silently
+    // absent timeout is the exact unbounded-blocking-read this guards against,
+    // and the '?' returns before any read happens.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(15)))?;
     match read_request(&stream)? {
         ReadOutcome::Closed => Ok(()),
         ReadOutcome::Bad => respond(stream, &Response::Error("bad request".into())),
@@ -652,6 +775,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 // Authoritative loaded-cue name so a non-root TUI can show the
                 // real on/off state (settings.conf is root-only).
                 third_party_pad: engine.thirdparty_pad_name().map(String::from),
+                apparmor: apparmor_confinement(),
             }
         }
         // Only tune the band to a user the peer may act for (root, or their own
@@ -771,6 +895,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         Request::Identify => {
+            if identify_rate_limited(peer.uid) {
+                return Response::Error("rate limited; try again shortly".into());
+            }
             // 1:N identify returns an exact similarity score, so an ungated
             // socket peer could hill-climb it to tune a spoof or enumerate who
             // is enrolled. Root keeps the full cross-user search (admin/test);
@@ -854,6 +981,58 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             match engine.enroll_profile(&user, profile, want) {
                 Ok(outcome) => enroll_response(outcome),
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Request::TuneCaptureMode { rounds } => {
+            // Holds the camera for tens of seconds and rewrites capture policy in
+            // /etc/irlume, so it is root-only like the other camera-bearing
+            // management requests.
+            if peer.uid != 0 {
+                return Response::Error(format!(
+                    "camera-tune requires root (peer uid {})",
+                    peer.uid
+                ));
+            }
+            // Enough rounds that one unlucky capture cannot decide the answer,
+            // few enough that a user waits seconds rather than minutes: the
+            // measured spread was sd ~1.3 on a mean of ~117, so 6 is ample.
+            const DEFAULT_ROUNDS: usize = 6;
+            const MAX_ROUNDS: usize = 30;
+            let rounds = rounds.unwrap_or(DEFAULT_ROUNDS).clamp(1, MAX_ROUNDS);
+            let (rgb_dev, ir_dev) = (
+                engine.rgb_device().to_string(),
+                engine.ir_device().to_string(),
+            );
+            match irlume_auth::measure_contention(&rgb_dev, &ir_dev, rounds) {
+                Ok(report) => {
+                    let mode = report.recommended_mode();
+                    match irlume_auth::store_capture_mode(&rgb_dev, mode) {
+                        Ok(()) => {
+                            let mut msg = format!(
+                                "capture mode {} for this camera: concurrent capture keeps {:.0}% of RGB \
+                                 and {:.0}% of IR brightness and saves {:.0}ms ({rounds} rounds)",
+                                mode.as_str(),
+                                report.retained_rgb() * 100.0,
+                                report.retained_ir() * 100.0,
+                                report.saved_ms(),
+                            );
+                            // Say so rather than letting a dark room read as a
+                            // clean bill of health.
+                            if !report.conclusive() {
+                                msg.push_str(&format!(
+                                    "\n     measured in a dim scene (RGB mean {:.0}); this loss only \
+                                     shows in normal light, so re-run camera-tune with the room lit \
+                                     to confirm",
+                                    report.sequential.rgb_mean
+                                ));
+                            }
+                            eprintln!("irlumed: {msg}");
+                            Response::Ok(msg)
+                        }
+                        Err(e) => Response::Error(e.to_string()),
+                    }
+                }
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -1198,14 +1377,14 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                             .is_usable()
                         })
                         .unwrap_or(false),
-                    ir_depth_floored: enr.ir_depth_floor().is_some(),
+                    ir_ratio_calibrated: enr.ir_center_edge_ratio_floor().is_some(),
                 },
                 Ok(None) => Response::Enrollment {
                     profiles: vec![],
                     require_eyes_open: false,
                     require_challenge: false,
                     closure_calibrated: false,
-                    ir_depth_floored: false,
+                    ir_ratio_calibrated: false,
                 },
                 Err(e) => Response::Error(e.to_string()),
             }
@@ -1355,7 +1534,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         }
         Request::SelfTest { kind } => {
             // Fires the camera and returns raw liveness/alignment measurements
-            // (IR brightness, depth, glint), which are a spoof-tuning oracle and
+            // (IR brightness, center/edge, glint), which are a spoof-tuning oracle and
             // a way to tie up the single-threaded daemon. Gate to root, like the
             // other camera-bearing requests; on the 0666 socket fallback this is
             // the only thing keeping an arbitrary local uid out.
@@ -1455,10 +1634,14 @@ fn mutate_enrollment(
     }
 }
 
-/// Face-verify `user` and, on a live match, release the TPM-sealed password. The
-/// biometric check happens HERE (inside unseal), so a caller cannot get the
-/// password without a live face that matches the enrolled templates. We log the
-/// decision + cosine score, but never the password or its length.
+/// Face-verify `user` and, on a passing match, release the TPM-sealed password.
+/// The biometric check happens HERE (inside unseal), so a caller cannot get the
+/// password without a capture that clears the liveness gate and matches the
+/// enrolled templates. Clearing the gate is evidence, not proof, that a live
+/// person is present: the single-frame IR cues are defeatable by a good print
+/// (docs/PAD_SELFTEST.md), which is why this path additionally requires the
+/// temporal consent gesture by default. We log the decision + cosine score, but
+/// never the password or its length.
 /// Deny-line score display: exact under IRLUME_LOG=debug tracing, else
 /// quantized to one decimal (anti-oracle; see comment at the deny log).
 fn deny_score(s: f32) -> String {
@@ -1524,6 +1707,20 @@ fn deny_reason(r: &str) -> String {
     out
 }
 
+/// The purpose every credential release runs under. Releasing the sealed password
+/// hands over a REUSABLE secret rather than one session, so by default the face
+/// match must be followed by a deliberate gesture (a nod, or a calibrated eye
+/// closure).
+///
+/// The setting is read here, per request, so `irlume credential-release-challenge
+/// off` takes effect without a daemon restart; the engine receives the decision,
+/// not the policy lookup.
+fn credential_release_purpose() -> irlume_auth::AuthenticationPurpose {
+    irlume_auth::AuthenticationPurpose::CredentialRelease {
+        temporal_challenge: irlume_common::config::credential_release_challenge(),
+    }
+}
+
 fn do_unseal_password(
     user: &str,
     service: Option<&str>,
@@ -1541,7 +1738,7 @@ fn do_unseal_password(
     if rate_limited(user) {
         return Response::Error("too many recent face attempts; use your password".into());
     }
-    let outcome = match engine.authenticate(user, service) {
+    let outcome = match engine.authenticate_for(user, service, credential_release_purpose()) {
         Ok(o) => o,
         Err(e) => {
             // A PCR-drift here is the ENROLLED-TEMPLATE key failing to unseal (it
@@ -1709,6 +1906,18 @@ mod tests {
         assert_eq!(identify_scope(&peer(0xfffe_fffe)), IdentifyScope::NoAccount);
         // Ground the reverse lookup itself (added by the same fix).
         assert_eq!(users::name_for_uid(0).as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn identify_rate_limit_is_per_uid_and_exempts_root() {
+        let uid = 0xfffe_fffd;
+        let other_uid = 0xfffe_fffc;
+
+        assert!(!identify_rate_limited(uid));
+        assert!(identify_rate_limited(uid));
+        assert!(!identify_rate_limited(other_uid));
+        assert!(!identify_rate_limited(0));
+        assert!(!identify_rate_limited(0));
     }
 
     // Regression: 834c71e. IRLUME_MODELS_STRICT=1 refused to start because the
@@ -2196,6 +2405,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The POLICY read behind credential release: `temporal_challenge` tracks the
+    /// live setting so a toggle needs no daemon restart, and DEFAULT ON means an
+    /// absent key still requires the gesture, which is the whole point of the
+    /// change.
+    ///
+    /// Scope, stated plainly: this covers the helper, not the dispatch. That
+    /// `UnsealPassword` runs under this purpose rests on
+    /// [`credential_release_purpose`] having exactly one caller,
+    /// [`do_unseal_password`], which is also the only path to
+    /// `keyring::unseal_password`. A camera-less test cannot observe the gesture
+    /// gate itself; the engine-side proof lives in irlume-auth
+    /// (`no_credential_release_failure_mode_ever_grants`) and the end-to-end proof
+    /// in irlume-pam (`pamwrap_refused_challenge_falls_through_to_the_password_module`).
+    #[test]
+    fn credential_release_purpose_defaults_to_a_required_challenge() {
+        use irlume_auth::AuthenticationPurpose::CredentialRelease;
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-crp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
+
+        // No settings.conf at all: the challenge is REQUIRED.
+        assert_eq!(
+            credential_release_purpose(),
+            CredentialRelease {
+                temporal_challenge: true
+            },
+            "an absent key must still require the gesture"
+        );
+        // An explicit opt-out, read live, is the only way to drop it.
+        std::fs::write(
+            dir.join("settings.conf"),
+            "credential_release_challenge=off\n",
+        )
+        .unwrap();
+        assert_eq!(
+            credential_release_purpose(),
+            CredentialRelease {
+                temporal_challenge: false
+            }
+        );
+        std::fs::write(
+            dir.join("settings.conf"),
+            "credential_release_challenge=on\n",
+        )
+        .unwrap();
+        assert_eq!(
+            credential_release_purpose(),
+            CredentialRelease {
+                temporal_challenge: true
+            }
+        );
+        // Whatever the setting says, the purpose is never Verify or AppConsent:
+        // credential release can never be downgraded to a session-only gate.
+        for v in ["on", "off", "garbage"] {
+            std::fs::write(
+                dir.join("settings.conf"),
+                format!("credential_release_challenge={v}\n"),
+            )
+            .unwrap();
+            assert!(
+                matches!(credential_release_purpose(), CredentialRelease { .. }),
+                "'{v}' must stay a credential release"
+            );
+        }
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn verify_models_without_strict_warns_but_continues() {
         // No IRLUME_MODELS_STRICT in the test env: an unknown digest and a
@@ -2451,7 +2732,7 @@ mod tests {
             rgb: unit512(seed),
             ir: None,
             ir_space: None,
-            ir_depth: 0.0,
+            ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
         }

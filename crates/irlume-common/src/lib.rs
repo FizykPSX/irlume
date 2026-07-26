@@ -118,6 +118,69 @@ pub fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
+/// Like [`write_0600`] but ATOMIC: write a unique 0600 temp file in the same
+/// directory, fsync it, rename it over `path`, then fsync the directory. A
+/// crash, ENOSPC, or kill mid-write leaves the PRE-EXISTING file byte-for-byte
+/// intact instead of a truncated/half-written one. Use this for anything a
+/// failed rewrite must never corrupt: a TPM-sealed keyring password or template
+/// key whose loss would drop face auth to the password until a re-seal or
+/// re-enroll. The rename replaces the target in one step, so a reader (the
+/// greeter unseal) sees either the whole old file or the whole new one, never a
+/// torn write. Temp and target must share a directory so the rename stays within
+/// one filesystem (where rename is atomic).
+pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("irlume");
+        // Unique per call: pid plus a process-monotonic counter (no time
+        // dependency). create_new below never adopts a stale or planted temp, so
+        // the inode is always freshly ours at 0600.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{name}.tmp.{}.{seq}", std::process::id()));
+        // create_new + mode(0o600): the mode is set at CREATION, before the fsync,
+        // so sync_all captures the final permissions; no post-fsync metadata
+        // change. On the rare stale-temp collision (a crashed prior writer reusing
+        // this pid+seq), drop it and retry once.
+        let open_tmp = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+        };
+        let mut f = match open_tmp() {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&tmp)?;
+                open_tmp()?
+            }
+            other => other?,
+        };
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp); // don't leave a stray temp behind
+            return Err(e);
+        }
+        // fsync the directory so the rename (the directory entry that makes the
+        // new bytes visible under `path`) is itself durable across a power loss.
+        // A failure here means the update is NOT durably committed, so surface it
+        // as a write failure (the content is live but a crash could revert the
+        // entry); the caller retries the whole atomic write.
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, bytes)
+}
+
 /// Request from an (untrusted) client to the (privileged) daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
@@ -194,6 +257,13 @@ pub enum Request {
     /// and persist the UVC control that lights the 850nm illuminator, using IR
     /// brightness to detect success. `dry_run` only enumerates XU controls.
     SetupIrEmitter { dry_run: bool },
+    /// Measure whether this camera can stream RGB and IR at once without losing
+    /// signal, and persist the answer (cameras.conf) so authentication picks the
+    /// right capture mode. Fires the camera for several seconds. PRIVILEGED.
+    TuneCaptureMode {
+        #[serde(default)]
+        rounds: Option<usize>,
+    },
     /// Liveness/alignment self-test (no auth side effects). See PAD self-testing.
     SelfTest { kind: SelfTestKind },
     /// Liveness/health ping.
@@ -356,12 +426,13 @@ pub enum Response {
         /// polkit gesture); surfaced so `doctor` can flag wired-but-uncalibrated.
         #[serde(default)]
         closure_calibrated: bool,
-        /// Whether this enrollment has a per-user IR depth floor fitted (>=2
-        /// scans carry recorded IR depth). False for enrollments made before the
-        /// depth-floor feature; surfaced so `doctor` can nudge a re-enroll to
-        /// activate the anti-print depth tightening.
-        #[serde(default)]
-        ir_depth_floored: bool,
+        /// Whether this enrollment has a per-user floor fitted on the IR
+        /// center/edge brightness ratio (>=2 scans carry a recorded ratio). False
+        /// for enrollments made before the feature; surfaced so `doctor` can nudge
+        /// a re-enroll to activate the personalized tightening. The alias keeps a
+        /// new client readable by the 0.6.1 daemon, which sent `ir_depth_floored`.
+        #[serde(default, alias = "ir_depth_floored")]
+        ir_ratio_calibrated: bool,
     },
     /// Generic success ack for management operations, with a human message.
     Ok(String),
@@ -404,6 +475,15 @@ pub enum Response {
         /// no cue is loaded (or an older daemon that predates this field).
         #[serde(default)]
         third_party_pad: Option<String>,
+        /// The daemon's OWN AppArmor confinement, read from its /proc/self/attr
+        /// at request time: e.g. `irlumed (enforce)`, `irlumed (complain)`, or
+        /// `unconfined`. `None` when AppArmor is not enabled on this boot (or an
+        /// older daemon that predates this field). Lets the TUI report the real
+        /// confinement of the running daemon instead of inferring it from the
+        /// on-disk profile file, which stays present even if `apparmor_parser`
+        /// failed to load it and the daemon is actually unconfined.
+        #[serde(default)]
+        apparmor: Option<String>,
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),
@@ -494,6 +574,30 @@ pub(crate) mod testenv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_0600_atomic_replaces_content_at_0600_without_stray_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("irlume-atomic-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("seal.json");
+        // Fresh write, then an overwrite: the new content fully replaces the old.
+        write_0600_atomic(&target, b"OLD-SEAL").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"OLD-SEAL");
+        write_0600_atomic(&target, b"NEW-SEAL-longer").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"NEW-SEAL-longer");
+        // 0600, and no leftover `.seal.json.tmp.*` beside it.
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "must be 0600");
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(strays.is_empty(), "atomic write left a temp file behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The `Locked:` kB of the /proc/self/smaps mapping containing `addr`
     /// (Linux splits a VMA on mlock, so a locked buffer's mapping reports a

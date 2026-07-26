@@ -23,3 +23,7 @@ result
 # Claude Code session worktrees / local agent state
 .claude/
 /ppa-out/
+
+# Locally-generated release checksum artifacts
+SHA256SUMS
+SHA256SUMS.asc

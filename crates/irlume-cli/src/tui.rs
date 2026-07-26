@@ -233,6 +233,11 @@ enum Suspend {
     /// Toggle the opt-in biopolicy operation-class gate (the bool is the target
     /// state). Root op; the daemon reads it live, no restart.
     Biopolicy(bool),
+    /// Toggle the credential-release gesture gate (the bool is the target state).
+    /// Root op; the daemon reads it live, no restart. Turning it OFF weakens
+    /// credential release, so the TUI confirms first and the CLI still prints its
+    /// own warning in the cooked terminal.
+    CredentialReleaseChallenge(bool),
     /// IR liveness self-test via `sudo irlume selftest liveness` (the daemon
     /// root-gates it; the raw measurements are a spoof-tuning oracle).
     SelfTestLiveness,
@@ -346,6 +351,11 @@ struct HealthInfo {
     /// Loaded third-party PAD cue name (authoritative on/off, since
     /// settings.conf is root-only and a non-root TUI can't read it).
     third_party_pad: Option<String>,
+    /// The daemon's real AppArmor confinement label ("irlumed (enforce)",
+    /// "unconfined", ...), or None when AppArmor is off or the daemon predates
+    /// the field. Authoritative: the on-disk profile can exist while the daemon
+    /// runs unconfined (a failed apparmor_parser load).
+    apparmor: Option<String>,
 }
 
 /// Template-encryption + recovery status (`RecoveryStatus`).
@@ -694,6 +704,7 @@ impl App {
                     adapter,
                     version,
                     third_party_pad,
+                    apparmor,
                 }) => Some(HealthInfo {
                     tier,
                     rgb_dev,
@@ -702,6 +713,7 @@ impl App {
                     adapter,
                     version,
                     third_party_pad,
+                    apparmor,
                 }),
                 _ => None, // older daemon / daemon down → Repair falls back to local probes
             };
@@ -1256,25 +1268,59 @@ impl App {
                 "moiré screen-detector active; if real faces read 'screen pattern', tune IRLUME_RGB_MOIRE_MAX on the unit".into(),
                 Fix::None));
         }
-        // AppArmor (Debian-family) parity with the SELinux check.
-        if std::path::Path::new("/sys/kernel/security/apparmor").exists() {
-            let profiled = std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists();
-            v.push(mk(
+        // AppArmor: prefer the daemon's SELF-REPORTED confinement (Health.apparmor
+        // read from its /proc/self/attr). The on-disk profile file existing does
+        // NOT prove the daemon is confined: apparmor_parser can fail to load it
+        // (a swallowed install error) and leave irlumed unconfined while the file
+        // is still present. Only fall back to the file heuristic for an older
+        // daemon that doesn't report the field.
+        let aa = self.health.as_ref().and_then(|h| h.apparmor.as_deref());
+        let aa_reload =
+            "reinstall the package, or: sudo apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed";
+        match aa {
+            Some(label) if label.contains("unconfined") => v.push(mk(
                 "AppArmor",
-                if profiled { Sev::Ok } else { Sev::Warn },
-                if profiled {
-                    "irlume profile installed".into()
-                } else {
-                    "daemon unconfined; optional hardening profile available".into()
-                },
-                if profiled {
-                    Fix::None
-                } else {
-                    Fix::Manual(
-                        "install packaging/apparmor/usr.local.bin.irlumed (see repo)".into(),
-                    )
-                },
-            ));
+                Sev::Warn,
+                "daemon running UNCONFINED; the profile is installed but not loaded".into(),
+                Fix::Manual(aa_reload.into()),
+            )),
+            Some(label) if label.contains("(complain)") => v.push(mk(
+                "AppArmor",
+                Sev::Warn,
+                format!("profile loaded in COMPLAIN mode, not enforcing ({label})"),
+                Fix::Manual("enforce it: sudo aa-enforce /etc/apparmor.d/usr.bin.irlumed".into()),
+            )),
+            Some(label) => v.push(mk(
+                "AppArmor",
+                Sev::Ok,
+                format!("daemon confined ({label})"),
+                Fix::None,
+            )),
+            None => {
+                // Older daemon (no field). Fall back to the file heuristic, but
+                // only when AppArmor is actually live this boot.
+                let enabled = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+                    .map(|s| s.trim() == "Y")
+                    .unwrap_or(false);
+                if enabled {
+                    let profiled = std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists();
+                    v.push(mk(
+                        "AppArmor",
+                        if profiled { Sev::Ok } else { Sev::Warn },
+                        if profiled {
+                            "irlume profile installed (update the daemon to confirm it is loaded)"
+                                .into()
+                        } else {
+                            "daemon unconfined; the AppArmor hardening profile is not loaded".into()
+                        },
+                        if profiled {
+                            Fix::None
+                        } else {
+                            Fix::Manual(aa_reload.into())
+                        },
+                    ));
+                }
+            }
         }
 
         // Login keyring LOCKED: a Secret Service provider is up but its login
@@ -1982,6 +2028,22 @@ impl App {
                 },
                 &["irlume", "biopolicy", if on { "on" } else { "off" }],
             ),
+            // `--yes`: the TUI already ran the confirm above. The CLI still prints
+            // its warning to the cooked terminal, which is the point of routing
+            // through it rather than writing settings.conf from here.
+            Suspend::CredentialReleaseChallenge(on) => self.sudo_step(
+                if on {
+                    "require a gesture before releasing the keyring password"
+                } else {
+                    "stop requiring a gesture before releasing the keyring password"
+                },
+                &[
+                    "irlume",
+                    "credential-release-challenge",
+                    if on { "on" } else { "off" },
+                    "--yes",
+                ],
+            ),
             Suspend::SelfTestLiveness => self.sudo_step(
                 "run the IR liveness self-test",
                 &["irlume", "selftest", "liveness"],
@@ -2568,6 +2630,44 @@ impl App {
                         "Enable",
                         ConfirmAct::Sus(Suspend::Biopolicy(true)),
                     ));
+                }
+            }
+            // Credential-release gesture gate. Default ON, and the direction that
+            // needs friction is OFF: it drops the only check that separates a
+            // present person from a photograph of one, for the one operation that
+            // hands out a reusable secret. Enabling goes straight through (it only
+            // restores the default). settings.conf is root-only, so an unprivileged
+            // TUI cannot read the current state; then offer the safe direction (on)
+            // rather than guess.
+            (SC_SETTINGS, KeyCode::Char('g')) => {
+                match irlume_common::config::credential_release_challenge_visible() {
+                    Some(true) => {
+                        self.confirm = Some((
+                            format!(
+                                "Stop requiring a gesture before your keyring password is \
+                                 released? {}. Your typed password keeps working either way.",
+                                crate::commands::CREDENTIAL_RELEASE_RISK
+                            ),
+                            "Disable",
+                            ConfirmAct::Sus(Suspend::CredentialReleaseChallenge(false)),
+                        ));
+                    }
+                    Some(false) => {
+                        self.log(
+                            '→',
+                            "sudo irlume credential-release-challenge on: restore the gesture \
+                             gate on keyring release",
+                        );
+                        self.suspend = Some(Suspend::CredentialReleaseChallenge(true));
+                    }
+                    None => {
+                        self.log(
+                            '→',
+                            "the gate's state is root-only; running `credential-release-challenge \
+                             on` to restore the default",
+                        );
+                        self.suspend = Some(Suspend::CredentialReleaseChallenge(true));
+                    }
                 }
             }
             // Third-party PAD model toggle. settings.conf is root-only, so the
@@ -3203,6 +3303,61 @@ impl App {
                 Line::from(vec![
                     Span::styled("  [enter]", Style::new().fg(th().accent)),
                     Span::styled(" toggle", Style::new().dim()),
+                ]),
+                Line::raw(""),
+                section("Gesture before keyring release"),
+                {
+                    // Tri-state, not a bool: settings.conf is root-only, so an
+                    // unprivileged TUI genuinely cannot read this. Showing ○ off
+                    // there would be a false all-clear on a security default, and
+                    // showing ● on would be an unearned one.
+                    let (icon, icon_style, label) =
+                        match irlume_common::config::credential_release_challenge_visible() {
+                            Some(true) => (
+                                "●",
+                                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                                "required (default)".to_string(),
+                            ),
+                            Some(false) => (
+                                "○",
+                                Style::new().fg(th().warn).add_modifier(Modifier::BOLD),
+                                "DISABLED   (a static IR print may release the password)"
+                                    .to_string(),
+                            ),
+                            None => (
+                                "◐",
+                                Style::new().fg(th().warn),
+                                "on/off is root-only; run the TUI with sudo to see it".to_string(),
+                            ),
+                        };
+                    Line::from(vec![
+                        Span::raw("  state  "),
+                        Span::styled(format!("{icon} "), icon_style),
+                        Span::styled(label, Style::new().dim()),
+                    ])
+                },
+                Line::from(Span::styled(
+                    "  Releasing your TPM-sealed keyring password needs a NOD (or a calibrated",
+                    Style::new().dim(),
+                )),
+                Line::from(Span::styled(
+                    "  eye closure) after the face match, so a photo or a screen cannot pull the",
+                    Style::new().dim(),
+                )),
+                Line::from(Span::styled(
+                    "  password out. Login, lock screen and sudo are unaffected, and a missed",
+                    Style::new().dim(),
+                )),
+                Line::from(Span::styled(
+                    "  gesture just falls back to typing the password.",
+                    Style::new().dim(),
+                )),
+                Line::from(vec![
+                    Span::styled("  [g]", Style::new().fg(th().accent)),
+                    Span::styled(
+                        " turn it on or off (sudo; off asks first)",
+                        Style::new().dim(),
+                    ),
                 ]),
                 Line::raw(""),
                 section("Biopolicy operation-class gate"),
@@ -4061,22 +4216,49 @@ impl App {
                 Span::raw(format!("  {:<16}", "SELinux module")),
                 sel,
             ]));
-        } else if std::path::Path::new("/sys/kernel/security/apparmor").exists() {
-            let profiled = std::fs::read_to_string("/proc/self/attr/apparmor/current")
-                .map(|s| s.contains("irlume"))
-                .unwrap_or(false)
-                || std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists();
-            lines.push(Line::from(vec![
-                Span::raw(format!("  {:<16}", "AppArmor")),
-                if profiled {
-                    Span::styled("● irlume profile installed", Style::new().fg(th().ok))
-                } else {
-                    Span::styled(
-                        "active; irlume unconfined (profile optional)",
-                        Style::new().dim(),
-                    )
-                },
-            ]));
+        } else {
+            // AppArmor row: prefer the daemon's real confinement (Health.apparmor
+            // from its /proc/self/attr). The on-disk profile existing does not
+            // prove the daemon is confined (apparmor_parser can fail silently at
+            // install). Fall back to the on-disk-profile heuristic only for an
+            // older daemon that doesn't report the field.
+            let aa = self.health.as_ref().and_then(|h| h.apparmor.as_deref());
+            let enabled = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+                .map(|s| s.trim() == "Y")
+                .unwrap_or(false);
+            let val = match aa {
+                Some(l) if l.contains("unconfined") => Some(Span::styled(
+                    "✗ daemon UNCONFINED (profile installed but not loaded)",
+                    Style::new().fg(th().err),
+                )),
+                Some(l) if l.contains("(complain)") => Some(Span::styled(
+                    "◐ profile loaded in complain mode (not enforcing)",
+                    Style::new().dim(),
+                )),
+                Some(_) => Some(Span::styled(
+                    "● daemon confined (enforce)",
+                    Style::new().fg(th().ok),
+                )),
+                None if enabled => {
+                    let profiled = std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists()
+                        || std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists();
+                    Some(if profiled {
+                        Span::styled("● irlume profile installed", Style::new().fg(th().ok))
+                    } else {
+                        Span::styled(
+                            "active; irlume unconfined (profile optional)",
+                            Style::new().dim(),
+                        )
+                    })
+                }
+                None => None, // AppArmor not enabled this boot: no row
+            };
+            if let Some(val) = val {
+                lines.push(Line::from(vec![
+                    Span::raw(format!("  {:<16}", "AppArmor")),
+                    val,
+                ]));
+            }
         }
         lines.push(Line::raw(""));
         lines.push(section("What each does"));
@@ -4231,6 +4413,14 @@ impl App {
                 onoff(self.keyring_armed.unwrap_or(false)),
             ]),
             Line::from(vec![
+                Span::raw("  keyring gesture   "),
+                match irlume_common::config::credential_release_challenge_visible() {
+                    Some(v) => onoff(v),
+                    // Root-only setting: say unknown rather than claim either state.
+                    None => Span::styled("◐ root-only", Style::new().fg(th().warn)),
+                },
+            ]),
+            Line::from(vec![
                 Span::raw("  templates enc     "),
                 onoff(rec.encrypted),
             ]),
@@ -4372,6 +4562,7 @@ impl App {
             SC_SETTINGS => &[
                 ("enter", "eyes-open"),
                 ("c", "blink"),
+                ("g", "keyring gesture"),
                 ("b", "biopolicy"),
                 ("m", "3rd-party model"),
             ],
@@ -5025,7 +5216,7 @@ mod tests {
             require_eyes_open: true,
             require_challenge: false,
             closure_calibrated: false,
-            ir_depth_floored: false,
+            ir_ratio_calibrated: false,
         });
         assert!(ok);
         let (ok, _) = map_settings(Response::Error("boom".into()));
@@ -5068,6 +5259,73 @@ mod tests {
     // title, a single line clamped to the box width, so a long target name was
     // cut off. It must render inside the wrapping body, with the deliberate
     // [y] yes / [n] no hint from 093dc56.
+    /// The keyring-gesture toggle: OFF is the direction that weakens credential
+    /// release, so it must go through the y/n gate and never act on the keypress
+    /// alone. ON (and the unreadable case) restore the default and go straight
+    /// through. The rendered section must report the state it actually read.
+    #[test]
+    fn keyring_gesture_toggle_confirms_before_disabling() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-tui-crc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
+
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+
+        // Default (no settings.conf): shown as required, and [g] asks first.
+        let text = draw_text(&app);
+        assert!(
+            text.contains("Gesture before keyring release") && text.contains("required (default)"),
+            "the default must render as required:\n{text}"
+        );
+        app.on_key(KeyCode::Char('g'));
+        assert!(
+            app.suspend.is_none(),
+            "disabling must not act on the keypress alone"
+        );
+        match app.confirm.take() {
+            Some((q, verb, ConfirmAct::Sus(Suspend::CredentialReleaseChallenge(false)))) => {
+                assert_eq!(verb, "Disable");
+                assert!(
+                    q.contains("IR print"),
+                    "the confirm must name the consequence: {q}"
+                );
+            }
+            Some((q, verb, _)) => panic!("wrong confirm action: {verb} / {q}"),
+            None => panic!("disabling must raise a confirm"),
+        }
+
+        // Already off: the row warns, and [g] restores the default with no gate.
+        std::fs::write(
+            dir.join("settings.conf"),
+            "credential_release_challenge=0\n",
+        )
+        .unwrap();
+        let text = draw_text(&app);
+        assert!(
+            text.contains("DISABLED"),
+            "an opted-out gate must be visible on the page:\n{text}"
+        );
+        app.on_key(KeyCode::Char('g'));
+        assert!(app.confirm.is_none(), "re-enabling needs no confirm");
+        assert!(matches!(
+            app.suspend.take(),
+            Some(Suspend::CredentialReleaseChallenge(true))
+        ));
+
+        match old {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn hub_selection_and_enter_jump_to_the_picked_screen() {
         let mut app = test_app();
@@ -5399,6 +5657,7 @@ mod tests {
             adapter: false,
             version: "test".into(),
             third_party_pad: None,
+            apparmor: None,
         });
         let start = std::time::Instant::now();
         app.refresh_light();
@@ -6948,6 +7207,7 @@ mod tests {
             adapter: false,
             version: "1.0".into(),
             third_party_pad: None,
+            apparmor: None,
         });
         let text = draw_text(&app);
         assert!(
@@ -6991,14 +7251,17 @@ mod tests {
             adapter: false,
             version: "test".into(),
             third_party_pad: Some("flir".into()),
+            apparmor: None,
         });
         let text = draw_text(&app);
         assert!(
             text.contains("● ") && text.contains("enabled: flir"),
             "a daemon-loaded cue shows green enabled:\n{text}"
         );
+        // Specifically the THIRD-PARTY row's root-only fallback must be gone (the
+        // keyring-gesture section on the same page has its own root-only label).
         assert!(
-            !text.contains("root-only"),
+            !text.contains("weights installed; on/off is root-only"),
             "the authoritative state replaces the root-only guess"
         );
         // No daemon-reported cue: fall back to the filesystem probe (we can't
@@ -7308,6 +7571,7 @@ mod tests {
             adapter: true,
             version: env!("CARGO_PKG_VERSION").into(),
             third_party_pad: None,
+            apparmor: None,
         });
         app.run_checks();
         let find = |label: &str| {
@@ -7355,6 +7619,7 @@ mod tests {
             adapter: false,
             version: "0.0.1-old".into(),
             third_party_pad: None,
+            apparmor: None,
         });
         app.challenge = true;
         app.enroll_error = Some("bad ciphertext".into());

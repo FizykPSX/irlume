@@ -116,8 +116,12 @@ fn main() -> std::process::ExitCode {
         (Some("logs"), sub) => logs::run(sub, &args),
         (Some("models"), sub) => models::run(sub, &args),
         (Some("biopolicy"), sub) => commands::biopolicy(sub, &args),
+        (Some("credential-release-challenge"), sub) => {
+            commands::credential_release_challenge(sub, &args)
+        }
         (Some("calibrate-closure"), _) => calibrate_closure(&args),
         (Some("ir-setup"), _) => ir_setup(&args),
+        (Some("camera-tune"), _) => camera_tune(&args),
         (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),
         (Some("uninstall"), _) => uninstall::run(&args),
@@ -517,6 +521,25 @@ fn ir_setup(args: &[String]) -> std::process::ExitCode {
     )
 }
 
+/// `irlume camera-tune`: measure whether this camera can stream RGB and IR at
+/// once without losing signal, and persist the answer. Some Hello modules starve
+/// their own RGB interface when both stream (measured: the NexiGo HelloCam N930W
+/// keeps 56% of its RGB brightness), which dims the frame recognition runs on;
+/// others are unaffected and should keep the faster concurrent path. Only a
+/// measurement on the camera in front of the user can tell the two apart.
+fn camera_tune(args: &[String]) -> std::process::ExitCode {
+    use irlume_common::Request;
+    let rounds = flag(args, "--rounds").and_then(|v| v.parse::<usize>().ok());
+    eprintln!(
+        "[camera-tune] measuring this camera under load; it fires the IR emitter \
+         for up to a minute…"
+    );
+    report_ok_response(
+        "camera-tune",
+        daemon_request(&Request::TuneCaptureMode { rounds }),
+    )
+}
+
 fn usage_profiles() -> std::process::ExitCode {
     eprintln!(
         "usage: irlume profiles [--user U] <subcommand>\n  \
@@ -809,7 +832,7 @@ pub(crate) fn engine(
     Ok(e)
 }
 
-// Brightness/depth cue helpers live in irlume-auth (the daemon-side pipeline
+// Brightness/center-edge cue helpers live in irlume-auth (the daemon-side pipeline
 // owns them); re-exported so the dev tools here and in pad.rs measure with the
 // exact same code the gate uses.
 pub(crate) use irlume_auth::{center_edge_ratio, mean_in_bbox};
@@ -1498,12 +1521,12 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
         println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}");
         println!(
-            "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} depth={} glint={}",
+            "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} center_edge={} glint={}",
             cues.face_in_rgb,
             cues.face_in_ir,
             cues.cross_spectrum_aligned,
             cues.ir_reflectance_ok,
-            cues.depth_ok,
+            cues.center_edge_ratio_ok,
             cues.glint_present
         );
         println!("[GATE] {verdict:?}: {reason}");
@@ -2099,15 +2122,15 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             }
             rec.insert("rgb_present".into(), rgb_top.is_some().into());
 
-            let (mut ir_cos, mut ir_bri, mut ir_depth, mut ir_glint) =
+            let (mut ir_cos, mut ir_bri, mut ir_center_edge_ratio, mut ir_glint) =
                 (f32::NAN, 0.0f32, 0.0f32, 0.0f32);
             if let Some(t) = &ir_top {
                 let chip = irlume_vision::align::align_to_arcface(&iv, &t.landmarks)?;
                 let raw = emb.embed(&chip)?; // IR = plain embed (no TTA), RAW 512-D
                 ir_bri = mean_bbox(&irf.data, irf.width, irf.height, 1, &t.bbox);
-                // Ambient-INDEPENDENT liveness cues (the depth-primary-floor candidates):
+                // Ambient-INDEPENDENT liveness cues (the center/edge-floor candidates):
                 // center/edge IR ratio (3D face structure) and corneal glint peak.
-                ir_depth =
+                ir_center_edge_ratio =
                     irlume_auth::center_edge_ratio(&irf.data, irf.width, irf.height, &t.bbox);
                 ir_glint = irlume_auth::eye_glint(&irf.data, irf.width, irf.height, &t.landmarks);
                 if let Some(a) = adapter.as_mut() {
@@ -2143,7 +2166,10 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                     irlume_auth::both_eyes_open(&irf.data, irf.width, irf.height, &t.landmarks)
                         .into(),
                 );
-                rec.insert("ir_depth".into(), json_f32(ir_depth));
+                rec.insert(
+                    "ir_center_edge_ratio".into(),
+                    json_f32(ir_center_edge_ratio),
+                );
                 rec.insert("ir_glint".into(), json_f32(ir_glint));
                 rec.insert(
                     "ir_emb_raw".into(),
@@ -2156,13 +2182,13 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             written += 1;
             println!(
-                "  [{:>2}/{n}] rgb {} bri {:>5.1} | ir {} bri {:>5.1} depth {:>5.2} glint {:>3.0}",
+                "  [{:>2}/{n}] rgb {} bri {:>5.1} | ir {} bri {:>5.1} c/e {:>5.2} glint {:>3.0}",
                 idx + 1,
                 if rgb_top.is_some() { "✓" } else { "·" },
                 rgb_bri,
                 if ir_top.is_some() { "✓" } else { "·" },
                 ir_bri,
-                ir_depth,
+                ir_center_edge_ratio,
                 ir_glint
             );
         }
@@ -2289,6 +2315,86 @@ pub(crate) fn tpm_device() -> Option<&'static str> {
     ["/dev/tpmrm0", "/dev/tpm0"]
         .into_iter()
         .find(|d| std::path::Path::new(d).exists())
+}
+
+/// Doctor's credential-release block: is the temporal gesture required before the
+/// TPM-sealed keyring password is released, and can that gesture actually run here?
+///
+/// Kept separate from the polkit block because the failure MEANING differs. A
+/// polkit prompt that cannot run the gesture falls back to a password dialog the
+/// user is already looking at; a credential release that cannot run it leaves the
+/// keyring locked after an otherwise successful face login, which reads as "face
+/// login is broken" unless doctor names it.
+///
+/// Silent when the user has no sealed password: nothing is released, so there is no
+/// gate to explain.
+fn report_credential_release(user: &str, gesture_is_closure: bool, closure_calibrated: bool) {
+    let armed = matches!(
+        daemon_request(&irlume_common::Request::HasSealedPassword {
+            user: user.to_string()
+        }),
+        Ok(irlume_common::Response::HasPassword(true))
+    );
+    if !armed {
+        return;
+    }
+    match irlume_common::config::credential_release_challenge_visible() {
+        Some(true) => {}
+        Some(false) => {
+            println!(
+                "[doctor] ⚠ credential-release challenge: DISABLED\n     \
+                 {risk}.\n     \
+                 Re-enable: sudo irlume credential-release-challenge on",
+                risk = commands::CREDENTIAL_RELEASE_RISK
+            );
+            return;
+        }
+        None => {
+            println!(
+                "[doctor] credential-release challenge: root-only setting; re-run \
+                 `sudo irlume doctor` to read it"
+            );
+            return;
+        }
+    }
+    // The gate is on. Whether it can RUN needs the mesh model (every consent frame
+    // goes through FaceMesh) and, in closure-only mode, this user's EAR calibration.
+    // A nod needs no calibration, which is why the default mode leaves existing
+    // enrollments working with no re-enroll.
+    let mesh = matches!(
+        daemon_request(&irlume_common::Request::Health),
+        Ok(irlume_common::Response::Health { mesh: true, .. })
+    );
+    if !mesh {
+        println!(
+            "[doctor] ⚠ credential-release challenge is required but cannot run: FaceMesh \
+             is not loaded\n     \
+             (face_landmark.onnx). Face login still works; your keyring will fall back to \
+             the typed\n     password. Fix: set IRLUME_MESH_MODEL in the irlumed unit, or \
+             reinstall the package."
+        );
+        return;
+    }
+    if gesture_is_closure && !closure_calibrated {
+        println!(
+            "[doctor] ⚠ credential-release challenge is required but consent_gesture=closure \
+             is NOT\n     calibrated for '{user}': your keyring will fall back to the typed \
+             password.\n     Fix: sudo irlume calibrate-closure, or unset consent_gesture in \
+             settings.conf to\n     use the no-calibration head nod."
+        );
+        return;
+    }
+    println!(
+        "[doctor] credential-release challenge: required ✓ ({} to release your keyring \
+         password)",
+        if gesture_is_closure {
+            "close your eyes ~1s then open"
+        } else if closure_calibrated {
+            "keep nodding, or close your eyes ~1s then open"
+        } else {
+            "keep nodding your head"
+        }
+    );
 }
 
 /// Preflight diagnostics ("preparing"): discover + classify cameras, flag the
@@ -2545,8 +2651,10 @@ fn doctor() -> std::process::ExitCode {
     // The consent gesture is a head NOD by default (no calibration). Only the
     // opt-in closure gesture needs a per-user calibration; wired-but-uncalibrated
     // then silently falls to the password on every polkit prompt.
-    let gesture_is_closure = irlume_common::config::read_kv("settings.conf", "consent_gesture")
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("closure"));
+    // Same parse the engine gates on and the PAM module instructs from, so doctor
+    // can never report a gesture the daemon would refuse.
+    let gesture_is_closure = irlume_common::config::consent_gesture_mode()
+        == irlume_common::config::ConsentGesture::Closure;
     let closure_calibrated = matches!(
         daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }),
         Ok(irlume_common::Response::Enrollment {
@@ -2554,6 +2662,12 @@ fn doctor() -> std::process::ExitCode {
             ..
         })
     );
+    // --- credential release (the keyring password) --------------------------
+    // Reported before the polkit block because it shares the gesture-readiness
+    // facts above: this is the same nod/closure gate, applied to the one operation
+    // where a spoof yields a REUSABLE secret instead of one session.
+    report_credential_release(&user, gesture_is_closure, closure_calibrated);
+
     match crate::pamwire::polkit_wired() {
         Some(true) if !gesture_is_closure => println!(
             "[doctor] polkit app prompts: wired ✓ (NOD your head to approve Bitwarden unlock,\n     \
@@ -2613,23 +2727,23 @@ fn doctor() -> std::process::ExitCode {
     // pam-auth-update on Debian) and dropped irlume's lines. Face still falls
     // back to the password, so this is not a lockout, but face login silently
     // stopped working. Surface it with the one-command fix.
-    let (enrolled, ir_depth_floored) =
+    let (enrolled, ir_ratio_calibrated) =
         match daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }) {
             Ok(irlume_common::Response::Enrollment {
                 ref profiles,
-                ir_depth_floored,
+                ir_ratio_calibrated,
                 ..
-            }) => (!profiles.is_empty(), ir_depth_floored),
+            }) => (!profiles.is_empty(), ir_ratio_calibrated),
             _ => (false, false),
         };
-    // An IR enrollment made before the per-user depth floor existed carries no
-    // recorded IR depth, so the personalized anti-print 3D-structure check never
-    // engages (new IR enrollments fit it automatically). Nudge a re-enroll to
-    // activate it. Secure/IR hardware only, and only when actually enrolled.
-    if enrolled && !ir_depth_floored && irlume_camera::capabilities().ir_pair {
+    // An IR enrollment made before the per-user center/edge floor existed carries
+    // no recorded ratio, so the personalized anti-print check never engages (new
+    // IR enrollments fit it automatically). Nudge a re-enroll to activate it.
+    // Secure/IR hardware only, and only when actually enrolled.
+    if enrolled && !ir_ratio_calibrated && irlume_camera::capabilities().ir_pair {
         println!(
-            "[doctor] {user}'s face enrollment predates the per-user IR depth floor (an\n     \
-             anti-print 3D-structure check that new IR enrollments fit automatically).\n     \
+            "[doctor] {user}'s face enrollment predates the per-user IR center/edge floor\n     \
+             (an anti-print check that new IR enrollments fit automatically).\n     \
              Re-enroll to activate it: the TUI Profiles tab, or `sudo irlume enroll`."
         );
     }

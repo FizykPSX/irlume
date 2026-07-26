@@ -29,8 +29,14 @@ const CREATED_PREFIX: &str = "# irlume: created from ";
 /// line, the plan line, and docs/SETUP.md's mirror never drift apart.
 const ONDEMAND_HINT: &str = "leave the password empty and press Enter to use your face";
 
-// Greeter block (mirrors scripts/deploy-keyring-unlock.sh exactly).
-const GREETER_UNSEAL: &str = "auth       [success=1 default=ignore]   pam_irlume.so unseal";
+// Greeter block for a non-`@include` (Fedora `substack`) stack: a `success=1`
+// jump over the password substack, plus the `PERMIT_LANDING` it lands on.
+/// Jump-style face line for a submit-driven greeter we have NOT validated for the
+/// on-demand probe (old GDM, unknown DM). `facefirst` is mandatory here: without
+/// it the module runs the ACTIVE probe (`pam_get_authtok`), and a greeter that
+/// blocks that probe until the user types means face never fires at all.
+const GREETER_UNSEAL_FACEFIRST_JUMP: &str =
+    "auth       [success=1 default=ignore]   pam_irlume.so unseal facefirst";
 /// The greeter/locker face line for any INCLUDE layout: Debian/Ubuntu
 /// `@include common-auth` and Arch `auth include system-login` alike (a
 /// `success=N` jump can't skip an include expansion, so this can't be the jump
@@ -60,13 +66,12 @@ const RESEAL_AUTH: &str = "auth       optional                     pam_irlume.so
 /// wallet. No-op when the keyring isn't armed or a password is already set.
 const KEYRING_UNSEAL: &str = "auth       optional                     pam_irlume.so keyring";
 const RESEAL_SESSION: &str = "session    optional                     pam_irlume.so reseal";
-const SUDO_STANZA: &str = "auth       sufficient                   pam_irlume.so";
-/// polkit prompts (Bitwarden vault unlock, pkexec, systemd unit control) get the
-/// same plain verify stanza as sudo: no `unseal` (the daemon refuses credential
-/// release for the polkit class anyway) and no mode arg (the polkit agent runs
-/// the conversation as soon as its dialog opens, which IS the face-first
-/// trigger; the daemon adds the forced blink gate on top).
-const POLKIT_STANZA: &str = SUDO_STANZA;
+/// The plain verify stanza, shared by `sudo` and polkit prompts (Bitwarden vault
+/// unlock, pkexec, systemd unit control): no `unseal` (the daemon refuses
+/// credential release for both classes anyway) and no mode arg (each surface runs
+/// the PAM conversation as soon as it prompts, which IS the face-first trigger;
+/// the daemon adds the forced consent gesture on top).
+const VERIFY_STANZA: &str = "auth       sufficient                   pam_irlume.so";
 
 /// A PAM service to wire. `vendor=Some` → materialize an /etc override from the
 /// vendor copy; `vendor=None` → back up and edit the real /etc file.
@@ -194,7 +199,7 @@ fn wired_marker_path() -> std::path::PathBuf {
 /// Persist (on enable) or remove (on disable) the wiring marker. The body is a
 /// tiny stable key=value record of the extra scopes so reconcile re-applies the
 /// same `--with-sudo` / `--with-polkit` choice, not a bare login wiring.
-fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool) {
+fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool, with_lock: bool) {
     let path = wired_marker_path();
     if !enable {
         let _ = std::fs::remove_file(&path);
@@ -203,7 +208,11 @@ fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let body = format!("with_sudo={with_sudo}\nwith_polkit={with_polkit}\n");
+    // with_lock records whether we actually wired the KDE lock screen, so a later
+    // absence of /etc/pam.d/kde is only a regression when it was ours to maintain
+    // (a Plasma package's vendor /usr/lib/pam.d/kde on a GNOME box must not read
+    // as a regression and loop reconcile forever).
+    let body = format!("with_sudo={with_sudo}\nwith_polkit={with_polkit}\nwith_lock={with_lock}\n");
     // 0600, root-owned (enable/reconcile run as root): the marker must not be
     // plantable by a non-root user, since reconcile trusts its with_sudo flag.
     // A silent failure would leave self-heal disabled without the user knowing,
@@ -219,7 +228,7 @@ fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool) {
 
 /// Re-read the marker's recorded flags. Returns `None` when login was never
 /// enabled (no marker), so reconcile does nothing on machines that opted out.
-fn read_wired_marker() -> Option<(bool, bool)> {
+fn read_wired_marker() -> Option<(bool, bool, bool)> {
     let path = wired_marker_path();
     // In production (default state dir) the marker must be root-owned: reconcile
     // acts on its with_sudo flag as root, so a marker a non-root user could plant
@@ -244,7 +253,10 @@ fn read_wired_marker() -> Option<(bool, bool)> {
             .map(|v| v.trim() == "true")
             .unwrap_or(false)
     };
-    Some((flag("with_sudo"), flag("with_polkit")))
+    // with_lock absent in a marker written before this field existed: default
+    // false, so an old marker never triggers a false lock-screen regression; the
+    // next `login enable` / adopt rewrites it with the real value.
+    Some((flag("with_sudo"), flag("with_polkit"), flag("with_lock")))
 }
 
 /// Idempotent repair entry point, meant to run unattended from a systemd path
@@ -252,7 +264,7 @@ fn read_wired_marker() -> Option<(bool, bool)> {
 /// but the PAM stack is no longer wired, re-apply the recorded configuration;
 /// otherwise exit quietly. Always root (the path unit's service runs as root).
 fn reconcile() -> ExitCode {
-    let Some((with_sudo, with_polkit)) = read_wired_marker() else {
+    let Some((with_sudo, with_polkit, with_lock)) = read_wired_marker() else {
         // No marker. Two sub-cases:
         //  - Login IS currently wired (an upgrade from a pre-marker version, or
         //    a hand-wired install): ADOPT the existing wiring into a marker so a
@@ -270,16 +282,24 @@ fn reconcile() -> ExitCode {
         }
         let with_sudo = Path::new(SUDO).exists() && file_has_module(Path::new(SUDO));
         let with_polkit = polkit_wired() == Some(true);
-        write_wired_marker(true, with_sudo, with_polkit);
+        // Record the lock screen as ours only if the /etc override actually
+        // carries the module now (it was wired), not merely because the vendor
+        // file exists.
+        let with_lock =
+            Path::new(LOCKSCREEN.etc).exists() && file_has_module(Path::new(LOCKSCREEN.etc));
+        write_wired_marker(true, with_sudo, with_polkit, with_lock);
         eprintln!(
             "[login] adopted the existing face-login wiring into the self-heal marker \
-             (sudo={with_sudo}, polkit={with_polkit}); a future distro PAM update will now \
-             re-apply it automatically"
+             (sudo={with_sudo}, polkit={with_polkit}, lock={with_lock}); a future distro PAM \
+             update will now re-apply it automatically"
         );
         return ExitCode::SUCCESS;
     };
-    if active_login_wired() {
+    if active_login_wired() && !lockscreen_regressed(with_lock) {
         // Still intact; the common case after a spurious file-change event.
+        // Also re-apply when only the KDE lock screen regressed (its file is
+        // watched too, but active_login_wired alone would treat the login
+        // greeter staying wired as "nothing to do").
         return ExitCode::SUCCESS;
     }
     if effective_uid() != 0 {
@@ -310,12 +330,50 @@ fn active_login_wired() -> bool {
     etc.exists() && file_has_module(&etc)
 }
 
-/// Whether the self-heal marker says login WAS wired but the active greeter's
-/// stack no longer carries the module (a distro PAM regeneration stripped it):
-/// exactly the condition `login reconcile` repairs. The TUI's Repair tab uses
-/// this to offer the fix.
+/// Whether the KDE lock-screen face wiring regressed. Two shapes, both of which
+/// `active_login_wired` (login greeter only) misses while the DM greeter stays
+/// intact: a pambase / pam-auth-update regeneration STRIPS the module from the
+/// /etc/pam.d/kde override, OR a package update DELETES the override entirely
+/// (reverting to the vendor-only service). On a non-KDE box the vendor file is
+/// absent, so a missing override is not a regression — there is nothing to
+/// maintain there. reconcile re-materializes/re-wires in either case.
+fn lockscreen_regressed(with_lock: bool) -> bool {
+    // Only maintain the lock screen if we actually wired it (marker with_lock).
+    // Otherwise a Plasma vendor file present on a non-KDE box, or a box that
+    // chose fingerprint/RGB-less (no face lock), would read as a permanent
+    // regression and loop reconcile.
+    if !with_lock {
+        return false;
+    }
+    lock_regressed(Path::new(LOCKSCREEN.etc), LOCKSCREEN.vendor.map(Path::new))
+}
+
+/// Testable core of [`lockscreen_regressed`]: the /etc override was stripped in
+/// place (still there, lost the module), or it was deleted while a `vendor`
+/// service remains (a KDE box `login enable` had materialized and a package
+/// removed). A path taken from a real Svc so a temp path can drive it in tests.
+fn lock_regressed(etc: &Path, vendor: Option<&Path>) -> bool {
+    if etc.exists() {
+        return !file_has_module(etc); // stripped in place
+    }
+    vendor.is_some_and(|v| v.exists()) // deleted, but re-materializable from vendor
+}
+
+#[cfg(test)]
+fn path_regressed(etc: &Path) -> bool {
+    etc.exists() && !file_has_module(etc)
+}
+
+/// Whether the self-heal marker says login WAS wired but the wiring no longer
+/// holds: either the active greeter's stack lost the module (a distro PAM
+/// regeneration stripped it) OR the KDE lock screen regressed. Exactly the
+/// condition `login reconcile` repairs. The TUI's Repair tab uses this to offer
+/// the fix.
 pub(crate) fn reconcile_needed() -> bool {
-    read_wired_marker().is_some() && !active_login_wired()
+    match read_wired_marker() {
+        Some((_, _, with_lock)) => !active_login_wired() || lockscreen_regressed(with_lock),
+        None => false,
+    }
 }
 
 pub(crate) fn login_wired() -> bool {
@@ -704,7 +762,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
             },
             enable,
             apply,
-            &wire_sudo,
+            &wire_verify_service,
         ) {
             Ok(msg) => println!("  {msg}"),
             Err(e) => {
@@ -714,7 +772,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
         }
     }
     if polkit_in_scope(enable, with_polkit) {
-        match wire_service(&POLKIT, enable, apply, &wire_polkit) {
+        match wire_service(&POLKIT, enable, apply, &wire_verify_service) {
             Ok(msg) => {
                 println!("  {msg}");
                 if enable && apply {
@@ -748,7 +806,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
         // after a distro update rewrites a greeter's PAM file out from under us
         // (authselect, pam-auth-update, or a package upgrade shipping a fresh
         // vendor copy). On disable we clear the marker so reconcile stays quiet.
-        write_wired_marker(enable, with_sudo, with_polkit);
+        write_wired_marker(enable, with_sudo, with_polkit, want_face_lock);
         println!("[login] done. Password remains the fallback everywhere.");
     }
     if errs == 0 {
@@ -1000,7 +1058,7 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
                     if ondemand {
                         GREETER_UNSEAL_COSMIC_JUMP
                     } else {
-                        GREETER_UNSEAL
+                        GREETER_UNSEAL_FACEFIRST_JUMP
                     }
                     .to_string(),
                 );
@@ -1022,25 +1080,6 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
     }
     if sess_at.is_none() {
         out.push(RESEAL_SESSION.to_string()); // harmless optional session line
-    }
-    (format!("{}\n", out.join("\n")), true)
-}
-
-fn wire_single(content: &str, stanza: &str) -> (String, bool) {
-    if content_has_module(content) {
-        return (content.to_string(), false);
-    }
-    let mut out = Vec::new();
-    let mut done = false;
-    for l in content.lines() {
-        if !done && is_auth_directive(l) {
-            out.push(stanza.to_string());
-            done = true;
-        }
-        out.push(l.to_string());
-    }
-    if !done {
-        out.push(stanza.to_string());
     }
     (format!("{}\n", out.join("\n")), true)
 }
@@ -1118,17 +1157,17 @@ fn wire_fp_keyring(content: &str) -> (String, bool) {
     }
     (format!("{}\n", out.join("\n")), true)
 }
-fn wire_sudo(content: &str) -> (String, bool) {
-    wire_single(content, SUDO_STANZA)
-}
-/// Wire the polkit-1 stack: the verify stanza goes ABOVE the first auth-phase
-/// line, whether that is Fedora's `auth include system-auth` or Debian's
-/// `@include common-auth` (which `wire_single`'s auth-token anchor misses; an
-/// appended-at-end line would run after the password modules). No anchor →
-/// no wiring: appending to a file with no auth phase would leave pam_irlume as
-/// the only auth module, and its IGNORE on a failed face would then fail the
-/// whole prompt instead of falling back to the password.
-fn wire_polkit(content: &str) -> (String, bool) {
+/// Wire a single-stanza verify service (`sudo`, `polkit-1`): the stanza goes
+/// ABOVE the first auth-phase line, whether that is Fedora's `auth include
+/// system-auth` or Debian/Ubuntu's `@include common-auth`. An anchor that only
+/// matched a literal `auth` token missed the include layout entirely and the
+/// stanza got appended at EOF, i.e. AFTER the password modules, where it is dead:
+/// a wrong password already hit common-auth's pam_deny, a right one already
+/// granted via pam_unix. No anchor at all → no wiring: appending to a file with
+/// no auth phase would leave pam_irlume as the only auth module, and its IGNORE
+/// on a failed face would then fail the whole prompt instead of falling back to
+/// the password.
+fn wire_verify_service(content: &str) -> (String, bool) {
     if content_has_module(content) {
         return (content.to_string(), false);
     }
@@ -1142,7 +1181,7 @@ fn wire_polkit(content: &str) -> (String, bool) {
     let mut out = Vec::with_capacity(lines.len() + 1);
     for (i, l) in lines.iter().enumerate() {
         if i == anchor {
-            out.push(POLKIT_STANZA.to_string());
+            out.push(VERIFY_STANZA.to_string());
         }
         out.push((*l).to_string());
     }
@@ -1328,6 +1367,40 @@ mod tests {
     const GDM: &str = "#%PAM-1.0\nauth     [success=done ...] pam_selinux_permit.so\nauth     substack      password-auth\nauth     optional      pam_gnome_keyring.so\naccount  include       password-auth\nsession  include       password-auth\nsession  optional      pam_gnome_keyring.so auto_start\n";
 
     #[test]
+    fn path_regressed_flags_only_a_stripped_existing_file() {
+        let dir = std::env::temp_dir().join("irlume-pamwire-regress-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let wired = dir.join("kde-wired");
+        let stripped = dir.join("kde-stripped");
+        let absent = dir.join("kde-absent");
+        std::fs::write(&wired, "auth sufficient pam_irlume.so unseal ondemand\n").unwrap();
+        std::fs::write(&stripped, "auth include system-local-login\n").unwrap();
+        let _ = std::fs::remove_file(&absent);
+        // Stripped: the file is there (it was wired) but lost the module -> repair.
+        assert!(path_regressed(&stripped));
+        // Still wired: not a regression.
+        assert!(!path_regressed(&wired));
+        // Absent (non-KDE box / never wired): nothing to maintain, not a regression.
+        assert!(!path_regressed(&absent));
+
+        // lock_regressed adds the deleted-override case: /etc gone but the vendor
+        // service remains (a KDE box) is a regression; gone with no vendor is not.
+        let vendor = dir.join("vendor-kde");
+        std::fs::write(&vendor, "auth include something\n").unwrap();
+        assert!(lock_regressed(&stripped, Some(&vendor))); // stripped in place
+        assert!(!lock_regressed(&wired, Some(&vendor))); // still wired
+        assert!(lock_regressed(&absent, Some(&vendor))); // deleted, vendor present
+        assert!(!lock_regressed(&absent, None)); // deleted, no vendor (non-KDE)
+        let missing_vendor = dir.join("no-such-vendor");
+        assert!(!lock_regressed(&absent, Some(&missing_vendor))); // vendor also gone
+                                                                  // The marker gate: if we never wired the lock (with_lock=false), no state
+                                                                  // of /etc/pam.d/kde counts as a regression (a Plasma vendor file on a
+                                                                  // GNOME box must not loop reconcile).
+        assert!(!lockscreen_regressed(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn greeter_block_wraps_password_substack() {
         let (w, changed) = wire_greeter_impl(GDM, true, true, false);
         assert!(changed);
@@ -1351,6 +1424,23 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.starts_with("session") && l.contains("reseal")));
+    }
+
+    // Regression: the substack (Fedora) branch emitted a BARE `unseal` where the
+    // @include branch emitted `unseal facefirst`. Without the arg the module runs
+    // the active probe and blocks until the user types, so on the greeters this
+    // branch serves (old GDM below the GNOME gate, any unvalidated DM) the face
+    // never fired at all.
+    #[test]
+    fn substack_greeter_without_ondemand_still_gets_facefirst() {
+        let (w, changed) = wire_greeter_impl(GDM, true, false, false);
+        assert!(changed);
+        assert!(w.contains("pam_irlume.so unseal facefirst"), "{w}");
+        assert!(!w.contains("unseal ondemand"));
+        // Still the jump form (a substack IS skippable by success=1), with the
+        // landing that jump needs.
+        assert!(w.contains("[success=1 default=ignore]"));
+        assert!(w.contains("irlume-landing"));
     }
 
     // Debian/Ubuntu cosmic-greeter layout (@include-based; one service drives
@@ -1524,7 +1614,7 @@ mod tests {
     #[test]
     fn single_stanza_and_unwire_roundtrip() {
         let base = "#%PAM-1.0\nauth required pam_unix.so\nsession required pam_unix.so\n";
-        let (w, c) = wire_single(base, SUDO_STANZA);
+        let (w, c) = wire_verify_service(base);
         assert!(c && content_has_module(&w));
         let (back, changed) = unwire_lines(&w);
         assert!(changed && !content_has_module(&back));
@@ -1578,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_polkit_inserts_the_verify_stanza_before_the_first_auth_line() {
+    fn verify_service_inserts_the_stanza_before_the_first_auth_line() {
         // Fedora vendor layout (include system-auth) and Debian's @include
         // layout both anchor on the first auth directive; the stanza must land
         // above it so the face runs before the password modules, and the line
@@ -1588,7 +1678,7 @@ mod tests {
             "#%PAM-1.0\nauth       include      system-auth\naccount    include      system-auth\n",
             "#%PAM-1.0\n@include common-auth\n@include common-account\n",
         ] {
-            let (wired, changed) = wire_polkit(stock);
+            let (wired, changed) = wire_verify_service(stock);
             assert!(changed, "{stock:?}");
             let face = wired
                 .lines()
@@ -1607,19 +1697,19 @@ mod tests {
                 "{line}"
             );
             // Idempotent and fully reversible.
-            assert!(!wire_polkit(&wired).1);
+            assert!(!wire_verify_service(&wired).1);
             let (back, undone) = unwire_lines(&wired);
             assert!(undone && !content_has_module(&back));
         }
     }
 
     #[test]
-    fn wire_polkit_skips_a_file_with_no_auth_phase() {
+    fn verify_service_skips_a_file_with_no_auth_phase() {
         // With no auth anchor the stanza would become the ONLY auth module, and
         // a failed face (IGNORE) would then fail the prompt outright instead of
         // cascading to the password. Must skip, not append.
         let stock = "#%PAM-1.0\nsession    include      system-auth\n";
-        let (out, changed) = wire_polkit(stock);
+        let (out, changed) = wire_verify_service(stock);
         assert!(!changed);
         assert_eq!(out, stock);
     }
@@ -1675,7 +1765,7 @@ mod tests {
     #[test]
     fn disable_strips_in_place_when_the_file_changed_after_wiring() {
         let dir = TestDir::new("strip");
-        let (wired, changed) = wire_sudo(SUDO_STOCK);
+        let (wired, changed) = wire_verify_service(SUDO_STOCK);
         assert!(changed);
         let admin_line = "auth       required   pam_faillock.so preauth";
         let current = format!("{wired}{admin_line}\n");
@@ -1686,7 +1776,7 @@ mod tests {
             etc: leak(&etc),
             vendor: None,
         };
-        let msg = wire_service(&svc, false, true, &wire_sudo).unwrap();
+        let msg = wire_service(&svc, false, true, &wire_verify_service).unwrap();
         assert!(msg.contains("stripped irlume lines"), "{msg}");
         let after = std::fs::read_to_string(&etc).unwrap();
         assert!(
@@ -1706,7 +1796,7 @@ mod tests {
     #[test]
     fn disable_restores_the_backup_when_nothing_else_changed() {
         let dir = TestDir::new("restore");
-        let (wired, _) = wire_sudo(SUDO_STOCK);
+        let (wired, _) = wire_verify_service(SUDO_STOCK);
         let etc = dir.0.join("sudo");
         std::fs::write(&etc, &wired).unwrap();
         std::fs::write(dir.0.join(format!("sudo{BACKUP}")), SUDO_STOCK).unwrap();
@@ -1714,7 +1804,7 @@ mod tests {
             etc: leak(&etc),
             vendor: None,
         };
-        let msg = wire_service(&svc, false, true, &wire_sudo).unwrap();
+        let msg = wire_service(&svc, false, true, &wire_verify_service).unwrap();
         assert!(msg.contains("restored from backup"), "{msg}");
         assert_eq!(std::fs::read_to_string(&etc).unwrap(), SUDO_STOCK);
         assert!(!dir.0.join(format!("sudo{BACKUP}")).exists());
@@ -1858,12 +1948,34 @@ mod tests {
         assert_eq!(w, src);
     }
 
+    // Regression: face-sudo was dead code on Debian/Ubuntu. The old anchor only
+    // matched lines whose first token is `auth`, and Ubuntu 26.04's
+    // /etc/pam.d/sudo has none (session lines plus `@include common-auth`), so
+    // the stanza was appended at EOF — after the password stack, where it can
+    // never grant: a wrong password dies in common-auth's pam_deny first, a
+    // right one already succeeded via pam_unix.
     #[test]
-    fn wire_single_appends_when_there_is_no_auth_directive() {
-        // A stack with no auth line: the stanza is appended at the end.
-        let (w, c) = wire_single("#%PAM-1.0\n# comment only\n", SUDO_STANZA);
-        assert!(c && content_has_module(&w));
-        assert!(w.trim_end().ends_with(SUDO_STANZA));
+    fn face_sudo_wires_above_the_ubuntu_include_layout() {
+        // Verbatim from `podman run ubuntu:26.04` with the sudo package installed.
+        const UBUNTU_SUDO: &str = "#%PAM-1.0\n\n# Set up user limits from /etc/security/limits.conf.\nsession    required   pam_limits.so\n\nsession    required   pam_env.so readenv=1 user_readenv=0\nsession    required   pam_env.so readenv=1 envfile=/etc/default/locale user_readenv=0\n\n@include common-auth\n@include common-account\n@include common-session-noninteractive\n";
+        let (wired, changed) = wire_verify_service(UBUNTU_SUDO);
+        assert!(changed);
+        let lines: Vec<&str> = wired.lines().collect();
+        let stanza = lines.iter().position(|l| l.contains(MODULE)).unwrap();
+        let common_auth = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("@include common-auth"))
+            .unwrap();
+        assert!(
+            stanza < common_auth,
+            "stanza must precede the password stack:\n{wired}"
+        );
+        assert!(
+            !wired.trim_end().ends_with(VERIFY_STANZA),
+            "must not append at EOF"
+        );
+        // The `session pam_env` line above it is not an auth anchor.
+        assert!(stanza > 1, "{wired}");
     }
 
     #[test]
@@ -1915,14 +2027,20 @@ mod tests {
         std::env::set_var("IRLUME_STATE_DIR", &dir.0);
         // No marker → reconcile has nothing to maintain.
         assert_eq!(read_wired_marker(), None);
-        // Enable with only --with-polkit is recorded as (sudo=false, polkit=true).
-        write_wired_marker(true, false, true);
-        assert_eq!(read_wired_marker(), Some((false, true)));
-        // Re-enable with both flags overwrites cleanly.
-        write_wired_marker(true, true, true);
-        assert_eq!(read_wired_marker(), Some((true, true)));
+        // Enable with only --with-polkit is recorded (sudo=false, polkit=true,
+        // lock=false).
+        write_wired_marker(true, false, true, false);
+        assert_eq!(read_wired_marker(), Some((false, true, false)));
+        // Re-enable with both flags + the lock screen overwrites cleanly.
+        write_wired_marker(true, true, true, true);
+        assert_eq!(read_wired_marker(), Some((true, true, true)));
+        // A marker written before with_lock existed (only the two flags) reads
+        // back with lock=false, so it never triggers a false lock regression.
+        irlume_common::write_0600(&wired_marker_path(), b"with_sudo=true\nwith_polkit=false\n")
+            .unwrap();
+        assert_eq!(read_wired_marker(), Some((true, false, false)));
         // Disable clears the marker so the self-heal service stays quiet.
-        write_wired_marker(false, false, false);
+        write_wired_marker(false, false, false, false);
         assert_eq!(read_wired_marker(), None);
         match old {
             Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),

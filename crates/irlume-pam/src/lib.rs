@@ -77,15 +77,52 @@ fn is_remote_session(pamh: &Pam) -> bool {
             return true;
         }
     }
-    // KNOWN LIMITATION: a non-SSH remote desktop (xrdp / VNC / xpra) that sets
-    // neither PAM_RHOST nor the SSH_* markers is not detected here, so the local
-    // camera could fire for it and whoever is physically at the machine could
-    // grant the remote session. Most display managers set PAM_RHOST for a remote
-    // login; auto-detecting the rest reliably is not possible without risking a
-    // false positive that blocks a legitimate local login (there is no portable
-    // "is this session remote" signal). Documented in docs/THREAT_MODEL.md; the
-    // mitigation for a remote-desktop deployment is to not wire face auth there.
+    // Remote-desktop PAM services (xrdp / VNC / xpra / NoMachine) frequently set
+    // NEITHER a PAM_RHOST nor the SSH_* markers, yet the person driving them is
+    // NOT the one at the local camera. Deny face auth for those services by name:
+    // xrdp-sesman in particular includes common-auth on many distros, which is
+    // the exact vector by which a locally-oriented biometric runs during a remote
+    // login (see xrdp issue #1546). Logind seat/session data that could prove a
+    // local seat is not populated yet at authenticate() time (pam_systemd runs in
+    // the later session phase), so the service-name deny-list plus the rhost/SSH_*
+    // checks are the best available authenticate()-time signal. They are NOT a
+    // complete remote-desktop policy (see the residual below).
+    if let Ok(Some(svc)) = pamh.get_service() {
+        if is_remote_desktop_service(&svc.to_string_lossy()) {
+            return true;
+        }
+    }
+    // RESIDUAL (documented in docs/THREAT_MODEL.md): a deny-list by service name
+    // cannot catch every remote login. Two known classes:
+    //  - Remote-control software attached to the GENUINE local greeter/desktop on
+    //    seat0 (x11vnc of :0, an RDP screen-share, NoMachine to the physical
+    //    session): the PAM request originates from the real local GDM/SDDM and is
+    //    intentionally indistinguishable from someone typing at the monitor.
+    //  - GNOME Remote Desktop's headless multi-user RDP mode spins up a remote GDM
+    //    login that authenticates through the ORDINARY `gdm-password` service (a
+    //    permitted local name), so if that transaction sets no PAM_RHOST it is not
+    //    distinguishable here either.
+    // Both must be handled outside the module: do not expose the greeter/lock
+    // screen to remote control, and do not wire face auth where GNOME Remote Login
+    // is enabled.
     std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
+/// Known remote-desktop / remote-shell PAM service names whose sessions are not
+/// physically at the local camera. Matched conservatively (a curated set, not a
+/// broad substring sweep) so a legitimate local greeter is never stranded; an
+/// unmatched service just falls through to the ordinary remote checks. Face auth
+/// standing down here means IGNORE -> the password path, never a denied login.
+fn is_remote_desktop_service(service: &str) -> bool {
+    let s = service.trim().to_ascii_lowercase();
+    s.starts_with("xrdp")            // xrdp, xrdp-sesman
+        || s.contains("vnc")         // tigervnc, x11vnc, vncserver, kde vnc, ...
+        || s.starts_with("xpra")
+        || s == "nx"                 // NoMachine
+        || s.starts_with("nxagent")
+        || s.starts_with("nxnode")
+        || s.starts_with("nxserver")
+        || s == "sshd" // belt-and-suspenders alongside the rhost / SSH_* checks
 }
 
 impl PamServiceModule for IrlumePam {
@@ -231,7 +268,35 @@ impl PamServiceModule for IrlumePam {
             );
             if is_polkit && !unseal {
                 let _ = pamh.conv(
-                    Some("irlume: nod your head to approve (or close your eyes ~1s then open)"),
+                    Some("irlume: keep nodding your head to approve (or close your eyes ~1s then open)"),
+                    pamsm::PamMsgStyle::TEXT_INFO,
+                );
+            }
+
+            // Same discoverability problem on the credential-release path: by
+            // default the daemon requires the deliberate gesture before it releases
+            // the sealed keyring password, and a greeter that just says "Password:"
+            // gives the user no way to know that. Shown only on the interactive
+            // greeter probe (`unseal` without `wait`): in `wait` mode KDE runs us as
+            // a parallel biometric device where an unsolicited message competes with
+            // the password field.
+            //
+            // The instruction names the gesture the daemon will actually accept,
+            // from the same `consent_gesture` parse the engine gates on: telling a
+            // `closure`-only user to nod would cost them the whole watch window and
+            // then the password.
+            //
+            // Reading a root-only setting here is best-effort by design. Greeter and
+            // lock stacks run as root, so the read normally succeeds; a non-root PAM
+            // caller (a custom locker, `pamtester`) sees an unreadable file, which
+            // fails secure to ON and at worst over-instructs. It cannot obtain the
+            // credential either way, since the daemon refuses a non-root
+            // UnsealPassword.
+            if unseal && !wait && irlume_common::config::credential_release_challenge() {
+                let how = irlume_common::config::consent_gesture_mode()
+                    .instruction("unlock your keyring");
+                let _ = pamh.conv(
+                    Some(&format!("irlume: {how}")),
                     pamsm::PamMsgStyle::TEXT_INFO,
                 );
             }
@@ -415,6 +480,42 @@ mod tests {
     fn firewall_passes_normal_returns_through() {
         assert_eq!(firewall(|| PamError::SUCCESS), PamError::SUCCESS);
         assert_eq!(firewall(|| PamError::IGNORE), PamError::IGNORE);
+    }
+
+    #[test]
+    fn remote_desktop_services_are_denied_local_greeters_are_not() {
+        // Remote-desktop / remote-shell services stand down (face must not fire
+        // for a session the camera-side person isn't driving).
+        for svc in [
+            "xrdp",
+            "xrdp-sesman",
+            "tigervnc",
+            "x11vnc",
+            "vncserver",
+            "xpra",
+            "nx",
+            "nxagent",
+            "sshd",
+            "XRDP-SESMAN", // case-insensitive
+        ] {
+            assert!(is_remote_desktop_service(svc), "{svc} must be remote");
+        }
+        // Real local greeters / console / sudo must NOT be classified remote, or
+        // face login would never engage there.
+        for svc in [
+            "gdm-password",
+            "sddm",
+            "lightdm",
+            "plasmalogin",
+            "cosmic-greeter",
+            "greetd",
+            "kde",
+            "login",
+            "sudo",
+            "polkit-1",
+        ] {
+            assert!(!is_remote_desktop_service(svc), "{svc} must be local");
+        }
     }
 
     #[test]

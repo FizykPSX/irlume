@@ -15,10 +15,17 @@
 abi <abi/4.0>,
 include <tunables/global>
 
-profile irlumed /usr/bin/irlumed {
+profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   include <abstractions/base>
   # uid→name lookups for SO_PEERCRED authz (/etc/nsswitch.conf, passwd, group).
   include <abstractions/nameservice>
+  # On systemd-userdbd systems (Ubuntu 26.04+, systemd-homed) glibc's `systemd`
+  # NSS module resolves uid→name through the userdb varlink socket. Without this
+  # every SO_PEERCRED lookup logs an AppArmor denial (files still resolves a
+  # normal /etc/passwd user, but a userdb-only/homed user would fail authz). The
+  # nameservice abstraction predates userdb and does not cover it.
+  /run/systemd/userdb/ r,
+  /run/systemd/userdb/* rw,
 
   /usr/bin/irlumed mr,
 
@@ -71,6 +78,16 @@ profile irlumed /usr/bin/irlumed {
   /proc/[0-9]*/fd/ r,
   /proc/[0-9]*/fd/[0-9]* r,
   /proc/[0-9]*/comm r,
+
+  # The daemon reads its OWN confinement label + whether AppArmor is live so it
+  # can report real confinement in Health (the TUI shows enforce/complain/
+  # unconfined instead of guessing from the on-disk profile file). Under enforce
+  # these reads are themselves mediated, so without these rules the daemon cannot
+  # even tell it is confined and would report "unknown". /proc/self resolves to
+  # its own pid, matched by the numeric glob.
+  /sys/module/apparmor/parameters/enabled r,
+  /proc/[0-9]*/attr/current r,
+  /proc/[0-9]*/attr/apparmor/current r,
 
   # Reading another user's state dir as the root daemon.
   capability dac_override,
