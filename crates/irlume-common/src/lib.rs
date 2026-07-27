@@ -21,7 +21,8 @@ pub mod thirdparty;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
-/// Unix domain socket the daemon listens on. Root-owned, mode 0660, group-gated.
+/// Unix domain socket the daemon listens on. Root-owned, mode 0666: every local
+/// uid may connect, and `SO_PEERCRED` authorizes each request.
 pub const SOCKET_PATH: &str = "/run/irlume.sock";
 
 /// A byte secret (e.g. the login password) that zeroizes on drop and whose
@@ -209,7 +210,9 @@ pub enum Request {
     /// enrolled user, no claimed identity. Unprivileged (no credential release).
     Identify,
     /// Switch the active RGB+IR camera pair, persisting it (cameras.conf) so it
-    /// survives a daemon restart. PRIVILEGED (root or self); writes /etc/irlume.
+    /// survives a daemon restart. ROOT ONLY: it writes a system-wide setting
+    /// under /etc/irlume, which is not an arbitrary peer's to change. (This said
+    /// "root or self", which never matched the dispatch gate.)
     SetCameras { rgb: String, ir: String },
     /// Add one scan to an existing profile ("improve recognition"). PRIVILEGED.
     AddScan { user: String, profile: String },
