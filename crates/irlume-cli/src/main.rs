@@ -89,6 +89,15 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     }
+    // `--help` ANYWHERE means help, not "run the command and also I asked for
+    // help". Matching it only in position 0 meant `irlume detect --help` printed
+    // readiness, `irlume enroll --help` fired a capture, `irlume keyring arm
+    // --help` prompted for the login password, and `irlume uninstall --help`
+    // opened the uninstall confirmation. Asking a program what it does should
+    // never be the thing that does it.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return commands::help();
+    }
     match (
         args.first().map(String::as_str),
         args.get(1).map(String::as_str),
@@ -107,7 +116,15 @@ fn main() -> std::process::ExitCode {
         (Some("liveness"), _) => liveness_probe(&args),
         (Some("meshprobe"), _) => meshprobe(&args),
         (Some("enroll"), _) => enroll(&args),
-        (Some("profiles"), Some("list")) if args.iter().any(|arg| arg == "--json") => {
+        // Matched on PRESENCE of the subcommand, not on its position. Binding it
+        // to args[1] meant a flag before it displaced it: `profiles --contract 9
+        // list --json` fell through to the human handler and answered a machine
+        // caller with prose on stderr and exit 2, while `doctor`/`status`/
+        // `version` accepted the same flag anywhere. The contract documents no
+        // ordering rule, so all five now behave the same way.
+        (Some("profiles"), _)
+            if args.iter().any(|a| a == "list") && args.iter().any(|a| a == "--json") =>
+        {
             machine::profiles_list(&args)
         }
         (Some("profiles"), sub) => profiles(sub, &args),
@@ -117,7 +134,9 @@ fn main() -> std::process::ExitCode {
         (Some("recovery"), sub) => recovery::run(sub, &args),
         (Some("bitwarden"), sub) => bitwarden::run(sub, &args),
         (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
-        (Some("login"), Some("status")) if args.iter().any(|arg| arg == "--json") => {
+        (Some("login"), _)
+            if args.iter().any(|a| a == "status") && args.iter().any(|a| a == "--json") =>
+        {
             machine::login_status(&args)
         }
         (Some("login"), sub) => pamwire::run(sub, &args),
@@ -140,7 +159,7 @@ fn main() -> std::process::ExitCode {
             println!("irlume {}", env!("CARGO_PKG_VERSION"));
             std::process::ExitCode::SUCCESS
         }
-        (Some("doctor"), _) => doctor(),
+        (Some("doctor"), _) => doctor(&args),
         (Some("normprobe"), _) => normprobe(&args),
         (Some("status"), _) => commands::status(&args),
         (Some("detect"), _) => commands::detect(&args),
@@ -151,7 +170,7 @@ fn main() -> std::process::ExitCode {
         (Some("selinux"), sub) => commands::selinux(sub, &args),
         (Some("setup"), _) => commands::setup(&args),
         (Some("help" | "--help" | "-h"), _) => commands::help(),
-        (Some("tui"), _) => match tui::run() {
+        (Some("tui"), _) => match tui::run(&args) {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("tui: {e}");
@@ -317,24 +336,14 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
             },
             _ => return usage_profiles(),
         },
-        Some("eyes-open") => {
-            let on = args.iter().any(|a| a == "on");
-            let off = args.iter().any(|a| a == "off");
-            if on == off {
-                eprintln!("usage: irlume profiles eyes-open <on|off> [--user U]");
-                return std::process::ExitCode::from(2);
-            }
-            Request::SetRequireEyesOpen { user, on }
-        }
-        Some("challenge") => {
-            let on = args.iter().any(|a| a == "on");
-            let off = args.iter().any(|a| a == "off");
-            if on == off {
-                eprintln!("usage: irlume profiles challenge <on|off> [--user U]");
-                return std::process::ExitCode::from(2);
-            }
-            Request::SetRequireChallenge { user, on }
-        }
+        Some("eyes-open") => match toggle_value(args, "eyes-open") {
+            Some(on) => Request::SetRequireEyesOpen { user, on },
+            None => return std::process::ExitCode::from(2),
+        },
+        Some("challenge") => match toggle_value(args, "challenge") {
+            Some(on) => Request::SetRequireChallenge { user, on },
+            None => return std::process::ExitCode::from(2),
+        },
         _ => return usage_profiles(),
     };
     match daemon_request(&req) {
@@ -973,6 +982,34 @@ pub(crate) fn daemon_poll(req: &irlume_common::Request) -> Result<irlume_common:
     irlume_common::client::request_poll(req).map_err(|e| e.to_string())
 }
 
+/// The `on`/`off` word for `profiles eyes-open|challenge`, read as the argument
+/// AFTER the subcommand rather than found anywhere in argv.
+///
+/// Scanning the whole command line meant a flag VALUE could be mistaken for the
+/// setting: `irlume profiles eyes-open --user on` turned the feature on for an
+/// account named `on`, and `--user off` turned it off for one named `off`. The
+/// value is positional, so it is read positionally.
+fn toggle_value(args: &[String], sub: &str) -> Option<bool> {
+    let idx = args.iter().position(|a| a == sub)?;
+    let value = match args.get(idx + 1).map(String::as_str) {
+        Some("on") => Some(true),
+        Some("off") => Some(false),
+        _ => None,
+    };
+    // A contradictory second word stays a usage error rather than first-wins.
+    // The previous whole-argv scan caught `eyes-open on off` that way, and
+    // reading positionally has to keep it while no longer mistaking a
+    // `--user on` VALUE for the setting.
+    let contradicted = matches!(args.get(idx + 2).map(String::as_str), Some("on" | "off"));
+    match value {
+        Some(v) if !contradicted => Some(v),
+        _ => {
+            eprintln!("usage: irlume profiles {sub} <on|off> [--user U]");
+            None
+        }
+    }
+}
+
 pub(crate) fn user_arg(args: &[String]) -> String {
     flag(args, "--user")
         .map(str::to_string)
@@ -1095,6 +1132,21 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
     // (e.g. SFHQ synthetic faces; every file is a different person), so every
     // pair is an impostor pair. Measures FAR only (no genuine pairs / FRR).
     if args.iter().any(|a| a == "--impostor-only") {
+        // `--lfw` is an identity-GROUPING rule, and this mode has no grouping:
+        // it assumes every file is a different person and pairs all of them.
+        // Accepting both silently counted same-person pairs as impostor pairs,
+        // which inflates the reported FAR on any set with repeated identities.
+        // Refuse rather than return a number that does not mean what it says.
+        if args.iter().any(|a| a == "--lfw") {
+            eprintln!(
+                "[irbench] --impostor-only and --lfw are incompatible: --impostor-only \
+                 assumes every image is a DIFFERENT person and pairs all of them, so on a \
+                 set with several images per identity (which is what --lfw describes) the \
+                 same-person pairs would be counted as impostor pairs and the reported FAR \
+                 would be an upper bound, not an impostor rate. Drop one of the two flags."
+            );
+            return std::process::ExitCode::from(2);
+        }
         return farbench(dir, det_path, model, args);
     }
 
@@ -2767,14 +2819,20 @@ fn report_polkit_sandbox(report: &mut crate::doctor_report::Report) {
     }
 }
 
-fn doctor() -> std::process::ExitCode {
+fn doctor(args: &[String]) -> std::process::ExitCode {
     let mut report = crate::doctor_report::Report::new(crate::doctor_report::Mode::Human);
-    doctor_run(&mut report)
+    doctor_run(&mut report, args)
 }
 
 /// One pass over the machine. Prints the human report or stays silent and
 /// records, depending on `report`.
-fn doctor_run(report: &mut crate::doctor_report::Report) -> std::process::ExitCode {
+/// `args` carries `--user`, which doctor reports on in eight per-user lines.
+/// Resolving with an empty slice ignored the flag silently, while
+/// `docs/COMMANDS.md` documents `--user U` as a global convention.
+fn doctor_run(
+    report: &mut crate::doctor_report::Report,
+    args: &[String],
+) -> std::process::ExitCode {
     use crate::doctor_report::State;
     use irlume_common::secureboot;
     // --- platform / trust anchors ------------------------------------------
@@ -3021,7 +3079,7 @@ fn doctor_run(report: &mut crate::doctor_report::Report) -> std::process::ExitCo
         }
         // Stale device claim: pam_fprintd then fails silently and the finger
         // prompt never appears. The dominant post-suspend fingerprint failure.
-        let user = user_arg(&[]);
+        let user = user_arg(args);
         if irlume_fingerprint::reader_stuck(&user) {
             dout!(
                 report,
@@ -3050,7 +3108,7 @@ fn doctor_run(report: &mut crate::doctor_report::Report) -> std::process::ExitCo
     }
 
     // Template encryption + recovery come from the daemon (root-only store).
-    let user = user_arg(&[]);
+    let user = user_arg(args);
     match daemon_request(&irlume_common::Request::RecoveryStatus { user: user.clone() }) {
         Ok(irlume_common::Response::RecoveryStatus {
             encrypted,
@@ -3596,6 +3654,50 @@ mod tests {
 
         // And the degenerate case: no readings cannot report false confidence.
         assert_eq!(rounds_that_would_register(&[], &[], &cal), (0, 0));
+    }
+
+    /// The on/off word is positional. Scanning argv for it meant a flag value
+    /// could be mistaken for the setting, so `--user on` configured an account
+    /// named `on` instead of reporting a usage error.
+    #[test]
+    fn a_toggle_reads_its_value_positionally_not_from_anywhere_in_argv() {
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            toggle_value(&argv(&["eyes-open", "on"]), "eyes-open"),
+            Some(true)
+        );
+        assert_eq!(
+            toggle_value(
+                &argv(&["eyes-open", "off", "--user", "someone"]),
+                "eyes-open"
+            ),
+            Some(false)
+        );
+        // The bug: a username that happens to be `on` or `off`.
+        assert_eq!(
+            toggle_value(&argv(&["eyes-open", "--user", "on"]), "eyes-open"),
+            None,
+            "a --user VALUE must never be read as the setting"
+        );
+        assert_eq!(
+            toggle_value(&argv(&["challenge", "--user", "off"]), "challenge"),
+            None
+        );
+        // Contradictory input stays a usage error rather than first-wins.
+        assert_eq!(
+            toggle_value(&argv(&["eyes-open", "on", "off"]), "eyes-open"),
+            None
+        );
+        assert_eq!(
+            toggle_value(&argv(&["eyes-open", "off", "on"]), "eyes-open"),
+            None
+        );
+        // Missing value, and a value that is neither word.
+        assert_eq!(toggle_value(&argv(&["challenge"]), "challenge"), None);
+        assert_eq!(
+            toggle_value(&argv(&["challenge", "yes"]), "challenge"),
+            None
+        );
     }
 
     #[test]

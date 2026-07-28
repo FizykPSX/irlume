@@ -43,6 +43,11 @@ override_dh_auto_install:
 		debian/irlume/usr/share/irlume/models/face_landmark.onnx
 	install -D -m0644 models/blaze_face_short_range.onnx \
 		debian/irlume/usr/share/irlume/models/blaze_face_short_range.onnx
+# The machine-API JSON Schema. Fedora, Arch, Debian-nfpm and Nix all ship it and
+# the integration docs point consumers at this exact path, so a PPA install that
+# omitted it made those docs wrong for every Ubuntu user.
+	install -D -m0644 schemas/machine-api-v1.schema.json \
+		debian/irlume/usr/share/irlume/schemas/machine-api-v1.schema.json
 	mkdir -p debian/irlume/opt/irlume/onnxruntime
 	cp -a ort-prebuilt/lib debian/irlume/opt/irlume/onnxruntime/
 	install -D -m0644 packaging/systemd/irlumed.service \
@@ -56,6 +61,13 @@ override_dh_auto_install:
 		debian/irlume/usr/lib/systemd/system/irlume-reconcile.path
 	install -D -m0644 packaging/systemd/irlume-reconcile.service \
 		debian/irlume/usr/lib/systemd/system/irlume-reconcile.service
+# The timer, which Fedora, Arch and the universal .deb all ship and this lane
+# missed. It is not redundant with the .path unit: a path unit watches an inode,
+# and a config regenerator REPLACES the file by rename, which the watch cannot
+# see. Without the timer, PPA users get self-heal that silently misses the exact
+# failure it was built for.
+	install -D -m0644 packaging/systemd/irlume-reconcile.timer \
+		debian/irlume/usr/lib/systemd/system/irlume-reconcile.timer
 	install -D -m0644 packaging/apparmor/usr.bin.irlumed \
 		debian/irlume/etc/apparmor.d/usr.bin.irlumed
 

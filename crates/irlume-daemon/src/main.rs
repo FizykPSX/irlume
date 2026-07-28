@@ -433,22 +433,35 @@ fn main() {
     // descriptors one peer can pin; past it, connections are closed immediately.
     const REFUSAL_PENALTY: std::time::Duration = std::time::Duration::from_millis(250);
     const MAX_PENALTY_BOX: usize = 64;
-    let mut penalty_box: Vec<(UnixStream, std::time::Instant)> = Vec::new();
+    // Shared with a janitor thread, because draining only when the NEXT
+    // connection arrives is wrong in exactly the case that matters. `accept`
+    // blocks, so if the last connection to arrive is the one being held, nothing
+    // wakes to release it: a throttled uid's own lock screen would sit until
+    // some other client happened to connect, and PAM would wait out its whole
+    // read timeout instead of the 250ms this is supposed to cost. One thread for
+    // the daemon's lifetime, not one per held connection.
+    let penalty_box: std::sync::Arc<std::sync::Mutex<Vec<(UnixStream, std::time::Instant)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let box_ref = std::sync::Arc::clone(&penalty_box);
+        let _ = std::thread::Builder::new()
+            .name("irlume-penalty".into())
+            .spawn(move || loop {
+                std::thread::sleep(REFUSAL_PENALTY / 2);
+                let now = std::time::Instant::now();
+                let mut held = match box_ref.lock() {
+                    Ok(h) => h,
+                    Err(e) => e.into_inner(),
+                };
+                // Dropping the stream closes it, which is the moment the
+                // client's blocked read returns.
+                held.retain(|(_, until)| now < *until);
+            });
+    }
 
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                // Release anyone whose penalty has expired. Dropping the stream
-                // closes it, which is the moment the client's blocked read
-                // returns. Done here rather than on a timer because the only
-                // thing that fills this list is a peer still connecting.
-                penalty_box.retain(|(_, until)| {
-                    if std::time::Instant::now() < *until {
-                        true
-                    } else {
-                        false // dropped, and closed with it
-                    }
-                });
                 // A peer spinning on refusals is HELD, not answered and not
                 // dropped: its read blocks until the penalty expires, which
                 // paces it. Dropping was measured to be worse than useless, as
@@ -457,8 +470,12 @@ fn main() {
                 // daemon still burned 206% of a core. Holding costs a file
                 // descriptor and no thread, no parse and no arbiter round trip.
                 if peer_cred(&stream).is_ok_and(|p| refusal_throttled(p.uid)) {
-                    if penalty_box.len() < MAX_PENALTY_BOX {
-                        penalty_box.push((stream, std::time::Instant::now() + REFUSAL_PENALTY));
+                    let mut held = match penalty_box.lock() {
+                        Ok(h) => h,
+                        Err(e) => e.into_inner(),
+                    };
+                    if held.len() < MAX_PENALTY_BOX {
+                        held.push((stream, std::time::Instant::now() + REFUSAL_PENALTY));
                     }
                     // Over the cap the stream is dropped here, bounding the
                     // descriptors one abusive peer can pin.
@@ -763,8 +780,14 @@ fn password_matches_login(user: &str, password: &[u8]) -> Option<bool> {
     key.extend_from_slice(password);
     key.push(0);
     let setting = std::ffi::CString::new(stored.as_str()).ok()?;
-    // SAFETY: single-threaded daemon (crypt's static buffer is not shared); the
-    // pointers are valid NUL-terminated C strings for the call's duration.
+    // SAFETY: `crypt` returns a pointer into a STATIC buffer, so concurrent calls
+    // would race. The daemon is NOT single-threaded, which an earlier version of
+    // this comment claimed: it runs up to 64 connection threads plus a watchdog
+    // and a penalty-box janitor. The invariant that actually holds is narrower
+    // and must be preserved: this is reached only from `dispatch`, and `dispatch`
+    // runs only on the one camera worker thread. Calling it from a connection
+    // thread would be a data race. The pointers are valid NUL-terminated C
+    // strings for the call's duration.
     let out = unsafe { crypt(key.as_ptr() as *const libc::c_char, setting.as_ptr()) };
     if out.is_null() {
         return None; // unsupported hash format on this libcrypt
@@ -966,10 +989,12 @@ fn spawn_watchdog() {
 // at 44 against a cap of 64, so exhaustion was never the mechanism; CPU was, and
 // the cost is paid per CONNECTION, before the request is even parsed.
 //
-// So the throttle is enforced in the accept loop, where a dropped connection
-// costs no thread, no parse and no arbiter round trip. A short delay before
-// answering, the other obvious shape, would have made this worse: it holds a
-// connection thread for its whole duration and does nothing about the CPU.
+// So the throttle is enforced in the accept loop, where a throttled connection
+// costs no thread, no parse and no arbiter round trip. It is HELD there briefly
+// rather than dropped: measured, dropping was worse than useless, because an
+// instant EOF let the client reconnect sooner and CPU barely moved. A delay
+// before ANSWERING, the other obvious shape, would also have been worse: it
+// holds a connection thread for its whole duration and does nothing about CPU.
 //
 // It is fed ONLY by requests the arbiter actually refused, so a peer doing
 // ordinary work is never throttled no matter how busy it is. Root is exempt:
@@ -984,7 +1009,7 @@ fn spawn_watchdog() {
 // ---------------------------------------------------------------------------
 
 /// Refusals per second a single non-root uid may generate before its new
-/// connections are dropped. Set from `IRLUME_REFUSAL_RATE`; 0 disables the
+/// connections are held. Set from `IRLUME_REFUSAL_RATE`; 0 disables the
 /// throttle. Well above any real client: a refusal means the camera was busy,
 /// and a legitimate caller retries on a human timescale, not thousands of times
 /// a second.
@@ -1437,7 +1462,14 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 engine.rgb_device().to_string(),
                 engine.ir_device().to_string(),
             );
-            match irlume_auth::measure_contention(&rgb_dev, &ir_dev, rounds) {
+            // Reports between captures so a long but healthy tune is not read
+            // as a wedged driver by the watchdog (#141).
+            match irlume_auth::measure_contention_with_progress(
+                &rgb_dev,
+                &ir_dev,
+                rounds,
+                &note_worker_progress,
+            ) {
                 Ok(report) => {
                     let mode = report.recommended_mode();
                     match irlume_auth::store_capture_mode(&rgb_dev, mode) {
