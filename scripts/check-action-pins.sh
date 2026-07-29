@@ -16,8 +16,33 @@ set -euo pipefail
 # It is version-pinned by tag (@vX.Y.Z) by design and is itself provenanced.
 ALLOW_TAG_PREFIX="slsa-framework/slsa-github-generator/"
 
+# Discovery has to be counted and its status checked, not assumed. Reading the
+# matches from a process substitution hid both: `while ... done < <(grep ...)`
+# runs the loop zero times when grep matches nothing, and a process
+# substitution's exit status is invisible to `set -e` and pipefail, so the
+# script printed success having examined no references at all. That is reachable
+# without anyone touching this file: reformatting to `uses :`, moving steps into
+# generated YAML, or a rename of the workflows directory all produce it.
+#
+# grep is therefore run as its own command whose status is inspected: 0 is
+# matches, 1 is a clean no-match, and anything above that is a read error, which
+# means an unknown share of the workflows went unexamined.
+refs="$(mktemp)"
+trap 'rm -f "$refs"' EXIT
+
+grep_status=0
+grep -rnE '^[[:space:]]*(-[[:space:]]+)?uses:' .github/workflows/ > "$refs" || grep_status=$?
+
+if [ "$grep_status" -gt 1 ]; then
+  echo "Search over .github/workflows/ failed (grep exited $grep_status)."
+  echo "Some workflows were not read, so nothing here can be called pinned."
+  exit 1
+fi
+
+seen=0
 fail=0
 while IFS= read -r line; do
+  seen=$((seen + 1))
   file="${line%%:*}"
   rest="${line#*:}"
   # The reference is the token after `uses:` (strip a leading `- `).
@@ -33,7 +58,14 @@ while IFS= read -r line; do
     echo "NOT SHA-PINNED: $file -> $ref"
     fail=1
   fi
-done < <(grep -rnE '^[[:space:]]*(-[[:space:]]+)?uses:' .github/workflows/)
+done < "$refs"
+
+if [ "$seen" -eq 0 ]; then
+  echo "No 'uses:' references found under .github/workflows/."
+  echo "Every workflow here uses at least one action, so finding none means the"
+  echo "search stopped matching, not that the repository stopped using actions."
+  exit 1
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo
@@ -41,4 +73,4 @@ if [ "$fail" -ne 0 ]; then
   echo "The only allowed tag reference is ${ALLOW_TAG_PREFIX}* (SLSA generator)."
   exit 1
 fi
-echo "All action references are SHA-pinned (SLSA generator excepted)."
+echo "All $seen action references are SHA-pinned (SLSA generator excepted)."
