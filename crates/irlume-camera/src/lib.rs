@@ -1286,10 +1286,21 @@ impl IrCamera {
     /// measured: after ONE control write the emitter stayed lit for 30s of
     /// continuous streaming on both (ASUS built-in at a flat level of 144, NexiGo
     /// N930W at ~37), and the control survives even stream close and process
-    /// exit. See `examples/ir_refire_probe.rs`. The per-capture re-fires below
-    /// are kept anyway: an XU write costs microseconds against a 67ms frame, and
-    /// they are the only protection for modules we have never seen.
+    /// exit. See `examples/ir_refire_probe.rs`.
+    ///
+    /// The per-capture re-fires that used to sit below are gone (#168): they are
+    /// not part of the sequence Microsoft documents, and on a module that DOES
+    /// self-clear the illumination metadata from #167 now reports the dark
+    /// frames rather than leaving brightness to guess. The residual risk is a
+    /// module nobody here has seen going dark for a window, which costs the user
+    /// a password fallback rather than the hardware.
     pub fn session(&self) -> irlume_common::Result<IrSession<'_>> {
+        // DECLARED before the stream so it drops AFTER it. Locals drop in
+        // reverse declaration order, and `warm_up_stream` below can fail: with
+        // the guard declared second, that `?` dropped it first and sent the
+        // restore while the stream was still live, the very mid-stream write
+        // this change removes. Assigned further down, once the stream exists.
+        let mode;
         let mut stream = SafeStream::open(&self.device, &self.dev)?;
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
@@ -1297,18 +1308,35 @@ impl IrCamera {
         // buffers; STREAMON happens on the first dequeue, which is inside
         // `warm_up_stream` below. This is the window, and it is the only one.
         let meta = ir_metadata::IlluminationLog::open(&self.device);
+        // BEFORE the warm-up, because the warm-up's first dequeue is STREAMON.
+        // Microsoft's sequence sets the property and THEN starts streaming, and
+        // this ran the other way round: every authentication set the mode under
+        // an already-running stream, the mid-stream write the rest of #168
+        // removes.
+        //
+        // Still after `SafeStream::open`, which allocates buffers and starts
+        // nothing, and after the metadata queue above, whose ordering against
+        // the image queue is load-bearing and measured.
+        //
+        // The comment this replaces said the write had to happen "while
+        // streaming" because Hello modules reset the control per open. The reset
+        // is on DEVICE open, which happened in `IrCamera::open`, not here; and
+        // the record above says the control survives stream close and process
+        // exit on both cameras measured, so it is not stream-scoped.
+        //
+        // Held for the session rather than just applied: dropping `IrSession`
+        // puts the control back to the camera's own default, which is the
+        // documented sequence's last step and the half irlume never did.
+        mode = ir_emitter::enable(self.dev.handle().fd(), &self.card, &self.device);
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
         warm_up_stream(&self.device, &mut stream)?;
-        // Fire the active-IR emitter on the open fd (Hello modules reset it
-        // per-open, so we must do it here, while streaming, not via an external
-        // one-shot).
-        let lit = ir_emitter::enable(self.dev.handle().fd(), &self.card, &self.device);
         Ok(IrSession {
             cam: self,
             stream,
             dec: IrDecoder::new(self.pix),
-            lit,
+            lit: mode.lit(),
+            _mode: mode,
             meta,
         })
     }
@@ -1323,6 +1351,17 @@ pub struct IrSession<'a> {
     /// The camera's own per-frame illumination reporting, when it has any.
     /// `None` means this camera cannot say, and brightness decides as before.
     meta: Option<ir_metadata::IlluminationLog>,
+    /// Restores the face-auth control when this session ends, on every path out
+    /// including an error or a panic. Declared LAST of the streaming fields, so
+    /// it drops last: struct fields drop in declaration order, and both `stream`
+    /// and `meta` have to stop before the control is put back. `meta` is a
+    /// running V4L2 stream of its own that issues STREAMOFF from its `Drop`, so
+    /// with it declared after this one the restore went out while a stream tied
+    /// to the same capture was still live.
+    ///
+    /// Never read. It is held for its `Drop`, which is the whole point, and the
+    /// dead-code lint cannot see that.
+    _mode: ir_emitter::StreamMode,
 }
 
 impl IrSession<'_> {
@@ -1332,14 +1371,13 @@ impl IrSession<'_> {
         let device = self.cam.device.as_str();
         let (w, h) = (self.cam.width, self.cam.height);
         let card = &self.cam.card;
-        let fd = self.cam.dev.handle().fd();
         let lit = self.lit;
         let stream = &mut self.stream;
         let dec = &mut self.dec;
         // The emitter may STROBE (pulse), so grab a burst and keep the brightest
-        // frame, the lit strobe phase (linhello lesson). Re-fire mid-burst in case
-        // the control self-clears. Keep every frame so the optional ambient
-        // subtraction below can pair the lit frame with an adjacent emitter-off one.
+        // frame, the lit strobe phase (linhello lesson). Keep every frame so the
+        // optional ambient subtraction below can pair the lit frame with an
+        // adjacent emitter-off one.
         // Every frame is decoded to 8-bit GREY at dequeue, so the means, the
         // subtraction, and everything downstream see one uniform layout.
         let mut frames: Vec<Vec<u8>> = Vec::with_capacity(IR_BURST);
@@ -1356,10 +1394,16 @@ impl IrSession<'_> {
         if let Some(log) = meta.as_mut() {
             log.begin_burst();
         }
-        for i in 0..IR_BURST {
-            if i == IR_BURST / 2 {
-                ir_emitter::enable(fd, card, device);
-            }
+        // No re-fire mid-burst. The mode is set once before the stream starts,
+        // which is the sequence Microsoft documents and tests: set the property,
+        // start streaming, stop streaming, unset. Rewriting the control under a
+        // running stream is not part of it, and nothing published says which
+        // frame such a write first affects.
+        //
+        // The re-fire existed to make sure a lit frame landed in the burst. The
+        // camera answers that directly now, per frame, through the illumination
+        // metadata added in #167, so the guess is not needed to know the answer.
+        for _ in 0..IR_BURST {
             let (buf, bmeta) = stream.next().map_err(|e| map_io(device, e))?;
             stamps.push(bmeta.timestamp.sec * 1_000_000 + bmeta.timestamp.usec);
             taken.push(std::time::Instant::now());
@@ -1673,9 +1717,25 @@ pub mod ir_probe {
         let (fmt, pix) = negotiate_ir_format(device, &dev)?;
         let mut dec = super::IrDecoder::new(pix);
         let (w, h) = (fmt.width, fmt.height);
-        let mut stream = super::SafeStream::open(device, &dev)?;
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-        ir_emitter::enable(dev.handle().fd(), &card, device);
+        // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
+        // reverse declaration order, so `stream` drops first and stops the
+        // stream, and only then does this guard put the control back; declaring
+        // it after `stream` sent the restore out while the stream was still
+        // live, which is the mid-stream write this change exists to remove.
+        //
+        // The assignment waits for the open because writing first would touch
+        // the camera for a stream that may never exist: an open that fails on
+        // EBUSY, with another process already streaming, would leave this one
+        // having applied the mode and then restored the default underneath the
+        // other process's live stream. `SafeStream::open` only allocates
+        // buffers; STREAMON happens on the first dequeue, so the set still
+        // lands before streaming starts.
+        let mode;
+        let mut stream = super::SafeStream::open(device, &dev)?;
+        mode = ir_emitter::enable(dev.handle().fd(), &card, device);
+        // Bound, never read: held for its `Drop`, which restores the control.
+        let _ = &mode;
         let mut out = Vec::with_capacity(n);
         let t0 = std::time::Instant::now();
         for _ in 0..n {
@@ -1758,9 +1818,23 @@ pub fn capture_ir_streaming<B>(
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix);
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = SafeStream::open(device, &dev)?;
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-    ir_emitter::enable(dev.handle().fd(), &card, device);
+    // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
+    // reverse declaration order, so `stream` drops first and stops the
+    // stream, and only then does this guard put the control back; declaring
+    // it after `stream` sent the restore out while the stream was still
+    // live, which is the mid-stream write this change exists to remove.
+    //
+    // The assignment waits for the open because writing first would touch
+    // the camera for a stream that may never exist: an open that fails on
+    // EBUSY, with another process already streaming, would leave this one
+    // having applied the mode and then restored the default underneath the
+    // other process's live stream. `SafeStream::open` only allocates
+    // buffers; STREAMON happens on the first dequeue, so the set still
+    // lands before streaming starts.
+    let mut mode;
+    let mut stream = SafeStream::open(device, &dev)?;
+    mode = ir_emitter::enable(dev.handle().fd(), &card, device);
     // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
     // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
     // constant mid-grey for the rest of the window); real sensor noise never
@@ -1770,11 +1844,26 @@ pub fn capture_ir_streaming<B>(
     // (Signature + predicate live in `frame_signature` / `frame_frozen`.)
     let (mut dead_run, mut restarts) = (0usize, 0usize);
     let mut last_sig: Option<Vec<u8>> = None;
-    for attempt in 0..max_frames {
-        // Keep the emitter lit across the whole window (some controls self-clear).
-        if attempt % 8 == 0 {
-            ir_emitter::enable(dev.handle().fd(), &card, device);
-        }
+    // Set once above, before the stream started, and not again inside the loop.
+    //
+    // This used to re-apply the control every eighth frame on the theory that
+    // "some controls self-clear". At the default consent budget that is ten more
+    // writes to camera firmware per watch, and `enable` is not a bare ioctl: each
+    // call re-reads the USB descriptors from sysfs and takes a lock to scan the
+    // undo journal on disk. Ten of those sit in the authentication path for a
+    // hypothesis this project MEASURED and found false: the record in
+    // `IrCamera::session` says the control survives stream close and process
+    // exit on both cameras here, so there was nothing self-clearing to re-arm
+    // against.
+    //
+    // NOT justified by the illumination metadata from #167. `capture_with_stats`
+    // classifies its frames with that; this function never opens the metadata
+    // queue, and an earlier version of this comment claimed the evidence anyway.
+    // The residual risk is a module nobody here has seen whose control does
+    // self-clear mid stream: this path would go dark for the window and cost the
+    // user a password fallback. Reading the metadata queue here is how that gets
+    // closed, and it is not done.
+    for _ in 0..max_frames {
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
         let taken = std::time::Instant::now();
         let data = dec.decode(buf, w, h);
@@ -1790,7 +1879,26 @@ pub fn capture_ir_streaming<B>(
                 last_sig = None;
                 drop(stream); // stop + release buffers before re-arming
                 stream = SafeStream::open(device, &dev)?;
-                ir_emitter::enable(dev.handle().fd(), &card, device);
+                // The reopened stream needs the mode set again, and the OLD
+                // guard is only given up if the new one actually took. The
+                // measured behaviour on both cameras here is that the control
+                // survives a stream close, so the fresh `enable` can find the
+                // value still in place, send nothing, and come back unarmed.
+                // The restore then still belongs to the old guard, which is
+                // kept until a replacement genuinely holds one; replacing it
+                // unconditionally would drop it armed and write the default
+                // under the stream that just reopened.
+                // `owns_restore`, not `lit`. The control survives the close, so
+                // the fresh `enable` usually finds the value already there and
+                // comes back ACTIVE but owning nothing. Handing ownership over
+                // on `lit` disarmed the guard that actually held the change and
+                // installed one with nothing to put back, so the capture ended
+                // without restoring at all.
+                let fresh = ir_emitter::enable(dev.handle().fd(), &card, device);
+                if fresh.owns_restore() {
+                    mode.disarm();
+                    mode = fresh;
+                }
             }
             continue;
         }
@@ -1839,19 +1947,35 @@ pub fn capture_ir_sequence(
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix);
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = Some(SafeStream::open(device, &dev)?);
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-    ir_emitter::enable(dev.handle().fd(), &card, device);
+    // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
+    // reverse declaration order, so `stream` drops first and stops the
+    // stream, and only then does this guard put the control back; declaring
+    // it after `stream` sent the restore out while the stream was still
+    // live, which is the mid-stream write this change exists to remove.
+    //
+    // The assignment waits for the open because writing first would touch
+    // the camera for a stream that may never exist: an open that fails on
+    // EBUSY, with another process already streaming, would leave this one
+    // having applied the mode and then restored the default underneath the
+    // other process's live stream. `SafeStream::open` only allocates
+    // buffers; STREAMON happens on the first dequeue, so the set still
+    // lands before streaming starts.
+    let mut mode;
+    let mut stream = Some(SafeStream::open(device, &dev)?);
+    mode = ir_emitter::enable(dev.handle().fd(), &card, device);
+    // Set once above and not re-applied inside the loop. This path also carried
+    // an every-eighth-frame re-fire; it went for the same reason, and with the
+    // same caveat: the justification is the MEASURED record in
+    // `IrCamera::session` that the control survives streaming, not the
+    // illumination metadata, which this function does not read either.
     let mut frames = Vec::with_capacity(samples);
     let max_attempts = samples * 2 + 30;
     let (mut dead_run, mut restarts) = (0usize, 0usize);
     let mut last_sig: Option<Vec<u8>> = None;
-    for attempt in 0..max_attempts {
+    for _ in 0..max_attempts {
         if frames.len() >= samples {
             break;
-        }
-        if attempt % 8 == 0 {
-            ir_emitter::enable(dev.handle().fd(), &card, device);
         }
         let mut best: Option<Vec<u8>> = None;
         let mut best_mean = -1.0f64;
@@ -1885,7 +2009,26 @@ pub fn capture_ir_sequence(
                 last_sig = None;
                 drop(stream.take()); // stop + release buffers before re-arming
                 stream = Some(SafeStream::open(device, &dev)?);
-                ir_emitter::enable(dev.handle().fd(), &card, device);
+                // The reopened stream needs the mode set again, and the OLD
+                // guard is only given up if the new one actually took. The
+                // measured behaviour on both cameras here is that the control
+                // survives a stream close, so the fresh `enable` can find the
+                // value still in place, send nothing, and come back unarmed.
+                // The restore then still belongs to the old guard, which is
+                // kept until a replacement genuinely holds one; replacing it
+                // unconditionally would drop it armed and write the default
+                // under the stream that just reopened.
+                // `owns_restore`, not `lit`. The control survives the close, so
+                // the fresh `enable` usually finds the value already there and
+                // comes back ACTIVE but owning nothing. Handing ownership over
+                // on `lit` disarmed the guard that actually held the change and
+                // installed one with nothing to put back, so the capture ended
+                // without restoring at all.
+                let fresh = ir_emitter::enable(dev.handle().fd(), &card, device);
+                if fresh.owns_restore() {
+                    mode.disarm();
+                    mode = fresh;
+                }
             }
             continue;
         }
