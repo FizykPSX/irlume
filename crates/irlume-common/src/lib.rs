@@ -92,6 +92,91 @@ pub fn state_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from(STATE_DIR))
 }
 
+/// Hex sha256 of a byte slice.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Make every directory above `dir` durable, so the names leading to it survive
+/// a power loss.
+///
+/// Shallowest first, because a directory's entry lives in its parent: syncing
+/// `/var/lib/irlume` makes `login-transactions` findable, and does nothing for
+/// `irlume` itself, whose entry is in `/var/lib`. A record fsynced into a
+/// directory whose name did not survive is not a record.
+pub fn fsync_ancestors(dir: &std::path::Path) -> std::result::Result<(), String> {
+    for parent in ancestor_chain(dir) {
+        fsync_dir(&parent)?;
+    }
+    Ok(())
+}
+
+/// The directories to sync above `dir`, shallowest first.
+///
+/// Separated out because the interesting case cannot be observed from outside:
+/// whether an `fsync` happened is not visible in the filesystem afterwards, so
+/// the list is what a test can actually assert on.
+pub fn ancestor_chain(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut chain: Vec<std::path::PathBuf> = dir
+        .ancestors()
+        .skip(1) // `dir` itself is synced by the atomic write that fills it
+        .map(|p| {
+            // A relative path's last ancestor is "", which opens nothing. The
+            // directory a relative path is anchored in is the working
+            // directory, and that is where the entry actually lives. Filtering
+            // the empty one out instead left `IRLUME_STATE_DIR=state` syncing
+            // `state` while nothing synced the `state` entry itself.
+            if p.as_os_str().is_empty() {
+                std::path::PathBuf::from(".")
+            } else {
+                p.to_path_buf()
+            }
+        })
+        .collect();
+    chain.reverse();
+    chain
+}
+
+/// Make a directory's own contents durable, so entries created in it survive a
+/// power loss.
+///
+/// `fsync(2)` is explicit that syncing a file does not necessarily persist the
+/// directory entry naming it; the directory has to be synced too. Opening a
+/// directory read-only and syncing that descriptor is the way to do it.
+pub fn fsync_dir(dir: &std::path::Path) -> std::result::Result<(), String> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("fsync {}: {e}", dir.display()))
+}
+
+/// Set `path`'s permission bits, naming the path when it fails.
+pub fn restrict(path: &std::path::Path, mode: u32) -> std::result::Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))
+}
+
+/// Remove `path` and make its absence durable.
+///
+/// The counterpart to [`write_0600_atomic`] for a record whose whole meaning is
+/// "there is unfinished business here": an unlink still sitting in the page
+/// cache when the machine loses power brings the record back, and a record that
+/// comes back is acted on again. Already-gone is success, because the caller's
+/// postcondition is that nothing is there.
+pub fn remove_durable(path: &std::path::Path) -> std::result::Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("remove {}: {e}", path.display())),
+    }
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    fsync_dir(dir)
+}
+
 /// Create or truncate `path` with mode 0600 and write `bytes`, then fsync.
 ///
 /// Mode-on-open (not write-then-chmod) so a secret-bearing file is never
@@ -130,6 +215,60 @@ pub fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// torn write. Temp and target must share a directory so the rename stays within
 /// one filesystem (where rename is atomic).
 pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_mode(path, bytes, 0o600)
+}
+
+/// [`write_0600_atomic`] at a caller-chosen mode.
+///
+/// Exists because not everything that needs the atomic, fsynced write is secret.
+/// `ir_emitter.conf` names a camera and a control number; it needed durability,
+/// not privacy.
+///
+/// `mode` is a CEILING, not a guarantee: the kernel applies the process umask to
+/// a newly created file, so the result is `mode & !umask`. `irlumed.service`
+/// sets `UMask=0027`, which turns a requested 0644 into 0640 — and that is
+/// deliberately left alone, because `std::fs::write` behaved identically
+/// (`0666 & !umask` is also 0640 there) and forcing the requested bits would
+/// WIDEN permissions on machines already running. The 0600 callers are
+/// unaffected: a umask can only remove bits, and every ordinary umask removes
+/// none of those.
+pub fn write_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    match write_atomic_reporting(path, bytes, mode)? {
+        AtomicWrite::Durable => Ok(()),
+        AtomicWrite::VisibleNotDurable(e) => Err(e),
+    }
+}
+
+/// How far an atomic write got.
+///
+/// "It returned an error" and "nothing became visible" are not the same thing,
+/// and three separate defects on #183 came from treating them as one. The rename
+/// publishes the new content immediately and atomically; the fsyncs that make it
+/// survive a power loss come afterwards, and a failure there leaves the new
+/// content exactly where it was put.
+#[derive(Debug)]
+pub enum AtomicWrite {
+    /// Written, published, and both the file and its directory made durable.
+    Durable,
+    /// The rename landed, so the new content IS what a reader sees, but a later
+    /// fsync failed and it may not survive a power loss. A caller that must know
+    /// what is visible now has to treat this as published.
+    ///
+    /// NOT COVERED BY A TEST. Nothing available here can make a directory fsync
+    /// fail; provoking it needs filesystem fault injection, and a mutant that
+    /// reverts this arm to `?` propagation survives the suite. The branch rests
+    /// on `rename(2)` being atomic and immediate and `fsync(2)` being a separate
+    /// step, not on anything observed.
+    VisibleNotDurable(std::io::Error),
+}
+
+/// [`write_atomic_mode`], reporting whether the content became visible when the
+/// durability step failed. `Err` means nothing was published.
+pub fn write_atomic_reporting(
+    path: &std::path::Path,
+    bytes: &[u8],
+    mode: u32,
+) -> std::io::Result<AtomicWrite> {
     #[cfg(unix)]
     {
         use std::io::Write as _;
@@ -153,7 +292,7 @@ pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
             std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .mode(0o600)
+                .mode(mode)
                 .open(&tmp)
         };
         let mut f = match open_tmp() {
@@ -172,14 +311,22 @@ pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
         }
         // fsync the directory so the rename (the directory entry that makes the
         // new bytes visible under `path`) is itself durable across a power loss.
-        // A failure here means the update is NOT durably committed, so surface it
-        // as a write failure (the content is live but a crash could revert the
-        // entry); the caller retries the whole atomic write.
-        std::fs::File::open(dir)?.sync_all()?;
-        Ok(())
+        // The rename has ALREADY happened, so a failure here does not un-publish
+        // anything: the new content is what a reader sees, it simply might not
+        // survive a power loss. Reported as such rather than as a plain error,
+        // because a caller that then behaves as though nothing was written is
+        // exactly how a half-published file goes unnoticed.
+        match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            Ok(()) => Ok(AtomicWrite::Durable),
+            Err(e) => Ok(AtomicWrite::VisibleNotDurable(e)),
+        }
     }
     #[cfg(not(unix))]
-    std::fs::write(path, bytes)
+    {
+        let _ = mode;
+        std::fs::write(path, bytes)?;
+        Ok(AtomicWrite::Durable)
+    }
 }
 
 /// Request from an (untrusted) client to the (privileged) daemon.
@@ -640,6 +787,99 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    /// Every directory whose entry has to survive is in the chain, shallowest
+    /// first, including the one a RELATIVE state root is anchored in.
+    ///
+    /// A directory's name lives in its parent, so syncing `state` does nothing
+    /// for the `state` entry itself; for a relative path that entry is in the
+    /// working directory. An earlier version dropped the empty last ancestor
+    /// instead of reading it as ".", which left exactly that gap. Asserted on
+    /// the list because an `fsync` leaves no trace in the filesystem to check.
+    #[test]
+    fn the_sync_chain_covers_every_directory_whose_entry_must_survive() {
+        let abs = super::ancestor_chain(Path::new("/var/lib/irlume/login-transactions"));
+        assert_eq!(
+            abs,
+            vec![
+                PathBuf::from("/"),
+                PathBuf::from("/var"),
+                PathBuf::from("/var/lib"),
+                PathBuf::from("/var/lib/irlume"),
+            ],
+            "shallowest first, and the store itself is left to the atomic write"
+        );
+
+        // The case the filter used to lose: nothing anchored `state`.
+        let rel = super::ancestor_chain(Path::new("state/login-transactions"));
+        assert_eq!(rel, vec![PathBuf::from("."), PathBuf::from("state")]);
+
+        // A store directly under a relative root still names the anchor.
+        assert_eq!(
+            super::ancestor_chain(Path::new("login-transactions")),
+            vec![PathBuf::from(".")]
+        );
+        // Nothing in a chain may be empty: an empty path opens nothing, so a
+        // sync of it is a sync that silently did not happen.
+        for dir in ["/a/b", "a/b", "b", "/"] {
+            assert!(
+                super::ancestor_chain(Path::new(dir))
+                    .iter()
+                    .all(|p| !p.as_os_str().is_empty()),
+                "{dir} produced an empty entry"
+            );
+        }
+    }
+
+    /// A write reports whether it became VISIBLE, separately from whether it
+    /// became durable.
+    ///
+    /// Three defects on #183 came from callers reading "returned an error" as
+    /// "nothing is on disk". The rename publishes; the fsyncs come after. The
+    /// ordinary path must still report `Durable`, or the distinction is a
+    /// distinction nobody can act on.
+    #[test]
+    fn an_atomic_write_reports_that_it_became_durable() {
+        // Per-process, because the ASan lane and the ordinary lane run this same
+        // binary at once and a shared fixed name makes them delete each other's
+        // scratch directory mid-test.
+        let dir =
+            std::env::temp_dir().join(format!("irlume-atomic-reporting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("f");
+        match super::write_atomic_reporting(&path, b"hello", 0o600).expect("write") {
+            super::AtomicWrite::Durable => {}
+            super::AtomicWrite::VisibleNotDurable(e) => {
+                panic!("an ordinary write must be durable, got {e}")
+            }
+        }
+        assert_eq!(std::fs::read(&path).expect("read"), b"hello");
+        // And a write that cannot be published at all is an error, not a
+        // half-success: nothing is visible under the target name.
+        let missing = dir.join("no-such-dir").join("f");
+        assert!(super::write_atomic_reporting(&missing, b"x", 0o600).is_err());
+        assert!(!missing.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A removal that is not durable brings the record back after a power loss,
+    /// and a record that comes back is acted on again. Absence is the whole
+    /// meaning of a resolved journal, so it gets the same treatment as a write.
+    #[test]
+    fn removing_a_record_that_is_already_gone_is_success() {
+        let dir =
+            std::env::temp_dir().join(format!("irlume-remove-durable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record");
+        std::fs::write(&path, b"x").unwrap();
+        assert_eq!(super::remove_durable(&path), Ok(()));
+        assert!(!path.exists());
+        // Idempotent: a caller resuming after a crash must not fail here.
+        assert_eq!(super::remove_durable(&path), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // --- cross-version wire compatibility for typed operation errors --------
     //

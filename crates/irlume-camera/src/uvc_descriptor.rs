@@ -223,6 +223,28 @@ pub struct CameraIdentity {
     pub interface_number: u8,
     pub vid: u16,
     pub pid: u16,
+    /// The USB serial string, when the device publishes one.
+    ///
+    /// NOT a unique physical identity, and must not be trusted as one: the ASUS
+    /// module this project develops against reports `200901010001`, a batch
+    /// number of the kind webcam vendors repeat across every unit they ship.
+    /// It narrows a match; it does not settle one.
+    pub serial: Option<String>,
+    /// Resolved sysfs path of the USB DEVICE, `/devices/...` with no `/sys`
+    /// prefix and no interface suffix.
+    ///
+    /// The only identifier here that distinguishes two identical units attached
+    /// at the same time, because it names the port rather than the model. It is
+    /// stable across reboots for a fixed port and changes when the device is
+    /// moved to another one, which is the right way round for a record that has
+    /// to survive a power loss.
+    ///
+    /// It is NOT a physical-device identity. The kernel calls it the device's
+    /// key "at that point in time": the same path is reused by whatever is
+    /// plugged into that port next. So a path match says "the same place", never
+    /// "the same camera", and anything authorising a write on a path match alone
+    /// is trusting a port.
+    pub usb_devpath: String,
 }
 
 pub fn identity_from_fd(fd: std::os::raw::c_int) -> std::io::Result<CameraIdentity> {
@@ -252,6 +274,24 @@ pub fn identity_from_fd(fd: std::os::raw::c_int) -> std::io::Result<CameraIdenti
             .ok_or_else(|| bad(format!("{} has no idVendor", dev_dir.display())))?,
         pid: read_hex_u16(&dev_dir.join("idProduct"))
             .ok_or_else(|| bad(format!("{} has no idProduct", dev_dir.display())))?,
+        serial: read_optional_serial(&dev_dir)?,
+        // `dev_dir` came from `canonicalize`, so it is already the resolved
+        // physical path. Stripping `/sys` makes the value the kernel's own
+        // `DEVPATH` for this device, which is what `udevadm info -q path` prints
+        // and therefore what a person comparing a record against their machine
+        // will have in front of them.
+        //
+        // The leading slash is put back deliberately. `strip_prefix` removes the
+        // component and leaves a RELATIVE path, so this recorded
+        // `devices/pci0000:00/...` while every other source of the same string
+        // says `/devices/pci0000:00/...`. A hardware run is what showed it: the
+        // record on disk did not match the path printed beside it.
+        usb_devpath: dev_dir
+            .strip_prefix("/sys")
+            .map(|p| std::path::Path::new("/").join(p))
+            .unwrap_or_else(|_| dev_dir.clone())
+            .to_string_lossy()
+            .into_owned(),
     })
 }
 
@@ -286,6 +326,42 @@ fn device_numbers(fd: std::os::raw::c_int) -> std::io::Result<(u32, u32)> {
     }
     let rdev = st.st_rdev;
     Ok((libc::major(rdev), libc::minor(rdev)))
+}
+
+/// The device's USB serial, distinguishing "publishes none" from "could not read
+/// it".
+///
+/// `.ok()` on the read collapsed those two, and the difference decides whether
+/// one camera's recorded bytes may be written into another. A record created
+/// while the read failed stores `serial: None`, and `None` on the record side is
+/// deliberately permissive — it has to be, because a camera that genuinely
+/// publishes no serial must still be recoverable, and the NexiGo HelloCam this
+/// was validated against publishes none. So an identical unit swapped into the
+/// same USB port would satisfy `(None, Some(_))` and be authorized to receive
+/// the first camera's undo bytes, on matching descriptors and a reused port path
+/// alone. Failing the read closed keeps that authorization from ever being
+/// created.
+///
+/// An ABSENT attribute is `None`, because sysfs simply does not publish `serial`
+/// for a device with no iSerial descriptor, and that is the common case rather
+/// than a fault.
+///
+/// An EMPTY attribute is also `None`, which is where this deliberately diverges
+/// from the review that found the collapse: it proposed treating empty as an
+/// error. Empty carries the same information as absent — the device names no
+/// unit — and no camera here publishes one, so making it fatal would refuse
+/// hardware nobody has tested against on the strength of a guess. The hole being
+/// closed is the failed READ, not the empty value.
+fn read_optional_serial(dev_dir: &Path) -> std::io::Result<Option<String>> {
+    let path = dev_dir.join("serial");
+    match std::fs::read_to_string(&path) {
+        Ok(value) => {
+            let value = value.trim();
+            Ok((!value.is_empty()).then(|| value.to_owned()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(bad(format!("could not read {}: {e}", path.display()))),
+    }
 }
 
 fn ancestor_with(start: &Path, marker: &str) -> Option<PathBuf> {
@@ -335,6 +411,61 @@ fn bad(msg: String) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+
+    /// A serial that could not be READ is not the same as a camera that has
+    /// none, and the difference decides whether one camera's undo bytes may be
+    /// written into another.
+    ///
+    /// `.ok()` collapsed the two. A record created during a failed read stored
+    /// `serial: None`, and `None` on the record side is deliberately permissive
+    /// because a camera that publishes no serial must still be recoverable. So
+    /// an identical unit swapped into the same USB port matched on descriptors
+    /// and port alone. A test over `CameraIdentity { serial: None }` cannot see
+    /// this: it has to be exercised at the filesystem boundary.
+    #[test]
+    fn a_serial_that_cannot_be_read_is_an_error_not_an_absent_serial() {
+        let root = std::env::temp_dir().join(format!("irlume-serial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // No `serial` attribute at all: the ordinary case for a device with no
+        // iSerial descriptor, and the NexiGo this was validated against.
+        let absent = root.join("absent");
+        std::fs::create_dir_all(&absent).expect("scratch");
+        assert_eq!(
+            super::read_optional_serial(&absent).expect("an absent serial is not an error"),
+            None
+        );
+
+        // Present and readable.
+        let present = root.join("present");
+        std::fs::create_dir_all(&present).expect("scratch");
+        std::fs::write(present.join("serial"), " 200901010001\n").expect("write");
+        assert_eq!(
+            super::read_optional_serial(&present).expect("readable"),
+            Some("200901010001".to_string())
+        );
+
+        // Present and empty carries the same information as absent: the device
+        // names no unit.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).expect("scratch");
+        std::fs::write(empty.join("serial"), "  \n").expect("write");
+        assert_eq!(super::read_optional_serial(&empty).expect("readable"), None);
+
+        // Present and UNREADABLE. A directory where the attribute belongs makes
+        // the read fail with EISDIR, which is neither NotFound nor success, and
+        // is the shape of every transient sysfs failure this guards against.
+        let broken = root.join("broken");
+        std::fs::create_dir_all(broken.join("serial")).expect("scratch");
+        let e = super::read_optional_serial(&broken)
+            .expect_err("a serial that cannot be read must NOT read as absent");
+        assert!(
+            e.to_string().contains("could not read"),
+            "the error must name what failed, got: {e}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
     use super::*;
 
     /// Captured from the ASUS Hello camera (USB 3277:0059) this was developed
@@ -458,6 +589,31 @@ mod tests {
         ];
         buf.extend_from_slice(&[6, DESC_CS_INTERFACE, SUBTYPE_EXTENSION_UNIT, 14, 0, 0]);
         assert!(extension_units_for_interface(&buf, 0).is_empty());
+    }
+
+    /// The recorded device path is the kernel's own `DEVPATH`, leading slash and
+    /// all.
+    ///
+    /// `strip_prefix` leaves a RELATIVE path, so this recorded
+    /// `devices/pci0000:00/...` while `udevadm info -q path` prints
+    /// `/devices/pci0000:00/...` for the same device. Both sides of the match
+    /// computed it the same way, so nothing broke, which is exactly why only a
+    /// transcript from real hardware showed it: the record on disk did not look
+    /// like the path printed next to it.
+    #[test]
+    fn a_recorded_device_path_looks_like_the_kernels_own() {
+        let sys = std::path::Path::new("/sys/devices/pci0000:00/0000:00:14.0/usb3/3-5");
+        let devpath = sys
+            .strip_prefix("/sys")
+            .map(|p| std::path::Path::new("/").join(p))
+            .unwrap_or_else(|_| sys.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(devpath, "/devices/pci0000:00/0000:00:14.0/usb3/3-5");
+        assert!(
+            devpath.starts_with('/'),
+            "a relative path here is not a DEVPATH"
+        );
     }
 
     /// Every descriptor in the real chain must be consumed exactly, with no

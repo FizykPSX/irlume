@@ -22,9 +22,63 @@
 //! to RGB8. FOOTGUN: enumerate V4L2 controls defensively; naive control queries
 //! panic on some drivers. Probe, don't assume.
 
+pub mod emitter_journal;
 pub mod ir_emitter;
 mod ir_metadata;
 pub mod uvc_descriptor;
+
+/// Serializes unit tests that mutate process-global environment variables, and
+/// the RAII guard that restores them.
+///
+/// One lock for the whole crate, deliberately. Three modules here flip env vars
+/// in tests and two of them had grown their OWN private mutex; a second mutex
+/// guarding the same process-global serialises a module against itself and
+/// nothing else, which passes locally and fails under load. Rust's `set_var`
+/// also races any concurrent env READ anywhere in the process, so the lock has
+/// to cover every mutator in the crate to mean anything.
+///
+/// `EnvGuard` restores the PREVIOUS value rather than unsetting: unsetting is
+/// not restoring, and a test that leaves `IRLUME_STATE_DIR` cleared changes what
+/// the next one resolves.
+#[cfg(test)]
+pub(crate) mod testenv {
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        // A panic under the lock (a failed assert) must not cascade into every
+        // later env test; the environment is per-test state, not shared data.
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// RAII env-var override: restores the previous value (or absence) on drop,
+    /// so a panicking assertion cannot leak state into later tests.
+    pub(crate) struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        pub(crate) fn set(key: &'static str, val: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+        pub(crate) fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
 
 use irlume_common::Error;
 use v4l::buffer::Type;
@@ -2141,6 +2195,10 @@ pub fn store_capture_mode(device: &str, mode: CaptureMode) -> irlume_common::Res
 /// anything changed can be undone.
 pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     verify_pinned(device)?;
+    // Declared first, so it is dropped LAST: the guard that puts the control
+    // back lives inside `discover` (or inside `found` on the success path) and
+    // has to finish before this re-raises the signal that stops the process.
+    let _abort_orderly = ir_emitter::AbortOnSignal::install();
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix);
@@ -2162,14 +2220,34 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     // the daemon killed before the control it changed was restored. A fix for a
     // hang is not worth a race with systemd.
     let mut measure = || -> Option<f32> {
+        // A stop signal aborts through the same path a dead stream does, which
+        // is the path that puts the control back.
+        //
+        // Polled between frames rather than relied on to interrupt one. A
+        // process-directed signal goes to an ARBITRARY thread that has it
+        // unblocked, and the daemon has a watchdog, a listener and a connection
+        // thread besides this worker; only the syscall in the thread the kernel
+        // picks is interrupted, so dropping SA_RESTART does not guarantee this
+        // frame wait ever returns EINTR (signal(7)). Checking each iteration
+        // bounds the abort by one frame timeout, which this crate sets to five
+        // seconds, instead of by a whole measurement.
+        if ir_emitter::abort_requested() {
+            return None;
+        }
         // Frames already in flight were captured before the control changed, and
         // taking the brightest of the burst makes one stale frame decide the
         // answer. Discard a stream's worth before believing anything.
         for _ in 0..IR_BURST {
+            if ir_emitter::abort_requested() {
+                return None;
+            }
             stream.next().ok()?;
         }
         let mut best: Option<f32> = None;
         for _ in 0..8 {
+            if ir_emitter::abort_requested() {
+                return None;
+            }
             let (buf, _) = stream.next().ok()?;
             let data = dec.decode(buf, w, h);
             let m = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
@@ -2181,13 +2259,15 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     let id = crate::uvc_descriptor::identity_from_fd(fd)
         .map_err(|e| Error::Hardware(format!("could not identify the camera: {e}")))?;
     match ir_emitter::discover(fd, &id, &mut measure) {
-        Ok(ctrl) => {
-            ir_emitter::save_conf(&id, &ctrl).map_err(|e| Error::Io(e.to_string()))?;
+        Ok(found) => {
+            let encoded = found.control().encode();
+            // Confirm, publish, release, in that order. The sequence lives in
+            // `finish` rather than here so it is reachable by a test.
+            found.finish(&id).map_err(Error::Hardware)?;
             Ok(format!(
-                "IR emitter enabled: {} on the camera's Microsoft camera-control unit, \
+                "IR emitter enabled: {encoded} on the camera's Microsoft camera-control unit, \
                  using a value built from what the camera reports about that control \
-                 (saved; future captures rebuild it the same way)",
-                ctrl.encode()
+                 (saved; future captures rebuild it the same way)"
             ))
         }
         Err(e) => Err(Error::Hardware(e.to_string())),
@@ -3073,41 +3153,11 @@ mod tests {
         std::env::var("IRLUME_TEST_SPARE_DEVICE").ok()
     }
 
-    /// Serializes tests that mutate process-global env vars (cargo runs tests
-    /// on threads, and setters would otherwise race readers in other tests).
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// RAII env-var override: restores the previous value (or absence) on
-    /// drop, so a panicking assertion cannot leak state into later tests.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, val: &str) -> Self {
-            let prev = std::env::var_os(key);
-            std::env::set_var(key, val);
-            Self { key, prev }
-        }
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    // The lock and the guard live in `crate::testenv` so every env-mutating
+    // test in this crate contends on ONE mutex. They used to be private here,
+    // which serialised this module against itself and left it racing the
+    // `ir_emitter` tests that flip a different variable in the same process.
+    use crate::testenv::{env_lock, EnvGuard};
 
     /// Extend the exact-path virtual-camera escape with `device` for the
     /// test's lifetime (`verify_pinned` refuses loopback nodes otherwise),
