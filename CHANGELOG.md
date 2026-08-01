@@ -5,6 +5,68 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **A dark or blinded IR capture reports what its evidence supports.** A dark
+  burst used to get one hint ("no active emitter; run `sudo irlume ir-setup`")
+  even though shutters, covers, range, exposure and emitter failures all
+  produce similar frames. The capture path now reports from the camera's
+  per-frame illumination metadata, the privacy control, the emitter-control
+  state and the frame's mean and spread (its pixel standard deviation): it
+  names an engaged shutter,
+  separates frames the camera marked illuminated from a requested mode it
+  never reported as illuminated, and reserves `ir-setup` advice for the one
+  case with no active emitter. Illumination metadata is never treated as
+  proof of optical output: a failed LED and a subject out of range read the
+  same, and the diagnosis says so. The most common measured cover case was
+  not dark at all: an opaque cover under an active emitter produced a
+  saturated, nearly constant frame (measured 252.8 to 255.0 on the two test
+  cameras, against a standard deviation of 35 and up for every recorded real
+  scene), so that
+  signature is named too. And `IRLUME_IR_EMITTER=off` now silences this
+  output, which the old hint's own text promised while printing anyway.
+  Closes [#185] and [#197].
+
+- **Emitter-mode crash recovery for recorded capture writes.** Before
+  changing the camera's control, the capture path writes a per-camera stream
+  record and confirms it once the camera accepts the write; a later daemon
+  claims a confirmed leftover and finishes the interrupted restore, with
+  claims counted and capped. The guard arms with the value the write actually
+  displaced (one read, no window for another client's value to be lost in),
+  and it holds the camera handle itself, so a restore cannot land on a
+  descriptor number the kernel has recycled. The bookkeeping is deliberately
+  best-effort: when its lock, record write or confirmation is unavailable,
+  irlume warns and drives the emitter without crash recovery rather than
+  turning a full disk into a failed login, so a kill in that degraded path
+  can still strand the mode. Closes [#188], [#189] and [#190].
+
+- **`doctor` names each camera node's backend.** `(uvcvideo, USB)` for the
+  case irlume is built and tested for; the driver, the bus and a warning for
+  anything else; and a visible "backend unknown" when the observation fails.
+  Read from `VIDIOC_QUERYCAP`, the interface's own answer. This is the first
+  question of every camera bug report ([#187] had to collect it by shell
+  script), answered by the tool that should have known.
+
+### Fixed
+
+- **`ir-setup` refuses to write camera firmware while the privacy shutter is
+  engaged.** With the shutter shut the sensor substitutes a blank frame, so
+  discovery measured a constant, learned nothing from every exploratory write,
+  and told the user their camera "advertises no usable emitter control". Setup
+  now refuses up front when the shutter is engaged, and also when the privacy
+  control cannot be read at all ("could not read the switch" is not "the
+  switch is released"); it re-checks immediately before each exploratory
+  write, because the operator can engage the shutter mid-run; and restores are
+  never blocked. Closes [#186].
+
+[#185]: https://github.com/archledger/irlume/issues/185
+[#186]: https://github.com/archledger/irlume/issues/186
+[#187]: https://github.com/archledger/irlume/issues/187
+[#188]: https://github.com/archledger/irlume/issues/188
+[#189]: https://github.com/archledger/irlume/issues/189
+[#190]: https://github.com/archledger/irlume/issues/190
+[#197]: https://github.com/archledger/irlume/issues/197
+
 ## [0.7.2] - 2026-07-30
 
 Fixes a camera-firmware hazard present in 0.7.1. Please upgrade.
