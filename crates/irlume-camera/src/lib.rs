@@ -446,6 +446,28 @@ fn privacy_permits_setup(observed: std::io::Result<Option<bool>>) -> Result<(), 
     }
 }
 
+/// The backend classification from a `VIDIOC_QUERYCAP` answer. The V4L2
+/// specification requires USB devices to report a bus string starting with
+/// `usb-`, so the split is the interface's own, not a sysfs-path heuristic
+/// (the kernel's sysfs rules say not to depend on the `device`/`driver` link
+/// topology). Pure so both halves of the split are testable without a camera.
+fn backend_from_caps(driver: String, bus: &str) -> (String, bool) {
+    (driver, bus.starts_with("usb-"))
+}
+
+/// The kernel driver behind a video node and whether V4L2 reports it on USB.
+/// This answers the first question of every camera bug report: is this the
+/// `uvcvideo`-on-USB case irlume is built and tested for, or an IPU/MIPI or
+/// other pipeline that merely looks similar? #187's diagnosis had to ask for
+/// exactly this by shell script; `doctor` now reads it itself. A failure is an
+/// `Err` the caller must render, never silence: an unobserved backend on a
+/// diagnostic surface has to say "unknown" (#195 review).
+pub fn node_backend(device: &str) -> std::io::Result<(String, bool)> {
+    let dev = Device::with_path(device)?;
+    let caps = dev.query_caps()?;
+    Ok(backend_from_caps(caps.driver, &caps.bus))
+}
+
 /// True iff a sysfs `device` path traces to a real hardware bus (USB/PCI) and
 /// not a virtual/loopback origin. Pure so it can be unit-tested without sysfs.
 fn is_physical_camera_path(p: &str) -> bool {
@@ -3331,6 +3353,36 @@ mod tests {
         assert_eq!(
             select_pair(),
             ("/dev/irlume-test-rgb".into(), "/dev/irlume-test-ir".into())
+        );
+    }
+
+    #[test]
+    fn node_backend_errors_off_the_video_class() {
+        // Missing nodes and non-V4L2 paths are observation FAILURES, reported
+        // as Err for the caller to render, never a silent nothing.
+        assert!(node_backend("/dev/irlume-test-missing").is_err());
+        assert!(node_backend("/dev/null").is_err());
+        assert!(node_backend("not-even-a-dev-path").is_err());
+    }
+
+    /// The positive split: the classification comes from the V4L2 bus string's
+    /// specified `usb-` prefix, not from path text (#195 review — the first
+    /// version's only test observed nothing but negatives and passed against
+    /// an implementation that always answered nothing).
+    #[test]
+    fn backend_splits_on_the_specified_bus_prefix() {
+        assert_eq!(
+            backend_from_caps("uvcvideo".into(), "usb-0000:00:14.0-5"),
+            ("uvcvideo".into(), true)
+        );
+        assert_eq!(
+            backend_from_caps("intel-ipu6".into(), "platform:intel-ipu6"),
+            ("intel-ipu6".into(), false)
+        );
+        // A bus merely CONTAINING usb is not the specified prefix.
+        assert_eq!(
+            backend_from_caps("gadget".into(), "platform:dummy_usb"),
+            ("gadget".into(), false)
         );
     }
 

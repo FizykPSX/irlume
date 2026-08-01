@@ -3014,7 +3014,22 @@ fn doctor_run(
         } else {
             ""
         };
-        dout!(report, "  {path}: {role:?}{priv_on}");
+        // Name the backend on every node: uvcvideo-on-USB is the case irlume
+        // is built and tested for, and anything else is the first fact a bug
+        // report needs (an IPU/MIPI node classifies by format just as well and
+        // then behaves nothing alike; #187 had to establish this by hand).
+        let backend = match irlume_camera::node_backend(path) {
+            Ok((drv, true)) if drv == "uvcvideo" => format!(" ({drv}, USB)"),
+            Ok((drv, on_usb)) => {
+                let bus = if on_usb { "USB" } else { "not USB" };
+                format!(" ({drv}, {bus})  ⚠ not the uvcvideo-on-USB case irlume is built for")
+            }
+            // A failed observation says so; rendering it as the old bare line
+            // would make "could not tell" look like "nothing to tell" on the
+            // one surface whose whole job is telling (#195 review).
+            Err(e) => format!(" (backend unknown: {e})  ⚠ could not identify camera backend"),
+        };
+        dout!(report, "  {path}: {role:?}{backend}{priv_on}");
         // An RGB node the capture path can't decode (MJPEG-only) classifies as
         // usable but would fail at capture; warn here instead.
         if *role == irlume_camera::Role::Rgb {
