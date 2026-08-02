@@ -5,7 +5,116 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **The wallet hand-off check was blind to the fingerprint path.** It anchored
+  on the face `unseal` line, but the post-auth `keyring` line releases the same
+  sealed password. On a fingerprint-only box the greeter carries ONLY that
+  line, so a missing or mis-ordered wallet module after a fingerprint login was
+  never reported: the wallet stayed locked with nothing naming why. The check
+  now anchors on the first credential-releasing line of either mode, and its
+  warning names both methods. Verified against the KDE sources while at it:
+  Plasma's login greeter authenticates through the single `plasmalogin` stack
+  (its PAM backend has no fingerprint service; kscreenlocker's `kde-fingerprint`
+  triple is the lock screen only), so the greeter `keyring` line is exactly
+  where the KDE cold-boot fingerprint→KWallet chain runs; new tests pin that
+  the line lands above `pam_kwallet5.so` on every upstream plasmalogin layout.
+
+- **A stack using backslash line continuations is refused, not corrupted.**
+  libpam's line assembler joins a directive ending in `\` with the next
+  physical line before tokenizing (whitespace after the backslash does not
+  defuse it; a backslash ending a comment does not continue; all three pinned
+  by experiment against `pam_exec.so`). irlume edits stacks line-by-line, so
+  on such a file every matcher reads a different unit than PAM evaluates, and
+  inserting a stanza directly after a continued anchor would splice irlume's
+  text into the middle of the neighbouring logical line, corrupting the auth
+  stack on write. Continuations are now detected up front: the wiring
+  transforms decline the whole file (staged, never written, the same contract
+  as a missing anchor) and the keyring hand-off advisory stays silent rather
+  than judging lines PAM does not see as written. No upstream `plasmalogin` or
+  `gdm-password` stack uses continuations, so behaviour on real systems is
+  unchanged; a test now pins that assumption too.
+
+- **A module named only in a comment counted as configured.** libpam strips a
+  trailing `#` comment before tokenizing a stack line, so `auth required
+  pam_unix.so  # was pam_irlume.so` loads no irlume module at all. Every
+  matcher compared against the raw line instead, and disagreed with the thing
+  it configures. The consequences ran from cosmetic to silent: an invented
+  anchor, a keyring consumer that does not exist, and, because
+  `content_has_module` gates the whole wiring path, a stack whose comment
+  merely mentioned `pam_irlume.so` reported as already wired, so `login
+  enable` wrote nothing and said it succeeded. All ten matchers now compare
+  against the directive, exactly what PAM tokenizes. The `# irlume-landing`
+  and `# irlume-keyring` tags are still matched on the raw line, since being
+  comments is the whole point of them.
+
+- **A keyring module that stands down for the service was counted as if it
+  worked.** `pam_gnome_keyring.so` takes `only_if=<comma,separated,services>`,
+  and for any service outside that list every one of its entry points returns
+  `PAM_SUCCESS` immediately: it reads no token, stashes nothing, unlocks
+  nothing. The hand-off check matched the module name alone, so such a line
+  counted as a working consumer, reporting a wallet that would open when
+  nothing would, which is the one thing this check exists to prevent. It also
+  suppressed the consumer irlume adds to a fingerprint stack, silently undoing
+  that unlock. The list is now evaluated per service, matching whole
+  comma-separated items the way gkr-pam's own `evaluate_inlist` does, so
+  `only_if=gdm` no longer satisfies `gdm-fingerprint`. `pam_kwallet5.so` has no
+  equivalent option, so only the GNOME case narrows.
+
+- **Fingerprint keyring unlock never wired on GNOME, and could not have worked
+  if it had.** Two defects in one stack. The wiring anchored on a literal
+  `pam_fprintd.so` auth line, but GDM's `gdm-fingerprint.pam` never names the
+  module (it delegates to `auth substack fingerprint-auth`), so the anchor
+  search found nothing and the whole step became a silent no-op: `login enable`
+  reported success and wrote nothing. And had it wired, the stack carries no
+  keyring module at all, so the released password would have gone to a stack
+  with no consumer. The anchor now recognizes a fingerprint substack or include
+  as well as the literal module, and when the stack has no keyring consumer of
+  its own the two `pam_gnome_keyring.so` halves it needs are added alongside.
+  Those added lines are tagged so unwiring removes exactly ours and never a
+  distro-shipped keyring line, and carry PAM's leading `-` so a machine without
+  gnome-keyring installed is unaffected. Face login was never involved.
+
+- **A renamed shared PAM stack no longer drops the face block onto the wrong
+  line.** The greeter block anchored on a fixed list of stack names
+  (`password-auth`, `system-auth`, …) and, failing that, on the first `auth`
+  line, a guess that puts the `success=1` jump above whatever module happens to
+  come first. GDM's development branch renames its shared stack to
+  `gdm-password-auth-substack`, which no name matches; the guess would then have
+  anchored above `pam_selinux_permit.so` and landed the jump *before* the
+  password substack, which still runs. No released GDM ships that rename, so
+  this was latent rather than live, but it would have arrived silently with an
+  upgrade. Any `auth … substack …` line is now preferred over the guess,
+  whatever the stack is called (a substack is atomic for jump counting, so the
+  jump form stays correct), and the first-auth-line guess is kept strictly last.
+
+- **openSUSE greeters anchored face auth on the wrong line, skipping the
+  nologin gate.** openSUSE's `plasmalogin` routes the password through
+  `auth substack common-auth`, a stack name the wiring did not recognize, so it
+  fell back to the first `auth` line and inserted the `success=1` jump above
+  `pam_nologin.so`. A face match then jumped over the nologin gate and landed
+  *before* `substack common-auth`, which ran anyway: face auth that neither
+  honoured nologin nor spared the user the password. The auth and session stack
+  names are now kind-aware and include openSUSE's `common-auth` and
+  `common-session`, so the jump anchors on the password substack (atomic for
+  jump counting, so the jump form stays correct) and `pam_nologin.so` keeps
+  running first. A bare `auth include common-auth` is treated as an include
+  instead, taking the `sufficient` form a jump cannot skip.
+
 ### Added
+
+- **`login status` says when face login releases a password nothing will use.**
+  Wiring the greeter and arming the keyring is only half the KWallet path: the
+  released password still has to be read by `pam_kwallet5.so` (KDE) or
+  `pam_gnome_keyring.so` (GNOME), from an auth line BELOW irlume's, with a
+  matching session line to start the wallet daemon. When that module is absent,
+  or sits above ours where it runs before the token exists, the face login
+  succeeds and the wallet prompts anyway, and every command still reported the
+  greeter as `● wired`, so the one symptom the user could see pointed away from
+  the cause. `login status` and `login enable --apply` now inspect each wired
+  greeter and name which half is missing. Advisory only: it changes no stack and
+  fails no command, because an absent wallet module is a packaging choice rather
+  than a broken wiring.
 
 - **`camera-tune` is reachable from the TUI.** The Cameras screen gains `[t]`,
   which routes to `sudo irlume camera-tune` like the other privileged

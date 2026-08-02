@@ -65,6 +65,23 @@ const RESEAL_AUTH: &str = "auth       optional                     pam_irlume.so
 /// the TPM-sealed password and sets PAM_AUTHTOK so pam_gnome_keyring opens the
 /// wallet. No-op when the keyring isn't armed or a password is already set.
 const KEYRING_UNSEAL: &str = "auth       optional                     pam_irlume.so keyring";
+/// Tag on the gnome-keyring lines irlume ADDS to a fingerprint stack, so unwiring
+/// removes exactly ours and never a keyring line the distro shipped. Linux-PAM
+/// strips a trailing `#` comment before tokenizing (verified against
+/// `pam_exec.so`: an argument survives, a trailing comment does not), so this is
+/// invisible to the module, which matters here because gnome-keyring's
+/// `parse_args` syslogs a warning for every option it does not recognize.
+const KEYRING_TAG: &str = "# irlume-keyring";
+/// GDM's `gdm-fingerprint` stack carries NO keyring module at all (verified on
+/// upstream `data/pam-redhat/gdm-fingerprint.pam` through GDM 50.0), so the
+/// `KEYRING_UNSEAL` line above would set a token nothing reads. These are the
+/// two halves gnome-keyring needs, added only when the stack has no consumer of
+/// its own. The leading `-` is PAM's "do not complain if the module is missing",
+/// so a machine without gnome-keyring installed is unaffected.
+const FP_GKR_AUTH: &str =
+    "-auth      optional                     pam_gnome_keyring.so   # irlume-keyring";
+const FP_GKR_SESSION: &str =
+    "-session   optional                     pam_gnome_keyring.so auto_start   # irlume-keyring";
 const RESEAL_SESSION: &str = "session    optional                     pam_irlume.so reseal";
 /// The plain verify stanza, shared by `sudo` and polkit prompts (Bitwarden vault
 /// unlock, pkexec, systemd unit control): no `unseal` (the daemon refuses
@@ -944,7 +961,8 @@ fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut S
         visit(s, ROLE_LOGIN, &greeter_wire, face || fp_keyring);
     }
     for s in FP_GREETERS {
-        visit(s, ROLE_LOGIN_FP, &wire_fp_keyring, fp_keyring);
+        let fp_wire = |c: &str| wire_fp_keyring(c, service_name(s.etc));
+        visit(s, ROLE_LOGIN_FP, &fp_wire, fp_keyring);
     }
     visit(&LOCKSCREEN, ROLE_LOCK, &wire_lock, face_lock);
     if sudo_in_scope(enable, with_sudo) {
@@ -1398,6 +1416,11 @@ fn status() -> ExitCode {
     if any_ondemand {
         println!("  on-demand: {ONDEMAND_HINT}");
     }
+    // A greeter can be correctly wired and still leave the wallet locked, so
+    // this is reported next to the wiring rather than left to `doctor`: it is
+    // the difference between "face logs me in" and "face logs me in AND my
+    // wallet is open", which is what the keyring path exists for.
+    report_keyring_handoff();
     println!(
         "[login] SELinux module: {}",
         match selinux_loaded() {
@@ -1530,7 +1553,8 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
         do_svc(s, &greeter_wire, face || want_fp_keyring);
     }
     for s in FP_GREETERS {
-        do_svc(s, &wire_fp_keyring, want_fp_keyring);
+        let fp_wire = |c: &str| wire_fp_keyring(c, service_name(s.etc));
+        do_svc(s, &fp_wire, want_fp_keyring);
     }
     // A separate lock service (KDE `kde`) is a WARM screen unlock: the module
     // short-circuits (no `kr`), so the keyring (already open) isn't re-touched.
@@ -1588,6 +1612,12 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
         // (authselect, pam-auth-update, or a package upgrade shipping a fresh
         // vendor copy). On disable we clear the marker so reconcile stays quiet.
         write_wired_marker(enable, with_sudo, with_polkit, want_face_lock);
+        // Say it at the moment the user wired it, not only when they next run
+        // `login status`: a wallet that still prompts after `enable --apply`
+        // otherwise reads as irlume having failed.
+        if enable {
+            report_keyring_handoff();
+        }
         println!("[login] done. Password remains the fallback everywhere.");
     }
     if errs == 0 {
@@ -1710,7 +1740,18 @@ fn wire_service(
                 );
             }
             let (base, _) = unwire_lines(&read(vendor)?);
-            let (wired, _) = wire(&base);
+            let (wired, changed) = wire(&base);
+            // The transform saying "unchanged" means it REFUSED (no anchor, a
+            // continued file): materializing anyway would shadow the vendor
+            // file with a copy carrying no irlume line and report ✓ while face
+            // login stayed off. The in-place branch below already refuses on
+            // this; the override branch must too.
+            if !changed {
+                return out(
+                    PlannedChange::NoAnchor,
+                    format!("· {}: no anchor to wire (skipped)", s.etc),
+                );
+            }
             let body = format!(
                 "{CREATED_PREFIX}{vendor}; delete this file to restore the vendor copy\n{wired}"
             );
@@ -1822,23 +1863,66 @@ fn wire_service(
 
 // ---- pure PAM-text mechanics (unit-tested) -----------------------------------
 
-fn content_has_module(c: &str) -> bool {
-    c.lines().any(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && t.contains(MODULE)
-    })
+/// The part of a stack line PAM actually tokenizes: everything before the first
+/// `#`, leading whitespace trimmed.
+///
+/// Matching the raw line disagrees with libpam, which strips a trailing comment
+/// before tokenizing (verified against `pam_exec.so`: a real argument survives,
+/// a trailing comment does not). Without this, a module named only inside a
+/// comment counts as configured, and because `content_has_module` gates the
+/// whole wiring path, a stack whose comment happens to mention `pam_irlume.so`
+/// would be treated as already wired and silently left alone.
+///
+/// A full-line comment yields `""`, so callers need no separate `#` check.
+fn directive(line: &str) -> &str {
+    let t = line.trim_start();
+    match t.find('#') {
+        Some(i) => &t[..i],
+        None => t,
+    }
 }
 
-/// `<kind>` is `auth`/`session`; matches a `(substack|include) (password-auth|
-/// system-auth)` line, the shared substack the success=1 jump skips.
+fn content_has_module(c: &str) -> bool {
+    c.lines().any(|l| directive(l).contains(MODULE))
+}
+
+/// True when any line's DIRECTIVE part ends in a `\` continuation.
+///
+/// libpam's line assembler joins such a line with the next one before
+/// tokenizing, so a two-physical-line entry is ONE line to PAM. Everything
+/// here is line-oriented, and on a continued file the two views disagree.
+/// Worse than mis-reading: inserting a stanza directly after a continued
+/// anchor would splice our text into the MIDDLE of the logical line PAM
+/// evaluates, corrupting the stack on write.
+///
+/// The semantics are pinned empirically against `pam_exec.so`:
+///   * a trailing `\` on a directive continues; the next physical line's
+///     text executed as this line's arguments;
+///   * whitespace AFTER the backslash does not defuse it (still continues);
+///   * a `\` at the end of a COMMENT does not continue; both lines ran.
+///
+/// Hence the check runs on `directive()` output with trailing space trimmed.
+///
+/// No upstream stack irlume pins uses continuations, so the fail-safe answer
+/// is to notice and stand down: the wiring transforms refuse the file
+/// (staged, never written, the same contract as a missing anchor), and the
+/// hand-off advisory stays silent rather than reporting from an analysis
+/// that cannot see the file the way PAM does.
+fn has_line_continuation(content: &str) -> bool {
+    content
+        .lines()
+        .any(|l| directive(l).trim_end().ends_with('\\'))
+}
+
 /// An `auth`-phase line whose password path is an `include` a `success=N` jump
-/// can't skip: Debian's `@include common-auth`/`login`, or Arch's
-/// `auth include system-login`/`system-local-login`/`system-auth`. These need
-/// the `sufficient` (module IGNOREs on cold login) form, NOT the jump form. A
-/// Fedora `substack` is atomic for jump counting, so it deliberately does not
-/// match here and keeps the jump stanza.
+/// can't skip: Debian's `@include common-auth`/`login`, Arch's
+/// `auth include system-login`/`system-local-login`/`system-auth`, or a bare
+/// `auth include common-auth`. These need the `sufficient` (module IGNOREs on
+/// cold login) form, NOT the jump form. A `substack` is atomic for jump
+/// counting, so it deliberately does not match here and keeps the jump stanza;
+/// which is what openSUSE's `auth substack common-auth` relies on.
 fn is_include_auth_layout(line: &str) -> bool {
-    let t = line.trim_start();
+    let t = directive(line);
     if t.starts_with("@include common-auth") || t.starts_with("@include login") {
         return true;
     }
@@ -1847,33 +1931,238 @@ fn is_include_auth_layout(line: &str) -> bool {
         && toks.get(1) == Some(&"include")
         && matches!(
             toks.get(2),
-            Some(&"system-login") | Some(&"system-local-login") | Some(&"system-auth")
+            Some(&"system-login")
+                | Some(&"system-local-login")
+                | Some(&"system-auth")
+                | Some(&"common-auth")
         )
 }
 
+/// `<kind>` is `auth`/`session`; matches the shared password stack that the
+/// `success=1` jump skips: Fedora's `password-auth`/`system-auth`, and
+/// openSUSE's `common-auth`/`common-session`.
+///
+/// The stack names are kind-aware so an `auth` line is only tested against
+/// auth-phase names. openSUSE's `plasmalogin` routes the password through
+/// `auth substack common-auth`, which matched nothing here: wiring then fell
+/// back to the first auth line and inserted the jump above `pam_nologin.so`, so
+/// a face login skipped the nologin gate and *still* landed on the password
+/// stack underneath: face auth that neither honoured nologin nor logged you in.
 fn is_passwd_substack(line: &str, kind: &str) -> bool {
-    let t = line.trim_start();
-    if t.starts_with('#') {
-        return false;
-    }
-    let toks: Vec<&str> = t
+    let d = directive(line);
+    let toks: Vec<&str> = d
         .strip_prefix('-')
-        .unwrap_or(t)
+        .unwrap_or(d)
         .split_whitespace()
         .collect();
+    let stacks: &[&str] = match kind {
+        "auth" => &["password-auth", "system-auth", "common-auth"],
+        "session" => &["password-auth", "system-auth", "common-session"],
+        _ => &["password-auth", "system-auth"],
+    };
     toks.first() == Some(&kind)
         && toks.iter().any(|w| *w == "substack" || *w == "include")
-        && toks
-            .iter()
-            .any(|w| *w == "password-auth" || *w == "system-auth")
+        && toks.iter().any(|w| stacks.contains(w))
 }
 
 fn is_auth_directive(line: &str) -> bool {
-    let t = line.trim_start();
-    if t.starts_with('#') {
-        return false;
-    }
+    let t = directive(line);
     t.strip_prefix('-').unwrap_or(t).split_whitespace().next() == Some("auth")
+}
+
+/// An `auth` line whose control keyword is `substack`, whatever the shared stack
+/// happens to be NAMED. A substack is atomic for jump counting, so this is a
+/// safe jump anchor even when we do not recognize the target.
+///
+/// This exists because the named list cannot keep up with upstreams. GDM's main
+/// branch renamed its shared stack from `password-auth` to
+/// `gdm-password-auth-substack` (a file GDM does not ship; distros supply it),
+/// which no name in `is_passwd_substack` matches. Without this tier the anchor
+/// search falls through to "first auth line", which on GDM's stack is
+/// `pam_selinux_permit.so`: the jump would then skip THAT and land above the
+/// password substack, which still runs. That is the openSUSE failure exactly,
+/// and it would arrive silently with a GDM upgrade.
+fn is_auth_substack_anchor(line: &str) -> bool {
+    let d = directive(line);
+    let toks: Vec<&str> = d
+        .strip_prefix('-')
+        .unwrap_or(d)
+        .split_whitespace()
+        .collect();
+    toks.first() == Some(&"auth") && toks.get(1) == Some(&"substack")
+}
+
+/// Where the face block anchors, in descending order of confidence: a shared
+/// stack we recognize by name, then any `substack` whatever its name, and only
+/// then the first `auth` line. The last tier is a guess and is kept last
+/// deliberately: it is what produces a jump over an unrelated module.
+fn find_auth_anchor(lines: &[&str]) -> Option<usize> {
+    lines
+        .iter()
+        .position(|l| is_passwd_substack(l, "auth"))
+        .or_else(|| lines.iter().position(|l| is_auth_substack_anchor(l)))
+        .or_else(|| lines.iter().position(|l| is_auth_directive(l)))
+}
+
+/// Login-keyring modules that CONSUME the password an `unseal` line releases.
+/// KDE's kwallet-pam still installs `pam_kwallet5.so` under Plasma 6 (the
+/// running provider process is `ksecretd`, but the PAM module kept the 5 in its
+/// name); older Plasma and a few distros ship `pam_kwallet.so`. GNOME ships
+/// `pam_gnome_keyring.so`.
+const KEYRING_CONSUMERS: &[&str] = &["pam_kwallet5.so", "pam_kwallet.so", "pam_gnome_keyring.so"];
+
+/// The keyring module on this line, if it is one AND it will actually do
+/// something for `service`.
+///
+/// `pam_gnome_keyring.so` accepts `only_if=<comma,separated,services>`, and for
+/// any service outside that list every one of its entry points returns
+/// `PAM_SUCCESS` immediately: it reads no token, stashes nothing, unlocks
+/// nothing. Matching the module name alone would therefore count a line that is
+/// a guaranteed no-op here as a working consumer, and report a hand-off that
+/// cannot happen: the exact false reassurance this check exists to prevent.
+///
+/// The list is matched the way gkr-pam's `evaluate_inlist` matches it: whole
+/// comma-separated items, not substrings, so `only_if=gdm` does not satisfy
+/// `gdm-fingerprint`. Any single excluding `only_if=` disables the module, since
+/// gkr ORs `ARG_IGNORE_SERVICE` in and never clears it. `pam_kwallet5.so` has no
+/// equivalent option (`only_if` appears nowhere in kwallet-pam), so this only
+/// ever narrows the gnome-keyring case.
+fn consumer_active_for(line: &str, service: &str) -> Option<&'static str> {
+    let t = directive(line);
+    let module = KEYRING_CONSUMERS.iter().copied().find(|m| t.contains(m))?;
+    let gated_out = t
+        .split_whitespace()
+        .filter_map(|w| w.strip_prefix("only_if="))
+        .any(|list| !list.split(',').any(|item| item == service));
+    (!gated_out).then_some(module)
+}
+
+/// What a wired greeter stack does with the password irlume releases.
+///
+/// irlume's job ends at setting `PAM_AUTHTOK`. Turning that token into an OPEN
+/// wallet is another module's work, and if that module is absent (or sits above
+/// our line, where it runs before the token exists) the login succeeds by face
+/// and the wallet stays locked, which surfaces to the user as KWallet
+/// prompting for its password anyway. Nothing checked for this, so the failure
+/// was indistinguishable from "wired ✓".
+struct KeyringHandoff {
+    /// A module carrying BOTH halves: an `auth` line below ours (so it observes
+    /// the token) and a `session` line of its own. That is a hand-off that
+    /// actually opens a wallet.
+    ///
+    /// The two halves are paired PER MODULE rather than counted separately,
+    /// because upstream stacks list several consumers side by side: Fedora's
+    /// `plasmalogin` ships `pam_gnome_keyring.so`, `pam_kwallet5.so` AND
+    /// `pam_kwallet.so`. Counting "some auth line" and "some session line"
+    /// independently would call a stack complete when one module read the token
+    /// and a different one started a daemon that never received it.
+    complete: Option<&'static str>,
+    /// Modules with an auth line below ours but no session line of their own.
+    /// `pam_kwallet.c` stashes the key with `pam_set_data` in
+    /// `pam_sm_authenticate` and only `pam_sm_open_session` acts on it, so this
+    /// half alone derives a key and then drops it.
+    auth_only: Vec<&'static str>,
+}
+
+/// Locate the keyring hand-off in a wired stack. `None` when this stack
+/// releases no credential at all (no `unseal` line), which is how the plain
+/// verify surfaces, sudo and polkit, opt out of being judged against a wallet
+/// they were never meant to open. The lock screen opts out a level up instead:
+/// `report_keyring_handoff` walks only `GREETERS`, because a warm screen unlock
+/// runs against a wallet the login already opened.
+fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHandoff> {
+    // A continued file cannot be judged line-by-line; silence beats a verdict
+    // reached on lines PAM does not evaluate as written.
+    if has_line_continuation(content) {
+        return None;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    // Anchor on the first line that RELEASES the sealed password into
+    // PAM_AUTHTOK. Two modes do: `unseal` (face login) and `keyring` (the
+    // post-auth fingerprint unlock). Anchoring on `unseal` alone left the
+    // fingerprint path unchecked: a fingerprint-only box wires the greeter
+    // with ONLY the `keyring` line, and a missing or mis-ordered wallet
+    // module there went unreported: the wallet stayed locked after a
+    // fingerprint login with nothing naming why.
+    let unseal_at = lines.iter().position(|l| {
+        let d = directive(l);
+        d.contains(MODULE) && (d.contains("unseal") || d.contains("keyring"))
+    })?;
+    let consumer_in = |l: &str| consumer_active_for(l, service);
+    // A given module's session line may sit anywhere in the session phase, so
+    // that half is searched across the whole file; only the AUTH half is
+    // order-sensitive.
+    let has_session_line = |module: &str| {
+        lines.iter().any(|l| {
+            let d = directive(l);
+            let phase = d.strip_prefix('-').unwrap_or(d);
+            phase.split_whitespace().next() == Some("session")
+                && d.contains(module)
+                // The session half is gated by `only_if=` exactly as the auth
+                // half is: gkr-pam checks it in `pam_sm_open_session` too.
+                && consumer_active_for(l, service).is_some()
+        })
+    };
+    // Only lines BELOW ours can see the token we set, so the search starts past
+    // the unseal line rather than scanning the whole file.
+    let mut complete = None;
+    let mut auth_only: Vec<&'static str> = Vec::new();
+    for module in lines
+        .iter()
+        .skip(unseal_at + 1)
+        .filter(|l| is_auth_directive(l))
+        .filter_map(|l| consumer_in(l))
+    {
+        if has_session_line(module) {
+            complete = complete.or(Some(module));
+        } else if !auth_only.contains(&module) {
+            auth_only.push(module);
+        }
+    }
+    Some(KeyringHandoff {
+        complete,
+        auth_only,
+    })
+}
+
+/// Print a warning for every wired greeter that releases the login password
+/// with nothing downstream to open the wallet. Advisory only: it never changes
+/// a stack and never fails a command, because a missing wallet module is the
+/// user's package/desktop choice, not a broken irlume wiring.
+fn report_keyring_handoff() {
+    for s in GREETERS {
+        let Some(path) = service_present(s) else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if !content_has_module(&content) {
+            continue;
+        }
+        let Some(handoff) = keyring_handoff(&content, service_name(s.etc)) else {
+            continue;
+        };
+        // A single complete module is enough: the wallet opens. Only when none
+        // is complete does the stack need explaining.
+        if handoff.complete.is_some() {
+            continue;
+        }
+        match handoff.auth_only.first() {
+            Some(m) => println!(
+                "  ⚠ {}: {m} reads the released password but has no session line, so the\n     \
+                 wallet daemon is never started with the key. Your wallet will still prompt.",
+                s.etc
+            ),
+            None => println!(
+                "  ⚠ {}: a face or fingerprint login releases your login password, but no\n     \
+                 keyring module reads it afterwards, so KWallet/the login keyring will\n     \
+                 still prompt. Install kwallet-pam (KDE) or gnome-keyring (GNOME); if it\n     \
+                 is already installed, its auth line must sit BELOW the pam_irlume line.",
+                s.etc
+            ),
+        }
+    }
 }
 
 /// Insert irlume's greeter block: `unseal` before the password substack, a
@@ -1887,6 +2176,9 @@ fn is_auth_directive(line: &str) -> bool {
 /// Reseal (self-heal of the sealed password) rides along whenever either is set.
 fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -> (String, bool) {
     if !face && !keyring {
+        return (content.to_string(), false);
+    }
+    if has_line_continuation(content) {
         return (content.to_string(), false);
     }
     if content_has_module(content) {
@@ -1927,10 +2219,7 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
         }
         return (format!("{}\n", out.join("\n")), true);
     }
-    let auth_at = lines
-        .iter()
-        .position(|l| is_passwd_substack(l, "auth"))
-        .or_else(|| lines.iter().position(|l| is_auth_directive(l)));
+    let auth_at = find_auth_anchor(&lines);
     let sess_at = lines.iter().position(|l| is_passwd_substack(l, "session"));
     let Some(auth_at) = auth_at else {
         return (content.to_string(), false);
@@ -1976,6 +2265,9 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
 /// screen unlock releases no credential). Handles both the Debian `@include`
 /// and the Fedora `substack` layouts.
 fn wire_lock(content: &str) -> (String, bool) {
+    if has_line_continuation(content) {
+        return (content.to_string(), false);
+    }
     if content_has_module(content) {
         return (content.to_string(), false);
     }
@@ -1995,10 +2287,7 @@ fn wire_lock(content: &str) -> (String, bool) {
         return (format!("{}\n", out.join("\n")), true);
     }
     // Fedora `substack password-auth` layout → jump stanza + permit landing.
-    let auth_at = lines
-        .iter()
-        .position(|l| is_passwd_substack(l, "auth"))
-        .or_else(|| lines.iter().position(|l| is_auth_directive(l)));
+    let auth_at = find_auth_anchor(&lines);
     let Some(auth_at) = auth_at else {
         return (content.to_string(), false);
     };
@@ -2018,29 +2307,88 @@ fn wire_lock(content: &str) -> (String, bool) {
 /// Wire the `keyring` unseal line into a fingerprint login service
 /// (`gdm-fingerprint`): insert it right after the `pam_fprintd.so` auth line so
 /// the sealed password is set before pam_gnome_keyring's auth line runs.
-fn wire_fp_keyring(content: &str) -> (String, bool) {
+fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
+    if has_line_continuation(content) {
+        return (content.to_string(), false);
+    }
     if content.lines().any(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && t.contains("pam_irlume.so") && t.contains("keyring")
+        let d = directive(l);
+        d.contains(MODULE) && d.contains("keyring")
     }) {
         return (content.to_string(), false); // already wired
     }
     let lines: Vec<&str> = content.lines().collect();
-    let fp_at = lines.iter().position(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && t.starts_with("auth") && t.contains("pam_fprintd.so")
-    });
-    let Some(fp_at) = fp_at else {
+    let Some(fp_at) = lines.iter().position(|l| is_fingerprint_auth(l)) else {
         return (content.to_string(), false);
     };
-    let mut out = Vec::with_capacity(lines.len() + 1);
+    // Does this stack already turn the token we are about to set into an open
+    // keyring? That takes ONE module holding BOTH halves in working positions:
+    // an auth line BELOW the fprintd anchor (above it, the module runs before
+    // PAM_AUTHTOK exists) and a session line of its own (the half that starts
+    // the daemon and unlocks with the stashed key), the same per-module rule
+    // `keyring_handoff` reports by. Any weaker test suppressed our lines on
+    // stacks where a lone session line, a lone auth line, a misplaced auth
+    // line, or even a password-phase line named the module, and the
+    // fingerprint login then succeeded with the wallet still locked.
+    // `only_if=` aware in both halves: a keyring line that stands down for
+    // THIS service is not a consumer here, however plainly it names the
+    // module. Supplying our tagged pair beside an incomplete foreign pair is
+    // the safe direction: unwiring removes exactly ours, and an extra pair
+    // risks redundant work where a suppressed pair leaves the wallet locked,
+    // the exact failure this function exists to close.
+    let has_complete_consumer = KEYRING_CONSUMERS.iter().copied().any(|module| {
+        let auth_below_anchor = lines
+            .iter()
+            .skip(fp_at + 1)
+            .any(|l| is_auth_directive(l) && consumer_active_for(l, service) == Some(module));
+        let session_present = lines.iter().any(|l| {
+            let d = directive(l);
+            let phase = d.strip_prefix('-').unwrap_or(d);
+            phase.split_whitespace().next() == Some("session")
+                && consumer_active_for(l, service) == Some(module)
+        });
+        auth_below_anchor && session_present
+    });
+    let mut out = Vec::with_capacity(lines.len() + 3);
     for (i, l) in lines.iter().enumerate() {
         out.push((*l).to_string());
         if i == fp_at {
             out.push(KEYRING_UNSEAL.to_string());
+            if !has_complete_consumer {
+                out.push(FP_GKR_AUTH.to_string());
+            }
         }
     }
+    if !has_complete_consumer {
+        // Appended last: gnome-keyring's session half wants to run once the
+        // session is otherwise set up.
+        out.push(FP_GKR_SESSION.to_string());
+    }
     (format!("{}\n", out.join("\n")), true)
+}
+
+/// The auth line that performs the fingerprint check, and therefore the line the
+/// keyring unseal must follow.
+///
+/// Matching a literal `pam_fprintd.so` was not enough: GDM's shipped
+/// `gdm-fingerprint.pam` never names the module, delegating instead to
+/// `auth substack fingerprint-auth` (renamed `gdm-fingerprint-auth-substack` on
+/// GDM's development branch). With only the literal match this returned no
+/// anchor, `wire_fp_keyring` became a silent no-op, and the fingerprint keyring
+/// unlock never wired on Fedora at all.
+fn is_fingerprint_auth(line: &str) -> bool {
+    let d = directive(line);
+    let toks: Vec<&str> = d
+        .strip_prefix('-')
+        .unwrap_or(d)
+        .split_whitespace()
+        .collect();
+    if toks.first() != Some(&"auth") {
+        return false;
+    }
+    toks.iter().any(|w| w.contains("pam_fprintd.so"))
+        || (toks.iter().any(|w| *w == "substack" || *w == "include")
+            && toks.iter().any(|w| w.contains("fingerprint")))
 }
 /// Wire a single-stanza verify service (`sudo`, `polkit-1`): the stanza goes
 /// ABOVE the first auth-phase line, whether that is Fedora's `auth include
@@ -2053,6 +2401,9 @@ fn wire_fp_keyring(content: &str) -> (String, bool) {
 /// on a failed face would then fail the whole prompt instead of falling back to
 /// the password.
 fn wire_verify_service(content: &str) -> (String, bool) {
+    if has_line_continuation(content) {
+        return (content.to_string(), false);
+    }
     if content_has_module(content) {
         return (content.to_string(), false);
     }
@@ -2082,12 +2433,16 @@ fn unwire_lines(content: &str) -> (String, bool) {
     let kept: Vec<&str> = content
         .lines()
         .filter(|l| {
-            let t = l.trim_start();
-            if t.starts_with('#') {
-                return true;
-            }
-            let drop = t.contains(MODULE)
-                || (t.contains("pam_permit.so") && l.contains("# irlume-landing"));
+            // The module is matched on the DIRECTIVE (what PAM tokenizes), so a
+            // module named only in a comment is never stripped. The tags are
+            // matched on the RAW line, because that is where they live; they
+            // are comments, invisible to PAM by design.
+            let d = directive(l);
+            let drop = d.contains(MODULE)
+                || (d.contains("pam_permit.so") && l.contains("# irlume-landing"))
+                // Only the gnome-keyring lines WE tagged; a distro-shipped
+                // keyring line carries no tag and must survive unwiring.
+                || (d.contains("pam_gnome_keyring.so") && l.contains(KEYRING_TAG));
             if drop {
                 changed = true;
             }
@@ -3352,6 +3707,965 @@ mod tests {
         assert!(!dir.0.join(format!("sudo{BACKUP}")).exists());
     }
 
+    // ---- keyring hand-off (KWallet / gnome-keyring) --------------------------
+    // A greeter can be wired perfectly and still leave the wallet locked, which
+    // reaches the user as "KWallet asks for its password even though face login
+    // worked". These pin the detection of that state.
+
+    // The four `plasmalogin` stacks Plasma Login Manager actually ships.
+    //
+    // Source: KDE/plasma-login-manager @ master, `data/pam/<os>/plasmalogin`.
+    // Its CMake installs them to `${prefix}/lib/pam.d`, which is the vendor path
+    // irlume materializes its /etc override from.
+    //
+    // BYTE-FOR-BYTE, comments and blank lines included. That is load-bearing, not
+    // tidiness: these pin what irlume's wiring is checked against, so a fixture
+    // that has been "cleaned up" is a fixture that no longer describes any real
+    // machine. An earlier revision of these constants had the comments stripped
+    // and, in the Debian file, had silently lost a `session required pam_env.so`
+    // directive along with them. Re-check with a diff against upstream rather
+    // than by eye.
+
+    const UPSTREAM_FEDORA: &str = r#"auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so
+auth        substack      password-auth
+-auth        optional      pam_gnome_keyring.so
+-auth        optional      pam_kwallet5.so
+-auth        optional      pam_kwallet.so
+auth        include       postlogin
+
+account     required      pam_nologin.so
+account     include       password-auth
+
+password    include       password-auth
+
+session     required      pam_selinux.so close
+session     required      pam_loginuid.so
+-session    optional    pam_ck_connector.so
+session     required      pam_selinux.so open
+session     optional      pam_keyinit.so force revoke
+session     required      pam_namespace.so
+session     include       password-auth
+-session     optional      pam_gnome_keyring.so auto_start
+-session     optional      pam_kwallet5.so auto_start
+-session     optional      pam_kwallet.so auto_start
+session     include       postlogin
+"#;
+
+    const UPSTREAM_ARCH: &str = r#"#%PAM-1.0
+
+# SPDX-License-Identifier: CC0-1.0
+# SPDX-FileCopyrightText: none
+
+auth        include     system-login
+-auth       optional    pam_gnome_keyring.so
+-auth       optional    pam_kwallet5.so
+
+account     include     system-login
+
+password    include     system-login
+-password   optional    pam_gnome_keyring.so    use_authtok
+
+session     optional    pam_keyinit.so          force revoke
+session     include     system-login
+-session    optional    pam_gnome_keyring.so    auto_start
+-session    optional    pam_kwallet5.so         auto_start
+"#;
+
+    const UPSTREAM_DEBIAN: &str = r#"#%PAM-1.0
+
+# Block login if they are globally disabled
+auth    requisite       pam_nologin.so
+auth    required        pam_succeed_if.so user != root quiet_success
+
+# auth    sufficient      pam_succeed_if.so user ingroup nopasswdlogin
+@include common-auth
+
+# gnome_keyring breaks QProcess
+-auth   optional        pam_gnome_keyring.so
+-auth   optional        pam_kwallet5.so
+
+@include common-account
+
+# SELinux needs to be the first session rule.  This ensures that any
+# lingering context has been cleared.  Without this it is possible that a
+# module could execute code in the wrong domain.
+session [success=ok ignore=ignore module_unknown=ignore default=bad] pam_selinux.so close
+
+# Create a new session keyring.
+session optional        pam_keyinit.so force revoke
+session required        pam_limits.so
+session required        pam_loginuid.so
+
+@include common-session
+
+# SELinux needs to intervene at login time to ensure that the process starts
+# in the proper default security context.  Only sessions which are intended
+# to run in the user's context should be run after this.
+session [success=ok ignore=ignore module_unknown=ignore default=bad] pam_selinux.so open
+-session optional       pam_gnome_keyring.so auto_start
+-session optional       pam_kwallet5.so auto_start
+
+@include common-password
+
+# From the pam_env man page
+# Since setting of PAM environment variables can have side effects to other modules, this module should be the last one on the stack.
+
+# Load environment from /etc/environment
+session required        pam_env.so
+
+# Load environment from /etc/default/locale and ~/.pam_environment
+session required        pam_env.so envfile=/etc/default/locale user_readenv=1
+"#;
+
+    /// openSUSE's upstream `plasmalogin` carries NO keyring module at all.
+    const UPSTREAM_SUSE: &str = r#"#%PAM-1.0
+auth     requisite      pam_nologin.so
+auth     substack       common-auth
+account  substack       common-account
+account  include        postlogin-account
+password substack       common-password
+password include        postlogin-password
+session  required       pam_loginuid.so
+session  optional       pam_keyinit.so revoke force
+session  substack       common-session
+session  include        postlogin-session
+
+"#;
+
+    #[test]
+    fn upstream_plasmalogin_stacks_wire_into_a_complete_handoff() {
+        // Fedora, Arch and Debian each ship a keyring module with both halves,
+        // so wiring them must produce a stack this check passes silently. If
+        // irlume's insertion point ever lands below the vendor's keyring auth
+        // line, `complete` goes None here and the wallet would stop opening.
+        for (os, vendor) in [
+            ("fedora", UPSTREAM_FEDORA),
+            ("arch", UPSTREAM_ARCH),
+            ("debian", UPSTREAM_DEBIAN),
+        ] {
+            let (wired, changed) = wire_greeter_impl(vendor, true, false, true);
+            assert!(changed, "{os}: upstream stack must be wirable");
+            let h = keyring_handoff(&wired, "plasmalogin")
+                .unwrap_or_else(|| panic!("{os}: releases a credential"));
+            assert!(
+                h.complete.is_some(),
+                "{os}: expected a complete hand-off, got auth_only={:?}",
+                h.auth_only
+            );
+            // And our line really does precede the vendor's keyring auth line.
+            let face = wired.find("pam_irlume.so unseal").expect("face line");
+            let consumer = wired
+                .find("pam_gnome_keyring.so")
+                .or_else(|| wired.find("pam_kwallet5.so"))
+                .expect("a keyring module");
+            assert!(face < consumer, "{os}: our line must precede the wallet's");
+        }
+    }
+
+    // GDM's shipped stacks, byte-for-byte from GNOME/gdm @ tag 50.0 (the latest
+    // release), `data/pam-<os>/gdm-password.pam`. Red Hat is the substack layout,
+    // Arch the include layout.
+    //
+    // gnome-keyring's module needs the same two halves kwallet does: its
+    // `pam_sm_authenticate` reads PAM_AUTHTOK and stashes it under
+    // "gkr_system_authtok", and `pam_sm_open_session` is what acts on it.
+
+    const UPSTREAM_GDM_REDHAT: &str = r#"auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so
+auth        substack      password-auth
+auth        optional      pam_gnome_keyring.so
+auth        include       postlogin
+
+account     required      pam_nologin.so
+account     include       password-auth
+
+password    substack       password-auth
+-password   optional       pam_gnome_keyring.so use_authtok
+
+session     required      pam_selinux.so close
+session     required      pam_loginuid.so
+session     required      pam_selinux.so open
+session     optional      pam_keyinit.so force revoke
+session     required      pam_namespace.so
+session     include       password-auth
+session     optional      pam_gnome_keyring.so auto_start
+session     include       postlogin
+"#;
+
+    const UPSTREAM_GDM_ARCH: &str = r#"#%PAM-1.0
+
+auth       include                     system-local-login
+auth       optional                    pam_gnome_keyring.so
+
+account    include                     system-local-login
+
+password   include                     system-local-login
+password   optional                    pam_gnome_keyring.so use_authtok
+
+session    include                     system-local-login
+session    optional                    pam_gnome_keyring.so auto_start
+"#;
+
+    /// GDM `main`'s `data/pam-redhat/gdm-password.pam`, byte-for-byte: the shared
+    /// stack is renamed to `gdm-password-auth-substack`, a file GDM does not itself
+    /// ship. No release carries this: 45.0 through 50.1 and 51.alpha all still say
+    /// `password-auth`. It is latent, and would arrive with an upgrade.
+    const UPSTREAM_GDM_RENAMED_SUBSTACK: &str = r#"auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so
+auth        substack      gdm-password-auth-substack
+auth        optional      pam_gnome_keyring.so
+auth        include       postlogin
+
+account     required      pam_nologin.so
+account     include       password-auth
+
+password    substack       gdm-password-auth-substack
+-password   optional       pam_gnome_keyring.so use_authtok
+
+session     required      pam_selinux.so close
+session     required      pam_loginuid.so
+session     required      pam_selinux.so open
+session     optional      pam_keyinit.so force revoke
+session     required      pam_namespace.so
+session     include       password-auth
+session     optional      pam_gnome_keyring.so auto_start
+session     include       postlogin
+"#;
+
+    /// GDM's shipped `gdm-fingerprint.pam` (upstream `data/pam-redhat`, released
+    /// 50.0). It names neither `pam_fprintd.so` nor any keyring module.
+    const UPSTREAM_GDM_FINGERPRINT: &str = r#"auth        substack      fingerprint-auth
+auth        include       postlogin
+
+account     required      pam_nologin.so
+account     include       fingerprint-auth
+
+password    include       fingerprint-auth
+
+session     required      pam_selinux.so close
+session     required      pam_loginuid.so
+session     required      pam_selinux.so open
+session     optional      pam_keyinit.so force revoke
+session     required      pam_namespace.so
+session     include       fingerprint-auth
+session     include       postlogin
+"#;
+
+    #[test]
+    fn gdm_fingerprint_wires_the_unseal_and_supplies_the_missing_consumer() {
+        // Two defects in one stack: no literal pam_fprintd.so to anchor on (so
+        // this used to be a silent no-op), and no keyring module at all (so the
+        // unseal line alone would release a token nothing reads).
+        assert!(!UPSTREAM_GDM_FINGERPRINT.contains("pam_fprintd.so"));
+        assert!(!UPSTREAM_GDM_FINGERPRINT.contains("pam_gnome_keyring.so"));
+
+        let (w, changed) = wire_fp_keyring(UPSTREAM_GDM_FINGERPRINT, "gdm-fingerprint");
+        assert!(changed, "the substack must serve as the anchor");
+        let lines: Vec<&str> = w.lines().collect();
+        let pos = |n: &str| lines.iter().position(|l| l.contains(n));
+
+        let fp = pos("substack      fingerprint-auth").expect("fingerprint substack");
+        let unseal = pos("pam_irlume.so keyring").expect("keyring unseal");
+        let gkr_auth = lines
+            .iter()
+            .position(|l| l.contains("pam_gnome_keyring.so") && is_auth_directive(l))
+            .expect("gnome-keyring auth line");
+        assert_eq!(
+            fp + 1,
+            unseal,
+            "unseal rides directly after the fingerprint auth"
+        );
+        assert_eq!(
+            unseal + 1,
+            gkr_auth,
+            "the consumer reads it immediately after"
+        );
+
+        // Both halves present and paired, so the hand-off actually completes.
+        let session_gkr = lines
+            .iter()
+            .any(|l| l.contains("pam_gnome_keyring.so") && l.contains("auto_start"));
+        assert!(
+            session_gkr,
+            "gnome-keyring needs its session half to unlock"
+        );
+        // The lines we added are tagged, and use PAM's `-` so a machine without
+        // gnome-keyring installed does not get an error logged.
+        assert!(w.contains(KEYRING_TAG));
+        assert!(w.contains("-auth") && w.contains("-session"));
+    }
+
+    #[test]
+    fn wire_fp_keyring_does_not_duplicate_an_existing_keyring_module() {
+        // gdm-fingerprint stacks that DO ship a keyring module must get the
+        // unseal line only; adding a second consumer would be noise.
+        let with_gkr = "#%PAM-1.0\nauth       required      pam_fprintd.so\n\
+auth       optional      pam_gnome_keyring.so\n\
+session    optional      pam_gnome_keyring.so auto_start\n";
+        let (w, changed) = wire_fp_keyring(with_gkr, "gdm-fingerprint");
+        assert!(changed);
+        assert_eq!(
+            w.matches("pam_gnome_keyring.so").count(),
+            2,
+            "must not add a third keyring line"
+        );
+        assert!(!w.contains(KEYRING_TAG), "nothing of ours to tag here");
+    }
+
+    #[test]
+    fn unwiring_removes_our_keyring_lines_but_keeps_the_distros() {
+        // Ours are tagged; a distro-shipped keyring line is not, and must survive.
+        let (wired, _) = wire_fp_keyring(UPSTREAM_GDM_FINGERPRINT, "gdm-fingerprint");
+        let (bare, changed) = unwire_lines(&wired);
+        assert!(changed);
+        assert!(!bare.contains("pam_gnome_keyring.so"), "ours must go");
+        assert!(!bare.contains("pam_irlume.so"));
+        // Round-trips back to the upstream content.
+        assert_eq!(bare.trim_end(), UPSTREAM_GDM_FINGERPRINT.trim_end());
+
+        // A foreign keyring line is untagged and survives.
+        let foreign = "auth       required      pam_fprintd.so\n\
+auth       optional      pam_gnome_keyring.so\n";
+        let (kept, _) = unwire_lines(foreign);
+        assert!(kept.contains("pam_gnome_keyring.so"));
+    }
+
+    #[test]
+    fn upstream_gdm_stacks_wire_into_a_complete_gnome_keyring_handoff() {
+        for (os, vendor) in [("redhat", UPSTREAM_GDM_REDHAT), ("arch", UPSTREAM_GDM_ARCH)] {
+            let (wired, changed) = wire_greeter_impl(vendor, true, false, false);
+            assert!(changed, "{os}: upstream GDM stack must be wirable");
+            let h = keyring_handoff(&wired, "plasmalogin")
+                .unwrap_or_else(|| panic!("{os}: releases a credential"));
+            assert_eq!(
+                h.complete,
+                Some("pam_gnome_keyring.so"),
+                "{os}: expected a complete hand-off, auth_only={:?}",
+                h.auth_only
+            );
+            let face = wired.find("pam_irlume.so unseal").expect("face line");
+            let gkr = wired.find("pam_gnome_keyring.so").expect("keyring module");
+            assert!(face < gkr, "{os}: our line must precede gnome-keyring's");
+        }
+    }
+
+    #[test]
+    fn a_renamed_gdm_substack_still_anchors_on_the_substack() {
+        // The named list cannot keep up with upstream renames, so an unrecognized
+        // `substack` must still be preferred over the first-auth-line guess.
+        // Otherwise the jump lands above pam_selinux_permit.so and the password
+        // substack runs anyway: the openSUSE bug, arriving via a GDM upgrade.
+        assert!(!is_passwd_substack(
+            "auth        substack      gdm-password-auth-substack",
+            "auth"
+        ));
+        let (w, changed) = wire_greeter_impl(UPSTREAM_GDM_RENAMED_SUBSTACK, true, false, false);
+        assert!(changed);
+        let lines: Vec<&str> = w.lines().collect();
+        let pos = |n: &str| lines.iter().position(|l| l.contains(n));
+        let selinux = pos("pam_selinux_permit.so").expect("selinux line");
+        let face = pos("pam_irlume.so unseal").expect("face line");
+        let substack = pos("gdm-password-auth-substack").expect("substack");
+        let landing = pos("irlume-landing").expect("landing");
+        assert!(
+            selinux < face,
+            "pam_selinux_permit must stay above our line"
+        );
+        assert!(
+            face < substack,
+            "our line must precede the password substack"
+        );
+        assert_eq!(
+            substack + 1,
+            landing,
+            "the jump must land past the substack"
+        );
+        // The hand-off still resolves, so a rename costs nothing else.
+        let h = keyring_handoff(&w, "gdm-password").expect("releases a credential");
+        assert_eq!(h.complete, Some("pam_gnome_keyring.so"));
+    }
+
+    #[test]
+    fn the_first_auth_line_guess_stays_the_last_resort() {
+        // Anchor precedence: named stack, then any substack, then the guess.
+        let named = ["auth substack password-auth", "auth substack whatever"];
+        assert_eq!(find_auth_anchor(&named), Some(0));
+        let unnamed = ["auth required pam_env.so", "auth substack whatever"];
+        assert_eq!(
+            find_auth_anchor(&unnamed),
+            Some(1),
+            "substack beats a guess"
+        );
+        let neither = ["auth required pam_env.so", "auth required pam_unix.so"];
+        assert_eq!(
+            find_auth_anchor(&neither),
+            Some(0),
+            "guess is still the floor"
+        );
+        let none: [&str; 0] = [];
+        assert_eq!(find_auth_anchor(&none), None);
+    }
+
+    #[test]
+    fn suse_common_auth_substack_is_the_jump_anchor_and_nologin_survives() {
+        let (w, changed) = wire_greeter_impl(UPSTREAM_SUSE, true, false, true);
+        assert!(changed);
+        let lines: Vec<&str> = w.lines().collect();
+        let pos = |needle: &str| lines.iter().position(|l| l.contains(needle));
+        let nologin = pos("pam_nologin.so").expect("nologin line");
+        let face = pos("pam_irlume.so unseal").expect("face line");
+        let substack = pos("substack       common-auth").expect("common-auth substack");
+        let landing = pos("irlume-landing").expect("permit landing");
+
+        // The anchor is the password substack, NOT the first auth line. Before
+        // this, the jump went above pam_nologin.so: a face match skipped the
+        // nologin gate and then met `substack common-auth` anyway, so the user
+        // typed a password regardless.
+        assert!(
+            nologin < face,
+            "pam_nologin must still run before face auth"
+        );
+        assert!(
+            face < substack,
+            "face line must precede the password substack"
+        );
+        assert!(
+            substack + 1 == landing,
+            "success=1 must land on the permit directly after the substack"
+        );
+        // A substack is atomic for jump counting, so the jump form is right here
+        // (an include would need the `sufficient` form instead).
+        assert!(w.contains("[success=1 default=ignore]   pam_irlume.so unseal ondemand"));
+        assert!(!w.contains("sufficient   pam_irlume.so unseal"));
+        // The session reseal now anchors on `substack common-session` rather
+        // than being appended at EOF.
+        let sess = pos("substack       common-session").expect("common-session");
+        let reseal = pos("session    optional                     pam_irlume.so reseal")
+            .expect("session reseal");
+        assert_eq!(
+            sess + 1,
+            reseal,
+            "session reseal follows the session substack"
+        );
+    }
+
+    #[test]
+    fn common_auth_matching_is_kind_aware_and_leaves_other_phases_alone() {
+        assert!(is_passwd_substack(
+            "auth     substack   common-auth",
+            "auth"
+        ));
+        assert!(is_passwd_substack(
+            "session  substack   common-session",
+            "session"
+        ));
+        // An auth line is not matched against a session-phase stack name, and
+        // the account/password phases are never anchors at all.
+        assert!(!is_passwd_substack(
+            "auth     substack   common-session",
+            "auth"
+        ));
+        assert!(!is_passwd_substack(
+            "account  substack   common-account",
+            "auth"
+        ));
+        assert!(!is_passwd_substack(
+            "password substack   common-password",
+            "session"
+        ));
+        // A bare `auth include common-auth` is an include a jump can't skip, so
+        // it takes the `sufficient` path instead of becoming a jump anchor.
+        assert!(is_include_auth_layout("auth include common-auth"));
+        // Debian's @include form is still caught by the include layout first.
+        assert!(is_include_auth_layout("@include common-auth"));
+    }
+
+    #[test]
+    fn plasmalogin_fingerprint_keyring_line_lands_above_the_wallet_module() {
+        // The KDE fingerprint→KWallet chain. Plasma's greeter runs ONE stack
+        // for user auth (plasma-login-manager's PamBackend selects only
+        // `plasmalogin` / `plasmalogin-greeter` / `plasmalogin-autologin`, and no
+        // fingerprint service, unlike kscreenlocker's kde/kde-fingerprint/
+        // kde-smartcard triple). So a greeter fingerprint login happens when
+        // the distro's shared stack carries pam_fprintd, provides no password,
+        // and the `keyring` line must then release the sealed one ABOVE the
+        // vendor's pam_kwallet5 auth line for the wallet to open.
+        for (os, vendor, od) in [
+            ("fedora", UPSTREAM_FEDORA, true),
+            ("arch", UPSTREAM_ARCH, true),
+            ("debian", UPSTREAM_DEBIAN, true),
+        ] {
+            let (w, changed) = wire_greeter_impl(vendor, true, true, od);
+            assert!(changed, "{os}");
+            let lines: Vec<&str> = w.lines().collect();
+            let keyring = lines
+                .iter()
+                .position(|l| l.contains("pam_irlume.so keyring"))
+                .unwrap_or_else(|| panic!("{os}: keyring line missing"));
+            let kwallet = lines
+                .iter()
+                .position(|l| is_auth_directive(l) && l.contains("pam_kwallet5.so"))
+                .unwrap_or_else(|| panic!("{os}: kwallet auth line missing"));
+            assert!(
+                keyring < kwallet,
+                "{os}: the released password must be set before pam_kwallet5 reads it"
+            );
+            let h = keyring_handoff(&w, "plasmalogin").expect("releases a credential");
+            assert!(h.complete.is_some(), "{os}");
+        }
+    }
+
+    #[test]
+    fn a_keyring_only_greeter_is_still_checked_for_the_wallet_handoff() {
+        // A fingerprint-only box (no face login) wires the greeter with ONLY
+        // the `keyring` line and no `unseal` line. The hand-off check used to anchor
+        // on `unseal` alone, so this stack was skipped entirely: a missing
+        // wallet module after a fingerprint login had no warning at all.
+        let (w, changed) = wire_greeter_impl(UPSTREAM_FEDORA, false, true, true);
+        assert!(changed);
+        assert!(!w.contains("unseal"), "no face line on this box");
+        let h = keyring_handoff(&w, "plasmalogin")
+            .expect("the keyring line releases a credential and must anchor the check");
+        assert!(h.complete.is_some(), "fedora ships the wallet modules");
+        // And on the stack that genuinely lacks a wallet module, the warning
+        // now fires for the fingerprint path too.
+        let (suse, changed) = wire_greeter_impl(UPSTREAM_SUSE, false, true, true);
+        assert!(changed);
+        let h = keyring_handoff(&suse, "plasmalogin").expect("releases a credential");
+        assert_eq!(h.complete, None);
+    }
+
+    #[test]
+    fn upstream_suse_plasmalogin_ships_no_keyring_module_and_is_flagged() {
+        // openSUSE's upstream file has neither pam_kwallet5 nor pam_gnome_keyring,
+        // so a face login there releases a password nothing reads. This is the
+        // real-world case the warning exists for, not a synthetic one.
+        assert!(!UPSTREAM_SUSE.contains("pam_kwallet"));
+        assert!(!UPSTREAM_SUSE.contains("pam_gnome_keyring"));
+        let (wired, changed) = wire_greeter_impl(UPSTREAM_SUSE, true, false, true);
+        assert!(changed);
+        let h = keyring_handoff(&wired, "plasmalogin").expect("releases a credential");
+        assert_eq!(h.complete, None);
+        assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn directive_cuts_at_the_comment_exactly_as_pam_does() {
+        assert_eq!(
+            directive("auth optional pam_unix.so"),
+            "auth optional pam_unix.so"
+        );
+        assert_eq!(
+            directive("  auth optional pam_unix.so  # note"),
+            "auth optional pam_unix.so  "
+        );
+        assert_eq!(directive("# whole line comment"), "");
+        assert_eq!(directive(""), "");
+        // libpam truncates at '#' even mid-token (pam_exec received `arg` from
+        // a literal `arg#embedded`), so cutting at the FIRST '#' anywhere is
+        // the faithful reading, not an approximation.
+        assert_eq!(
+            directive("auth optional pam_unix.so arg#embedded"),
+            "auth optional pam_unix.so arg"
+        );
+    }
+
+    #[test]
+    fn a_module_named_only_in_a_comment_is_never_treated_as_configured() {
+        // libpam strips a trailing comment before tokenizing, so none of these
+        // lines load the module they mention. Matching the raw line would make
+        // irlume disagree with the thing it is configuring.
+        //
+        // content_has_module is the dangerous one: it gates the whole wiring
+        // path, so a false positive means `login enable` silently writes
+        // nothing and reports the stack as already wired.
+        assert!(!content_has_module(
+            "auth required pam_unix.so  # was pam_irlume.so\n"
+        ));
+        assert!(content_has_module("auth sufficient pam_irlume.so\n"));
+
+        // Anchors must not be invented out of comment text either.
+        assert!(!is_passwd_substack(
+            "auth required pam_unix.so # substack password-auth",
+            "auth"
+        ));
+        assert!(!is_include_auth_layout(
+            "auth required pam_unix.so # @include common-auth"
+        ));
+        assert!(!is_auth_substack_anchor(
+            "auth required pam_unix.so # substack whatever"
+        ));
+        assert!(!is_fingerprint_auth(
+            "auth required pam_unix.so # substack fingerprint-auth"
+        ));
+        assert!(!is_auth_directive("# auth required pam_unix.so"));
+
+        // Nor a keyring consumer.
+        assert_eq!(
+            consumer_active_for(
+                "auth required pam_unix.so # see pam_gnome_keyring.so",
+                "gdm-password"
+            ),
+            None
+        );
+
+        // A stack whose only mention of a keyring module is a comment has no
+        // hand-off, however complete it looks to a grep.
+        let commented = "#%PAM-1.0\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth       substack      password-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+auth       optional      pam_deny.so    # pam_gnome_keyring.so would go here\n\
+session    optional      pam_deny.so    # pam_gnome_keyring.so auto_start\n";
+        let h = keyring_handoff(commented, "gdm-password").expect("releases a credential");
+        assert_eq!(h.complete, None);
+        assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn unwiring_matches_modules_on_the_directive_but_tags_on_the_raw_line() {
+        // Our tags ARE comments, so they must still be found there; a foreign
+        // line that merely names one of our modules in a comment must survive.
+        let stack = "auth required pam_unix.so  # not pam_irlume.so, just a note\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+-auth      optional      pam_gnome_keyring.so   # irlume-keyring\n\
+-auth      optional      pam_gnome_keyring.so\n";
+        let (out, changed) = unwire_lines(stack);
+        assert!(changed);
+        assert!(
+            out.contains("not pam_irlume.so, just a note"),
+            "comment-only mention survives"
+        );
+        assert!(!out.contains("irlume-landing"), "our tagged landing goes");
+        assert!(
+            !out.contains("irlume-keyring"),
+            "our tagged keyring line goes"
+        );
+        assert!(
+            out.contains("-auth      optional      pam_gnome_keyring.so\n"),
+            "the distro's untagged keyring line survives"
+        );
+    }
+
+    #[test]
+    fn line_continuation_semantics_match_the_pam_assembler() {
+        // Each row was executed against libpam via pam_exec.so:
+        // a trailing backslash on a directive joins the NEXT physical line into
+        // this one (the module received the next line's text as its argument);
+        assert!(has_line_continuation(
+            "auth optional pam_exec.so run.sh \\\n  CONT\n"
+        ));
+        // whitespace after the backslash does not defuse it (the follow-up
+        // line was still swallowed);
+        assert!(has_line_continuation(
+            "auth optional pam_exec.so run.sh A \\   \n"
+        ));
+        // a backslash at the end of a COMMENT does not continue (both modules
+        // ran as separate lines);
+        assert!(!has_line_continuation(
+            "auth optional pam_exec.so run.sh FIRST # note \\\nauth optional pam_exec.so run.sh SECOND\n"
+        ));
+        // and a whole-line comment ending in a backslash is still just a comment.
+        assert!(!has_line_continuation("# just a comment \\\n"));
+        // A backslash mid-line is an ordinary character, not a continuation.
+        assert!(!has_line_continuation(
+            "auth optional pam_unix.so arg\\more\n"
+        ));
+    }
+
+    #[test]
+    fn a_stack_using_line_continuations_is_never_rewritten() {
+        // PAM evaluates a continued pair as ONE logical line, so a line-based
+        // insertion after the anchor would splice our stanza into the middle of
+        // it. Every transform must refuse the whole file: staged-never-written,
+        // the same contract as a missing anchor.
+        let cont =
+            "#%PAM-1.0\nauth substack \\\n    password-auth\nsession include password-auth\n";
+        assert!(has_line_continuation(cont));
+        let (g, changed) = wire_greeter_impl(cont, true, true, true);
+        assert!(!changed);
+        assert_eq!(g, cont);
+        let (l, changed) = wire_lock(cont);
+        assert!(!changed);
+        assert_eq!(l, cont);
+        let (v, changed) = wire_verify_service(cont);
+        assert!(!changed);
+        assert_eq!(v, cont);
+        let fp = "auth required pam_fprintd.so \\\n    likeauth\n";
+        let (f, changed) = wire_fp_keyring(fp, "gdm-fingerprint");
+        assert!(!changed);
+        assert_eq!(f, fp);
+        // The advisory stays silent too: a verdict from lines PAM does not
+        // evaluate as written would be worse than no verdict.
+        let wired = "auth sufficient pam_irlume.so unseal ondemand\n\
+-auth optional pam_kwallet5.so \\\n    someopt\n";
+        assert!(keyring_handoff(wired, "plasmalogin").is_none());
+    }
+
+    #[test]
+    fn no_upstream_fixture_uses_line_continuations() {
+        // What makes the refusal gate behaviour-neutral on real stacks. If a
+        // distro starts shipping continuations, this fails and the gate needs
+        // real assembly support instead of refusal.
+        for (name, body) in [
+            ("plasmalogin fedora", UPSTREAM_FEDORA),
+            ("plasmalogin arch", UPSTREAM_ARCH),
+            ("plasmalogin debian", UPSTREAM_DEBIAN),
+            ("plasmalogin suse", UPSTREAM_SUSE),
+            ("gdm redhat", UPSTREAM_GDM_REDHAT),
+            ("gdm arch", UPSTREAM_GDM_ARCH),
+            ("gdm renamed", UPSTREAM_GDM_RENAMED_SUBSTACK),
+            ("gdm fingerprint", UPSTREAM_GDM_FINGERPRINT),
+        ] {
+            assert!(!has_line_continuation(body), "{name}");
+        }
+    }
+
+    #[test]
+    fn only_if_gating_is_matched_the_way_gkr_pam_matches_it() {
+        // gkr-pam's `evaluate_inlist` matches whole comma-separated items, so a
+        // prefix must NOT satisfy it: `only_if=gdm` leaves gdm-fingerprint out.
+        let line = "-auth optional pam_gnome_keyring.so only_if=gdm,gdm-password";
+        assert_eq!(
+            consumer_active_for(line, "gdm-password"),
+            Some("pam_gnome_keyring.so")
+        );
+        assert_eq!(consumer_active_for(line, "gdm-fingerprint"), None);
+        assert_eq!(
+            consumer_active_for(
+                "-auth optional pam_gnome_keyring.so only_if=gdm",
+                "gdm-fingerprint"
+            ),
+            None,
+            "a prefix must not satisfy a whole-item list"
+        );
+        // No only_if= at all → active everywhere. kwallet has no such option.
+        assert_eq!(
+            consumer_active_for("-auth optional pam_gnome_keyring.so", "anything"),
+            Some("pam_gnome_keyring.so")
+        );
+        assert_eq!(
+            consumer_active_for("-auth optional pam_kwallet5.so", "plasmalogin"),
+            Some("pam_kwallet5.so")
+        );
+        // A commented line is never a consumer.
+        assert_eq!(
+            consumer_active_for("# -auth optional pam_gnome_keyring.so", "plasmalogin"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_keyring_line_gated_off_for_this_service_is_not_a_hand_off() {
+        // The stack names pam_gnome_keyring on both halves, but `only_if=` means
+        // every entry point returns PAM_SUCCESS without reading the token. A
+        // module-name grep would call this complete and reassure the user that a
+        // wallet will open when nothing will.
+        let gated = "#%PAM-1.0\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth       substack      password-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+-auth      optional      pam_gnome_keyring.so only_if=gdm-password\n\
+session    include       password-auth\n\
+-session   optional      pam_gnome_keyring.so auto_start only_if=gdm-password\n";
+        assert_eq!(
+            keyring_handoff(gated, "gdm-password").unwrap().complete,
+            Some("pam_gnome_keyring.so"),
+            "on the listed service it really is a hand-off"
+        );
+        let h = keyring_handoff(gated, "gdm-fingerprint").expect("releases a credential");
+        assert_eq!(
+            h.complete, None,
+            "gated off here, so nothing opens the wallet"
+        );
+        assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn wire_fp_keyring_supplies_a_consumer_when_the_existing_one_is_gated_off() {
+        // Same trap on the fingerprint path: a gated line must not suppress the
+        // consumer we would otherwise add, or the unlock silently does nothing.
+        let gated = "#%PAM-1.0\nauth       required      pam_fprintd.so\n\
+-auth      optional      pam_gnome_keyring.so only_if=gdm-password\n\
+-session   optional      pam_gnome_keyring.so auto_start only_if=gdm-password\n";
+        let (w, changed) = wire_fp_keyring(gated, "gdm-fingerprint");
+        assert!(changed);
+        assert!(
+            w.contains(KEYRING_TAG),
+            "must add our own consumer, the existing one stands down here"
+        );
+        // And on the service the existing line DOES cover, we add nothing.
+        let (w2, _) = wire_fp_keyring(gated, "gdm-password");
+        assert!(!w2.contains(KEYRING_TAG));
+    }
+
+    #[test]
+    fn a_split_handoff_across_two_modules_is_not_complete() {
+        // The reason the halves are paired per module: kwallet5 reads the token
+        // but has no session line, while gnome-keyring has only a session line.
+        // Counting the halves separately would call this complete; nothing opens.
+        let split = "#%PAM-1.0\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth       substack      password-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+-auth      optional      pam_kwallet5.so\n\
+session    include       password-auth\n\
+-session   optional      pam_gnome_keyring.so auto_start\n";
+        let h = keyring_handoff(split, "plasmalogin").expect("releases a credential");
+        assert_eq!(h.complete, None);
+        assert_eq!(h.auth_only, vec!["pam_kwallet5.so"]);
+    }
+
+    /// Fedora KDE `plasmalogin` (substack layout) AFTER irlume wires it, with
+    /// the vendor kwallet lines in their shipped positions.
+    const PLASMA_WIRED: &str = "#%PAM-1.0\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth       substack      password-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+auth       optional                     pam_irlume.so reseal\n\
+-auth      optional      pam_kwallet5.so\n\
+auth       include       postlogin\n\
+account    include       password-auth\n\
+session    include       password-auth\n\
+-session   optional      pam_kwallet5.so auto_start\n\
+session    optional                     pam_irlume.so reseal\n";
+
+    #[test]
+    fn plasmalogin_with_kwallet_has_a_complete_handoff() {
+        let h = keyring_handoff(PLASMA_WIRED, "plasmalogin").expect("stack releases a credential");
+        // The jump skips exactly the substack and lands on the permit, so the
+        // vendor kwallet auth line below it does observe our PAM_AUTHTOK.
+        assert_eq!(h.complete, Some("pam_kwallet5.so"));
+        assert!(h.auth_only.is_empty());
+    }
+
+    /// The Fedora KDE vendor `plasmalogin` as shipped: kwallet lines in place,
+    /// irlume not yet wired.
+    const PLASMA_VENDOR: &str = "#%PAM-1.0\n\
+auth       substack      password-auth\n\
+-auth      optional      pam_kwallet5.so\n\
+auth       include       postlogin\n\
+account    include       password-auth\n\
+session    include       password-auth\n\
+-session   optional      pam_kwallet5.so auto_start\n";
+
+    #[test]
+    fn what_we_wire_is_what_the_handoff_check_approves() {
+        // Closes the loop between the two halves: the wiring must insert the
+        // unseal line ABOVE the vendor's kwallet auth line, which is exactly the
+        // order the check demands. If either side moves, this fails rather than
+        // shipping a stack we wire and then warn about.
+        let (wired, changed) = wire_greeter_impl(PLASMA_VENDOR, true, false, true);
+        assert!(changed);
+        let h =
+            keyring_handoff(&wired, "plasmalogin").expect("a wired greeter releases a credential");
+        assert_eq!(h.complete, Some("pam_kwallet5.so"));
+        assert!(h.auth_only.is_empty());
+        let face = wired.find("pam_irlume.so unseal").unwrap();
+        let kwallet = wired.find("pam_kwallet5.so").unwrap();
+        assert!(face < kwallet, "our line must precede the wallet's");
+    }
+
+    #[test]
+    fn arch_include_greeter_we_wire_also_passes_the_handoff_check() {
+        const ARCH_VENDOR: &str = "#%PAM-1.0\n\
+auth        include     system-login\n\
+-auth       optional    pam_kwallet5.so\n\
+account     include     system-login\n\
+session     include     system-login\n\
+-session    optional    pam_kwallet5.so auto_start\n";
+        let (wired, changed) = wire_greeter_impl(ARCH_VENDOR, true, false, true);
+        assert!(changed);
+        let h =
+            keyring_handoff(&wired, "plasmalogin").expect("a wired greeter releases a credential");
+        assert_eq!(h.complete, Some("pam_kwallet5.so"));
+        assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn plasmalogin_without_any_keyring_module_is_flagged() {
+        let stripped: String = PLASMA_WIRED
+            .lines()
+            .filter(|l| !l.contains("pam_kwallet5.so"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let h = keyring_handoff(&stripped, "plasmalogin").expect("stack releases a credential");
+        // Nothing reads the released password: this is the silent case that used
+        // to report as "wired ✓" while the wallet kept prompting.
+        assert_eq!(h.complete, None);
+        assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn kwallet_above_the_irlume_line_does_not_count_as_a_consumer() {
+        // Ordering, not mere presence, is what matters: an auth line ABOVE ours
+        // runs before the token exists, so the wallet stays locked.
+        let above = "#%PAM-1.0\n\
+-auth      optional      pam_kwallet5.so\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth       substack      password-auth\n\
+-session   optional      pam_kwallet5.so auto_start\n";
+        let h = keyring_handoff(above, "plasmalogin").expect("stack releases a credential");
+        assert_eq!(
+            h.complete, None,
+            "a consumer above our line cannot see the token"
+        );
+        assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn arch_include_layout_handoff_is_detected() {
+        let arch = "#%PAM-1.0\n\
+auth       sufficient   pam_irlume.so unseal ondemand kr\n\
+auth       include     system-login\n\
+auth       optional                     pam_irlume.so reseal\n\
+-auth      optional    pam_kwallet5.so\n\
+-session   optional    pam_kwallet5.so auto_start\n";
+        let h = keyring_handoff(arch, "plasmalogin").expect("stack releases a credential");
+        assert_eq!(h.complete, Some("pam_kwallet5.so"));
+        assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn auth_line_without_a_session_line_is_reported_separately() {
+        // pam_kwallet5 derives the key at auth time but it is the SESSION line
+        // that starts the daemon and hands it over; auth alone opens nothing.
+        let no_session: String = PLASMA_WIRED
+            .lines()
+            .filter(|l| !(l.contains("pam_kwallet5.so") && l.contains("session")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let h = keyring_handoff(&no_session, "plasmalogin").expect("stack releases a credential");
+        assert_eq!(h.complete, None);
+        assert_eq!(h.auth_only, vec!["pam_kwallet5.so"]);
+    }
+
+    #[test]
+    fn gnome_keyring_counts_as_a_consumer_too() {
+        let gnome = PLASMA_WIRED.replace("pam_kwallet5.so", "pam_gnome_keyring.so");
+        let h = keyring_handoff(&gnome, "plasmalogin").expect("stack releases a credential");
+        assert_eq!(h.complete, Some("pam_gnome_keyring.so"));
+        assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn a_verify_only_stack_is_not_judged_for_a_wallet() {
+        // sudo / polkit carry the plain verify stanza: no `unseal`, so no
+        // credential is released and there is nothing for a wallet to consume.
+        let sudo = "#%PAM-1.0\nauth       sufficient                   pam_irlume.so\n\
+@include common-auth\n";
+        assert!(keyring_handoff(sudo, "plasmalogin").is_none());
+    }
+
+    #[test]
+    fn a_commented_out_keyring_line_is_not_a_consumer() {
+        let commented = PLASMA_WIRED.replace(
+            "-auth      optional      pam_kwallet5.so",
+            "#-auth      optional      pam_kwallet5.so",
+        );
+        let h = keyring_handoff(&commented, "plasmalogin").expect("stack releases a credential");
+        assert_eq!(h.complete, None);
+        assert!(h.auth_only.is_empty());
+    }
+
     #[test]
     fn passwd_substack_matcher() {
         assert!(is_passwd_substack(
@@ -3551,7 +4865,7 @@ mod tests {
 
     #[test]
     fn wire_fp_keyring_inserts_between_fprintd_and_the_keyring_auth_line() {
-        let (w, changed) = wire_fp_keyring(GDM_FP);
+        let (w, changed) = wire_fp_keyring(GDM_FP, "gdm-fingerprint");
         assert!(changed);
         let lines: Vec<&str> = w.lines().collect();
         let fp = lines
@@ -3571,19 +4885,114 @@ mod tests {
             "keyring unseal must sit fprintd→keyring"
         );
         // Idempotent: a second pass is a no-op.
-        let (w2, c2) = wire_fp_keyring(&w);
+        let (w2, c2) = wire_fp_keyring(&w, "gdm-fingerprint");
         assert!(!c2 && w2 == w);
     }
 
     #[test]
     fn wire_fp_keyring_needs_an_fprintd_anchor() {
         // No pam_fprintd line → nothing to anchor to → unchanged.
-        let (w, changed) = wire_fp_keyring("#%PAM-1.0\nauth required pam_unix.so\n");
+        let (w, changed) =
+            wire_fp_keyring("#%PAM-1.0\nauth required pam_unix.so\n", "gdm-fingerprint");
         assert!(!changed);
         assert_eq!(w, "#%PAM-1.0\nauth required pam_unix.so\n");
         // A commented fprintd line is not an anchor either.
-        let (_, c) = wire_fp_keyring("#%PAM-1.0\n# auth required pam_fprintd.so\n");
+        let (_, c) = wire_fp_keyring(
+            "#%PAM-1.0\n# auth required pam_fprintd.so\n",
+            "gdm-fingerprint",
+        );
         assert!(!c);
+    }
+
+    // A consumer only counts when ONE module holds BOTH halves in working
+    // positions, the same per-module rule `keyring_handoff` reports by. Any
+    // single keyring line used to suppress our pair, and the fingerprint
+    // login then succeeded with the wallet still locked.
+
+    #[test]
+    fn fp_session_only_does_not_suppress_the_auth_consumer() {
+        // Session half alone: nothing reads the token irlume releases.
+        let stack = "auth required pam_fprintd.so\n\
+-session optional pam_gnome_keyring.so auto_start\n";
+        let (wired, changed) = wire_fp_keyring(stack, "gdm-fingerprint");
+        assert!(changed);
+        assert!(wired.contains(FP_GKR_AUTH), "{wired}");
+        assert!(
+            keyring_handoff(&wired, "gdm-fingerprint")
+                .expect("wired stack releases a credential")
+                .complete
+                .is_some(),
+            "the wired stack must form a complete hand-off:\n{wired}"
+        );
+    }
+
+    #[test]
+    fn fp_auth_only_does_not_suppress_the_session_consumer() {
+        // Auth half alone: the key is stashed and dropped, no daemon starts.
+        let stack = "auth required pam_fprintd.so\n\
+-auth optional pam_gnome_keyring.so\n";
+        let (wired, changed) = wire_fp_keyring(stack, "gdm-fingerprint");
+        assert!(changed);
+        assert!(wired.contains(FP_GKR_SESSION), "{wired}");
+        assert!(
+            keyring_handoff(&wired, "gdm-fingerprint")
+                .expect("wired stack releases a credential")
+                .complete
+                .is_some(),
+            "the wired stack must form a complete hand-off:\n{wired}"
+        );
+    }
+
+    #[test]
+    fn fp_consumer_above_the_anchor_does_not_count() {
+        // Both halves present, but the auth half sits ABOVE pam_fprintd.so:
+        // it runs before PAM_AUTHTOK exists, so it consumes nothing, and it
+        // must not suppress a pair that would actually work.
+        let stack = "-auth optional pam_gnome_keyring.so\n\
+auth required pam_fprintd.so\n\
+-session optional pam_gnome_keyring.so auto_start\n";
+        let (wired, changed) = wire_fp_keyring(stack, "gdm-fingerprint");
+        assert!(changed);
+        let release = wired
+            .find("pam_irlume.so keyring")
+            .expect("unseal line present");
+        let tagged_auth = wired.find(FP_GKR_AUTH).expect("tagged auth supplied");
+        assert!(
+            release < tagged_auth,
+            "the supplied consumer must sit below the release:\n{wired}"
+        );
+    }
+
+    // Regression for the vendor-override path: the transform refusing (a
+    // continued vendor file has no judgeable lines) must refuse the
+    // materialization too. This branch used to discard `changed`, write an
+    // override with NO irlume line over the vendor file, and report ✓.
+    #[test]
+    fn wire_service_override_does_not_materialize_a_refused_vendor_stack() {
+        let dir = TestDir::new("override-refused");
+        let vendor = dir.0.join("plasmalogin.vendor");
+        std::fs::write(
+            &vendor,
+            "auth substack \\\n    password-auth\nsession include password-auth\n",
+        )
+        .unwrap();
+        let etc = dir.0.join("plasmalogin");
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: Some(leak(&vendor)),
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, false, true);
+        let outcome = wire_service(&svc, true, true, &wire).unwrap();
+        assert_eq!(outcome.change, PlannedChange::NoAnchor);
+        assert!(
+            !etc.exists(),
+            "a refused transform must not create an override"
+        );
+        assert!(
+            !outcome.message.starts_with('✓'),
+            "refusal must not read as successful wiring: {}",
+            outcome.message
+        );
     }
 
     #[test]
