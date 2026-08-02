@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **`camera-tune` is reachable from the TUI.** The Cameras screen gains `[t]`,
+  which routes to `sudo irlume camera-tune` like the other privileged
+  one-shots, after saying up front that it holds the camera and fires the IR
+  emitter for up to a minute and then persists the capture-mode verdict, since
+  that materially changes how authentication captures frames afterwards. It
+  was the one user-facing operation with no TUI route. Closes #170.
+
 - **Debug-enabled consent watches report the #101 candidate discriminator.**
   `mean_step` (mean absolute pitch change per frame: |Δpitch|/Δidx over
   usable pairs at most one strobe apart, since IR modules light alternate
