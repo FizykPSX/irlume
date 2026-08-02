@@ -1108,10 +1108,17 @@ fn serve(stream: UnixStream, arbiter: &arbiter::Arbiter<Queued>) -> std::io::Res
             // read-only, engine-free, and possibly slow (ListProfiles is a
             // TPM unseal), so it must neither wait behind the worker nor make
             // an authentication wait behind it (#212).
+            // A Status request is answered here ONLY if dispatch_status can
+            // answer it from memory. `None` means it cannot (an unpublished
+            // enrollment summary), and the request must then take the normal
+            // queue path so the worker does the real load and publishes it.
+            // Answering the None with an error instead made every listing
+            // fail: the miss never reached the worker, so nothing ever
+            // published, so every later listing missed too.
             if class == arbiter::Class::Status {
-                let resp = dispatch_status(&req, &peer)
-                    .unwrap_or_else(|| Response::Error("not a status request".into()));
-                return respond(stream, &resp);
+                if let Some(resp) = dispatch_status(&req, &peer) {
+                    return respond(stream, &resp);
+                }
             }
             let (reply, answer) = std::sync::mpsc::channel();
             let queued = Queued {
@@ -3036,6 +3043,92 @@ mod tests {
         assert_eq!(peer.pid, std::process::id() as i32);
     }
 
+    /// Serialize the tests that mutate the process-global enrollment-summary
+    /// cache for the same username. libtest runs tests in parallel, so
+    /// without this one test's `publish` lands inside another's miss window
+    /// and turns a real pass into an intermittent failure (or worse, a false
+    /// pass in a mutation run, which is how a flake becomes a lie about
+    /// coverage).
+    fn enrollment_summary_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A Status request the connection thread CANNOT answer from memory must
+    /// reach the worker, not be answered with an error.
+    ///
+    /// Shipped broken once: `serve` turned `dispatch_status`'s `None` (an
+    /// unpublished enrollment summary) into `Error("not a status request")`,
+    /// so the miss never reached the worker, nothing ever published, and
+    /// every listing on the machine failed. The bug survived a hardware
+    /// check that compared two response BODIES for equality without
+    /// asserting their type: both were the same error.
+    #[test]
+    fn an_unpublished_listing_reaches_the_worker_instead_of_erroring() {
+        let _summary_guard = enrollment_summary_test_lock();
+        let me = users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());
+        invalidate_enrollment_summary(&me);
+
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let worker = {
+            let arbiter = std::sync::Arc::clone(&arbiter);
+            std::thread::spawn(move || {
+                while let Some(job) = arbiter.take() {
+                    let Queued { req, reply, .. } = job.payload;
+                    arbiter.finish(job.class, job.uid);
+                    // Stand in for the real load: the worker is what answers
+                    // a miss, and what publishes the summary afterwards.
+                    let resp = match req {
+                        Request::ListProfiles { .. } => Response::Enrollment {
+                            profiles: vec![irlume_common::ProfileSummary {
+                                name: "FromWorker".into(),
+                                scans: vec!["s1".into()],
+                            }],
+                            require_eyes_open: false,
+                            require_challenge: false,
+                            closure_calibrated: false,
+                            ir_ratio_calibrated: false,
+                        },
+                        _ => Response::Pong,
+                    };
+                    let _ = reply.send(resp);
+                }
+            })
+        };
+
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        (&ours)
+            .write_all(
+                format!("{{\"ListProfiles\":{{\"user\":\"{me}\",\"structured_errors\":false}}}}\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let a = std::sync::Arc::clone(&arbiter);
+        std::thread::spawn(move || serve(theirs, &a).unwrap());
+
+        let mut line = String::new();
+        BufReader::new(&ours)
+            .read_line(&mut line)
+            .expect("an answer within the deadline");
+        let resp: Response = serde_json::from_str(line.trim()).unwrap();
+        match resp {
+            Response::Enrollment { profiles, .. } => {
+                assert_eq!(
+                    profiles.first().map(|p| p.name.as_str()),
+                    Some("FromWorker")
+                )
+            }
+            other => panic!("a cache miss must be served by the worker, got {other:?}"),
+        }
+
+        arbiter.close();
+        worker.join().unwrap();
+    }
+
     #[test]
     fn serve_routes_a_request_through_the_arbiter_and_answers_the_client() {
         // The whole path a client sees, minus the engine: parse, queue, worker,
@@ -3168,6 +3261,7 @@ mod tests {
 
     #[test]
     fn a_listing_serves_the_published_summary_and_misses_queue_to_the_worker() {
+        let _summary_guard = enrollment_summary_test_lock();
         let me = users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());
         let peer = Peer {
             uid: unsafe { libc::getuid() },
