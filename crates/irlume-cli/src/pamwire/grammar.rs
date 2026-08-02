@@ -165,7 +165,7 @@ pub(super) fn consumer_active_for(line: &str, service: &str) -> Option<&'static 
 /// would be treated as already wired and silently left alone.
 ///
 /// A full-line comment yields `""`, so callers need no separate `#` check.
-pub(super) fn directive(line: &str) -> &str {
+pub(crate) fn directive(line: &str) -> &str {
     let t = line.trim_start();
     match t.find('#') {
         Some(i) => &t[..i],
@@ -195,8 +195,60 @@ pub(super) fn directive(line: &str) -> &str {
 /// (staged, never written, the same contract as a missing anchor), and the
 /// hand-off advisory stays silent rather than reporting from an analysis
 /// that cannot see the file the way PAM does.
-pub(super) fn has_line_continuation(content: &str) -> bool {
+pub(crate) fn has_line_continuation(content: &str) -> bool {
     content
         .lines()
         .any(|l| directive(l).trim_end().ends_with('\\'))
+}
+
+/// The module-path field of this line, when it is an auth RULE: `type control
+/// module-path module-arguments`, per pam.conf(5), with the type read
+/// case-insensitively as libpam does and PAM's leading `-` tolerated.
+///
+/// `include`/`substack` controls carry a target, not a module, and a bracketed
+/// control (`[success=1 default=ignore]`) spans tokens until the closing `]`,
+/// so the module path is whatever follows the WHOLE control field. Substring
+/// scans that skipped this parsing counted a `session` line, a module
+/// ARGUMENT naming the file, or `pam_fprintd.so.disabled` as fingerprint
+/// authentication, and the `--fingerprint-only` gate then stood face down on
+/// a box where no fingerprint rule answers any prompt.
+pub(crate) fn auth_module(line: &str) -> Option<&str> {
+    let mut toks = directive(line).split_whitespace();
+    let kind = toks.next()?;
+    if !kind
+        .strip_prefix('-')
+        .unwrap_or(kind)
+        .eq_ignore_ascii_case("auth")
+    {
+        return None;
+    }
+    let control = toks.next()?;
+    if control.eq_ignore_ascii_case("include") || control.eq_ignore_ascii_case("substack") {
+        return None;
+    }
+    if control.starts_with('[') && !control.ends_with(']') {
+        let mut closed = false;
+        for token in toks.by_ref() {
+            if token.ends_with(']') {
+                closed = true;
+                break;
+            }
+        }
+        if !closed {
+            return None;
+        }
+    }
+    toks.next()
+}
+
+/// True when this line is an auth rule whose module-path names `module` (by
+/// file name, so `/usr/lib64/security/pam_fprintd.so` matches
+/// `pam_fprintd.so` and `pam_fprintd.so.disabled` does not).
+pub(crate) fn directive_has_auth_module(line: &str, module: &str) -> bool {
+    auth_module(line).is_some_and(|path| {
+        std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(module)
+    })
 }
