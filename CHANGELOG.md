@@ -7,6 +7,24 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **Debug-enabled consent watches report the #101 candidate discriminator.**
+  `mean_step` (mean absolute pitch change per frame: |Δpitch|/Δidx over
+  usable pairs at most one strobe apart, since IR modules light alternate
+  frames; a longer, face-lost gap contributes nothing) now rides
+  in the nod evidence, the opt-in consent debug line (`IRLUME_LOG=debug`, off
+  by default; ordinary authentication runs still emit no diagnostic
+  evidence), and `blinkcap replay`'s per-label summary. It gates nothing:
+  #101 measured it separating a still head from a deliberate nod by 2.3x
+  where the gating pitch range manages 1.44x, then deliberately declined to
+  set a threshold on one user's single session, because this class of signal
+  is known to drift between sessions. The blocker is cross-session data, and
+  replay over recorded corpora is where that accumulates: replay now refuses
+  a damaged or truncated pose recording loudly instead of measuring its
+  fragments as a still head, accepts a single `.jsonl` file as documented
+  rather than only a directory, exits successfully on a pose-only corpus,
+  and captures are staged and renamed into place so a crash cannot leave a
+  valid header over a partial body.
+
 - **The emitter write honours the Windows exclusive-control model.** Windows
   permits many camera consumers but only one controlling instance; sharing
   consumers cannot change extended camera controls and inherit the controlling
