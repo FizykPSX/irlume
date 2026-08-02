@@ -781,16 +781,18 @@ impl Engine {
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: 0.0, // RGB-only path: no IR burst to measure
+            face_frac: face_frac_of(rgb_top.as_ref().map(|f| &f.bbox), rgb.width),
             rgb_face_brightness: rgb_brightness,
             rgb_specular_frac: rgb_specular,
             rgb_moire_score: rgb_moire,
         };
         let (verdict, _cues, reason) = self.gate.evaluate_rgb_only(&signals);
         irlume_common::dlog!(
-            "liveness(rgb-only): {verdict:?} ({reason}); bright={:.0} specular={:.2} moire={:.0}",
+            "liveness(rgb-only): {verdict:?} ({reason}); bright={:.0} specular={:.2} moire={:.0} face_frac={:.3} (recorded for #174, gates nothing)",
             signals.rgb_face_brightness,
             signals.rgb_specular_frac,
-            signals.rgb_moire_score
+            signals.rgb_moire_score,
+            signals.face_frac
         );
         let embedding = match &rgb_top {
             Some(f) => Some(
@@ -1131,6 +1133,8 @@ impl Engine {
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: ir_stats.ambient_mean,
+            // From the IR frame, because the IR cues are measured there.
+            face_frac: face_frac_of(ir_top.as_ref().map(|f| &f.bbox), ir.width),
             rgb_face_brightness: rgb_brightness,
             rgb_moire_score: 0.0,
             rgb_specular_frac: 0.0,
@@ -1139,9 +1143,10 @@ impl Engine {
         // Log the cue values on PASS too; a near-miss on a genuine user is
         // invisible in the outcome line but obvious here.
         irlume_common::dlog!(
-            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={:.2} ambient={:.0} yaw_asym={:.2} pitch={:.2}",
+            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={:.2} ambient={:.0} yaw_asym={:.2} pitch={:.2} face_frac={:.3} (recorded for #174, gates nothing)",
             signals.ir_face_brightness, signals.ir_center_edge_ratio, signals.ir_eye_glint,
-            signals.ir_ambient, signals.head_yaw_asym, signals.head_pitch_frac);
+            signals.ir_ambient, signals.head_yaw_asym, signals.head_pitch_frac,
+            signals.face_frac);
         // Opt-in third-party PAD cue: score whenever an IR face is present (the
         // `ir` frame is the brightest strobe phase, i.e. the LIT frame, which is
         // the regime the cue was measured in), so the dark path can consult the
@@ -2981,6 +2986,27 @@ pub fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     }
 }
 
+/// Face width as a fraction of frame width: the framing guide's `face_frac`,
+/// computed from a detection box so the liveness path can record the same
+/// quantity the guide judges seating distance by (#174).
+pub fn bbox_width_frac(bbox: &[f32; 4], frame_width: u32) -> f32 {
+    if frame_width == 0 {
+        return 0.0;
+    }
+    (bbox[2] - bbox[0]).max(0.0) / frame_width as f32
+}
+
+/// `Signals::face_frac` for a capture: the top detection's width fraction, or
+/// 0.0 when nothing was detected.
+///
+/// Separated from the two call sites so the DECISION (no face means no
+/// distance signal, not a fabricated one) is a value a test can construct.
+/// What remains untestable off hardware is only which frame each caller
+/// hands in, one expression per path.
+pub fn face_frac_of(bbox: Option<&[f32; 4]>, frame_width: u32) -> f32 {
+    bbox.map(|b| bbox_width_frac(b, frame_width)).unwrap_or(0.0)
+}
+
 /// The IR center/edge cue: ratio of the center-box mean to the edge-ring mean
 /// of the IR face crop (grey 0-255). A real 3D face lit by the near-coaxial
 /// emitter is brighter at the center/nose and falls off at the rim (ratio
@@ -3724,6 +3750,72 @@ mod tests {
         // A frame shorter than w*h (truncated/mismatched capture) must degrade
         // to 0.0, not panic on the out-of-bounds index.
         assert_eq!(mean_in_bbox(&grey[..3], w, h, &[0.0, 0.0, 4.0, 2.0]), 0.0);
+    }
+
+    /// `face_frac` is the seating-distance signal the framing guide already
+    /// judges by, recorded with the liveness cues so the #174 correlation is
+    /// answerable from ordinary debug output. It is a fraction of frame
+    /// width, so it must not depend on the frame's pixel dimensions.
+    #[test]
+    fn bbox_width_frac_is_a_fraction_of_frame_width() {
+        // Same face, same relative size, two sensor resolutions.
+        assert!((bbox_width_frac(&[100.0, 0.0, 292.0, 200.0], 640) - 0.3).abs() < 1e-6);
+        assert!((bbox_width_frac(&[200.0, 0.0, 584.0, 400.0], 1280) - 0.3).abs() < 1e-6);
+        // The guide's accepted band, as ends: 12% and 55% of the frame.
+        assert!((bbox_width_frac(&[0.0, 0.0, 76.8, 50.0], 640) - 0.12).abs() < 1e-6);
+        assert!((bbox_width_frac(&[0.0, 0.0, 352.0, 300.0], 640) - 0.55).abs() < 1e-6);
+        // Degenerate inputs report no face rather than a negative or a NaN.
+        assert_eq!(bbox_width_frac(&[300.0, 0.0, 100.0, 50.0], 640), 0.0);
+        assert_eq!(bbox_width_frac(&[0.0, 0.0, 100.0, 50.0], 0), 0.0);
+    }
+
+    /// No detection means NO distance signal, and 0.0 is how that is spelled:
+    /// a reader correlating cues against face size must be able to drop those
+    /// rows rather than treat them as "a face filling nothing".
+    #[test]
+    fn face_frac_of_reports_zero_when_nothing_was_detected() {
+        assert_eq!(face_frac_of(None, 640), 0.0);
+        let bbox = [100.0f32, 0.0, 292.0, 200.0];
+        assert!((face_frac_of(Some(&bbox), 640) - 0.3).abs() < 1e-6);
+    }
+
+    /// The center/edge ratio's GEOMETRY is bbox-relative (the inner box is
+    /// half the bbox per side), so the same face filling more of the frame
+    /// must read the same ratio. This is what makes #174 a question about
+    /// physics and pixel count rather than about the formula: it isolates
+    /// the one part that is scale invariant by construction, so a
+    /// correlation found on hardware cannot be blamed on the sampling
+    /// geometry.
+    #[test]
+    fn center_edge_ratio_is_invariant_to_apparent_face_size() {
+        // One synthetic "face": a bright center square on a dim rim, drawn at
+        // two scales in two frames, each filling its bbox identically.
+        let render = |side: u32| -> Vec<u8> {
+            let mut buf = vec![40u8; (side * side) as usize];
+            let q = side / 4;
+            for y in q..(side - q) {
+                for x in q..(side - q) {
+                    buf[(y * side + x) as usize] = 200;
+                }
+            }
+            buf
+        };
+        let small = render(40);
+        let large = render(160);
+        let r_small = center_edge_ratio(&small, 40, 40, &[0.0, 0.0, 40.0, 40.0]);
+        let r_large = center_edge_ratio(&large, 160, 160, &[0.0, 0.0, 160.0, 160.0]);
+        assert!(r_small > 1.0 && r_large > 1.0, "{r_small} {r_large}");
+        assert!(
+            (r_small - r_large).abs() < 0.05,
+            "the ratio must not move with apparent size on identical content: \
+             {r_small} vs {r_large}"
+        );
+        // The pixel count behind it does move, and the guard against a face
+        // too small to sample is a hard floor, not a gradual one.
+        assert_eq!(
+            center_edge_ratio(&small, 40, 40, &[0.0, 0.0, 4.0, 4.0]),
+            0.0
+        );
     }
 
     #[test]
