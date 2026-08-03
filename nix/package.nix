@@ -90,6 +90,16 @@ rustPlatform.buildRustPackage {
   # UAPI headers. bindgenHook already exports the base args, so append.
   preBuild = ''
     export BINDGEN_EXTRA_CLANG_ARGS="$BINDGEN_EXTRA_CLANG_ARGS -isystem ${linuxHeaders}/include"
+
+    # The compiled-in helper path is an FHS path that does not exist on NixOS,
+    # so the PAM module would look for it, not find it, and decline. Nothing
+    # sets IRLUME_KWALLET_INIT either, so a KDE-only NixOS user with a wallet-key
+    # envelope would get no wallet and no fallback, because no login password was
+    # released for pam_kwallet5 to use. Point it at the store path instead.
+    substituteInPlace crates/irlume-common/src/lib.rs \
+      --replace-fail \
+        '"/usr/libexec/irlume/irlume-kwallet-init"' \
+        "\"$out/libexec/irlume/irlume-kwallet-init\""
   '';
 
   # The suite needs a camera, a TPM, and PAM; none exist in the sandbox.
@@ -102,6 +112,16 @@ rustPlatform.buildRustPackage {
     install -Dm0755 \
       "$(find target -name libpam_irlume.so -print -quit)" \
       "$out/lib/security/pam_irlume.so"
+
+    # KDE wallet handoff helper. buildRustPackage puts every bin in $out/bin;
+    # this one belongs in libexec, since it takes a secret on stdin and is only
+    # meaningful inside a PAM transaction.
+    # Not conditional: if cargo did not produce it, the derivation must fail
+    # rather than quietly ship a build whose KDE wallet unlock cannot work.
+    test -x "$out/bin/irlume-kwallet-init"
+    install -Dm0755 "$out/bin/irlume-kwallet-init" \
+      "$out/libexec/irlume/irlume-kwallet-init"
+    rm "$out/bin/irlume-kwallet-init"
 
     install -d "$out/share/irlume/models"
     install -m0644 ${models}/*.onnx "$out/share/irlume/models/"
