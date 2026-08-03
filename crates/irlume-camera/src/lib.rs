@@ -104,7 +104,7 @@ pub struct Frame {
 /// The span of time a frame's pixels came from, on the monotonic clock.
 ///
 /// Most frames are one dequeue, so `start == end`. Two are not: the denoised RGB
-/// frame is a per-pixel median over a burst, and the IR frame is the brightest of
+/// frame is a per-pixel median over a burst, and the IR frame is one chosen from
 /// a burst, so their contents belong to a stretch of time rather than an instant.
 /// Keeping the stretch (instead of stamping "now" at return) is what lets
 /// [`CaptureWindow::gap_to`] state a real bound rather than a flattering one.
@@ -150,10 +150,14 @@ pub enum Spectrum {
     Ir,
 }
 
-/// Burst statistics from an IR capture: the per-frame mean extremes. When the
-/// emitter strobes, `ambient_mean` (the darkest frame of the burst) is the
-/// scene's ambient IR level with the emitter off, and `lit_mean -
-/// ambient_mean` is the strobe gap; on a steady emitter the two converge.
+/// Burst statistics from an IR capture. `lit_mean` is the mean of the frame
+/// capture chose to gate on: with camera illumination metadata and a known
+/// sensor ceiling that is the brightest lit frame clipping at most 5% (#221),
+/// otherwise the brightest eligible frame. `ambient_mean` is the darkest frame
+/// the camera flagged dark, falling back to the burst minimum. When the emitter
+/// strobes, `ambient_mean` is the scene's ambient IR level with the emitter off
+/// and `lit_mean - ambient_mean` is the strobe gap; on a steady emitter the two
+/// converge.
 #[derive(Clone, Copy, Debug)]
 pub struct IrCaptureStats {
     pub lit_mean: f32,
@@ -1693,8 +1697,12 @@ pub struct IrSession<'a> {
 }
 
 impl IrSession<'_> {
-    /// One IR capture: a burst, the brightest (lit strobe phase) frame, and the
-    /// burst statistics.
+    /// One IR capture: a burst, the gate frame, and the burst statistics.
+    ///
+    /// The gate frame is a lit strobe phase, and on a source whose ceiling is
+    /// known it is the brightest one clipping at most 5% of its pixels, since
+    /// a blown frame both flattens the liveness cues and blinds the PAD model
+    /// (#221).
     pub fn capture_with_stats(&mut self) -> irlume_common::Result<(Frame, IrCaptureStats)> {
         let device = self.cam.device.as_str();
         let (w, h) = (self.cam.width, self.cam.height);
@@ -1791,10 +1799,22 @@ impl IrSession<'_> {
         }
         let bmin = means.iter().cloned().fold(f64::INFINITY, f64::min);
         let bmax = means.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        // The brightest frame the CAMERA flagged lit. With no flags this is the
-        // first frame holding the max mean, exactly the original incremental
-        // scan, so the no-metadata path is unchanged.
-        let best_i = ir_metadata::brightest_lit(&means, &flags).unwrap_or(0);
+        // The brightest CLEAN frame the CAMERA flagged lit: a clipped frame
+        // compresses the centre/edge ratio toward the spoof floor and can
+        // defeat IR face detection outright (#221), and the brightest frame of
+        // a warming burst is the most likely to clip. Clipping is only
+        // measurable when the source format names its ceiling, and lit-ness
+        // only when the camera classified frames; on either fallback this is
+        // the first frame holding the max mean, exactly the original
+        // incremental scan.
+        let clipped_fracs: Option<Vec<f64>> = white_level.map(|_| {
+            frames
+                .iter()
+                .map(|f| ir_probe::saturated_fraction(f))
+                .collect()
+        });
+        let best_i =
+            ir_metadata::best_gate_frame(&means, &flags, clipped_fracs.as_deref()).unwrap_or(0);
         let mut best = Some(frames[best_i].clone());
         let mut ir_window = CaptureWindow::at(taken[best_i]);
 
@@ -1857,7 +1877,7 @@ impl IrSession<'_> {
                         eprintln!(
                         "[ir] ambient-subtract {action}: lit {best_i} ({lit_mean:.0}) - ambient {ai} ({amb_mean:.0}) => mean {sub_mean:.0}; lit clipped {:.1}%{}",
                         clipped * 100.0,
-                        if clipped > 0.05 {
+                        if clipped > ir_metadata::CLIPPED_FRAC_MAX {
                             " (blown exposure; subtracted frame unreliable)"
                         } else {
                             ""
@@ -1897,8 +1917,12 @@ impl IrSession<'_> {
             eprintln!("[ir_emitter] card={card:?} SET_CUR ok={lit}; burst {IR_BURST} frames, per-frame mean {bmin:.1}..{bmax:.1}");
             eprintln!(
                 "[ir] illumination: {from_camera}/{} frames classified by the camera; \
-                 chose frame {best_i} (mean {best_mean:.1}), lit {lit_level:.1} / ambient {ambient_level:.1}",
-                means.len()
+                 chose frame {best_i} (mean {best_mean:.1}{}), lit {lit_level:.1} / ambient {ambient_level:.1}",
+                means.len(),
+                match clipped_fracs.as_ref().and_then(|c| c.get(best_i)) {
+                    Some(c) => format!(", clipped {:.1}%", c * 100.0),
+                    None => String::new(),
+                }
             );
         }
         // An unusable burst gets a DIAGNOSIS, not the old one-size hint. The
@@ -2632,12 +2656,16 @@ pub fn measure_contention_with_progress(
 /// Fold one probe round into a running mean.
 ///
 /// The IR figure is the burst's `lit_mean`, NOT the returned frame's own mean.
-/// They differ, and the difference was measured: the returned frame is the
-/// brightest of a strobe burst, so which phase of the emitter's pulse happened to
+/// They differ, and the difference was measured: the returned frame is one
+/// phase of a strobe burst, so which phase of the emitter's pulse happened to
 /// land in it swings the frame mean hard. Retention on one unchanged camera read
 /// 94%, 137% and 83% across runs against an 80% floor, i.e. noise big enough to
-/// decide the verdict. `lit_mean` is the burst's own peak, which is the quantity
-/// that is actually stable from round to round.
+/// decide the verdict. `lit_mean` is the mean of the frame capture gated on,
+/// which is stable from round to round because it is drawn from the lit phase
+/// rather than whichever phase the caller happened to receive. Since #221 that
+/// frame is the brightest lit one under the clipping limit rather than the
+/// brightest outright, so a burst that straddles the limit can shift it by a
+/// frame; both are lit-phase means, which is the property this relies on.
 fn accumulate(
     into: &mut PairSample,
     rgb: &irlume_common::Result<Frame>,
