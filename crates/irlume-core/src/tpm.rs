@@ -927,6 +927,7 @@ fn digest_list(digests: &[Digest]) -> Result<DigestList> {
 }
 
 /// A single-value PCR group plus the ordered multi-value PCRs of a super policy.
+#[derive(Clone)]
 struct SuperPcr {
     /// Single-value PCRs, ascending (replayed live as one PolicyPCR at unseal).
     singles: Vec<u32>,
@@ -937,7 +938,64 @@ struct SuperPcr {
 /// Reconstruct systemd's super-PCR policy structure from the prediction, deriving
 /// each multi-value PCR's OR-branch digests via trial replays of the growing
 /// prefix (mirrors `tpm2_calculate_policy_super_pcr`).
+/// Memo for [`build_super_pcr`], keyed on the prediction it was derived from.
+///
+/// Deriving the branch digests costs ONE TRIAL TPM SESSION PER PREDICTED BRANCH,
+/// and the result depends only on the prediction file, never on the request. It
+/// was being recomputed on every unseal: measured 10.88s on a ThinkPad X13
+/// (STMicro discrete TPM, 17 branches) against 0.36s on a Zenbook (firmware TPM,
+/// 4 branches), three runs each within 0.01s. Because `pam_irlume`'s keyring line
+/// runs inside the PAM auth stack, that was 11 seconds of login the user waited
+/// through (#246).
+///
+/// Keyed on the prediction's own content, so `systemd-pcrlock make-policy`
+/// invalidates it by changing the key rather than by anyone remembering to clear
+/// it. In memory only: a persisted cache would need its own argument about what a
+/// tampered entry can do, and this already removes the repeat cost within a
+/// daemon's lifetime.
+type PcrlockKey = Vec<(u32, Vec<String>)>;
+
+static SUPER_PCR_MEMO: std::sync::OnceLock<std::sync::Mutex<Option<(PcrlockKey, SuperPcr)>>> =
+    std::sync::OnceLock::new();
+
+/// Identity of a prediction: its PCR numbers and predicted values, sorted into
+/// the order the policy is built from.
+///
+/// The whole prediction is kept and compared, not a hash of it. A 64-bit digest
+/// would have been smaller and the collision odds absurd, but the failure it
+/// admits is handing back digests derived from a DIFFERENT prediction, and this
+/// sits under credential release. A prediction is a handful of PCRs with a few
+/// hex strings each, so exact comparison costs nothing worth trading for that.
+/// Comparing parsed values rather than file bytes keeps reformatting from
+/// invalidating a still-correct memo.
+fn pcrlock_key(plock: &PcrlockJson) -> PcrlockKey {
+    let mut entries: PcrlockKey = plock
+        .pcr_values
+        .iter()
+        .map(|e| (e.pcr, e.values.clone()))
+        .collect();
+    entries.sort_by_key(|(pcr, _)| *pcr);
+    entries
+}
+
 fn build_super_pcr(ctx: &mut Context, plock: &PcrlockJson) -> Result<SuperPcr> {
+    let key = pcrlock_key(plock);
+    let memo = SUPER_PCR_MEMO.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = memo.lock() {
+        if let Some((cached_key, cached)) = guard.as_ref() {
+            if cached_key == &key {
+                return Ok(cached.clone());
+            }
+        }
+    }
+    let built = build_super_pcr_uncached(ctx, plock)?;
+    if let Ok(mut guard) = memo.lock() {
+        *guard = Some((key, built.clone()));
+    }
+    Ok(built)
+}
+
+fn build_super_pcr_uncached(ctx: &mut Context, plock: &PcrlockJson) -> Result<SuperPcr> {
     let mut entries: Vec<(u32, Vec<[u8; 32]>)> = plock
         .pcr_values
         .iter()
@@ -1158,6 +1216,53 @@ pub fn diagnose_pcrs(env: &SealedEnvelope) -> Result<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The memo's identity guard must distinguish predictions that differ in any
+    /// way the policy is built from, and must ignore ordering, which is why it
+    /// sorts. A guard that collided would serve branch digests derived from a
+    /// DIFFERENT prediction, under credential release; that is the reason it
+    /// compares the prediction itself rather than a hash of it.
+    #[test]
+    fn the_memo_key_separates_predictions_that_differ() {
+        let mk = |json: &str| -> PcrlockKey {
+            pcrlock_key(&serde_json::from_str::<PcrlockJson>(json).expect("fixture parses"))
+        };
+        let base = mk(r#"{"pcrBank":"sha256","pcrValues":[
+            {"pcr":7,"values":["aa"]},{"pcr":2,"values":["bb","cc"]}]}"#);
+
+        // Same content, PCRs listed in the other order: the same policy.
+        let reordered = mk(r#"{"pcrBank":"sha256","pcrValues":[
+            {"pcr":2,"values":["bb","cc"]},{"pcr":7,"values":["aa"]}]}"#);
+        assert_eq!(base, reordered, "listing order must not invalidate a memo");
+
+        // A changed predicted value is a different policy.
+        let changed = mk(r#"{"pcrBank":"sha256","pcrValues":[
+            {"pcr":7,"values":["aa"]},{"pcr":2,"values":["bb","dd"]}]}"#);
+        assert_ne!(base, changed, "a changed prediction must miss the memo");
+
+        // An extra branch on the same PCR is a different policy, and it changes
+        // how many trial replays the derivation performs.
+        let extra = mk(r#"{"pcrBank":"sha256","pcrValues":[
+            {"pcr":7,"values":["aa"]},{"pcr":2,"values":["bb","cc","ee"]}]}"#);
+        assert_ne!(base, extra, "an added branch must miss the memo");
+
+        // A different PCR carrying the same values is a different policy.
+        let moved = mk(r#"{"pcrBank":"sha256","pcrValues":[
+            {"pcr":7,"values":["aa"]},{"pcr":3,"values":["bb","cc"]}]}"#);
+        assert_ne!(
+            base, moved,
+            "the same values on another PCR must miss the memo"
+        );
+
+        // Branch ORDER within a PCR is load-bearing: it is the order the OR
+        // branches are derived and replayed in.
+        let swapped = mk(r#"{"pcrBank":"sha256","pcrValues":[
+            {"pcr":7,"values":["aa"]},{"pcr":2,"values":["cc","bb"]}]}"#);
+        assert_ne!(
+            base, swapped,
+            "branch order feeds the derivation, so it counts"
+        );
+    }
 
     #[test]
     fn srk_identity_match_accepts_ours_rejects_foreign() {
