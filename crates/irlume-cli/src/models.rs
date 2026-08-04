@@ -24,6 +24,10 @@ pub fn run(sub: Option<&str>, args: &[String]) -> ExitCode {
     match sub {
         None | Some("list") => list(),
         Some("enable") => enable(args.get(2).map(String::as_str)),
+        Some("add") => add(
+            args.get(2).map(String::as_str),
+            args.get(3).map(String::as_str),
+        ),
         Some("disable") => disable(),
         _ => usage(),
     }
@@ -31,9 +35,78 @@ pub fn run(sub: Option<&str>, args: &[String]) -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!("usage: irlume models [list]");
-    eprintln!("       sudo irlume models enable <name>");
+    eprintln!("       sudo irlume models enable <name>          (irlume fetches it)");
+    eprintln!("       sudo irlume models add <name> <path>      (you supply the file)");
     eprintln!("       sudo irlume models disable");
     ExitCode::from(2)
+}
+
+/// Install a model from a file the USER obtained, verified against the pin
+/// irlume measured.
+///
+/// This is the whole point of the two tiers: irlume will not fetch a model
+/// whose licence makes that the user's decision, but it still knows exactly
+/// which artifact it measured. A file that hashes to the catalog's `sha256` is
+/// that artifact and gets its measured threshold; anything else is refused,
+/// because scoring an unknown model against another model's threshold is the
+/// guess this catalog exists to prevent.
+fn add(name: Option<&str>, path: Option<&str>) -> ExitCode {
+    let (Some(name), Some(path)) = (name, path) else {
+        return usage();
+    };
+    let Some(m) = thirdparty::by_name(name) else {
+        eprintln!("[models] '{name}' is not in the catalog; run `irlume models` to list it");
+        return ExitCode::FAILURE;
+    };
+    if !is_root() {
+        eprintln!("[models] needs root: sudo irlume models add {name} {path}");
+        return ExitCode::FAILURE;
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[models] cannot read {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let digest = thirdparty::sha256_hex(&bytes);
+    if digest != m.sha256 {
+        eprintln!("[models] this file is NOT the artifact irlume measured.");
+        eprintln!("[models]   got      sha256 {digest}");
+        eprintln!("[models]   expected sha256 {}", m.sha256);
+        eprintln!(
+            "[models] refusing: irlume's threshold for '{}' was measured on the expected\n\
+             [models] artifact, and applying it to different weights would be a guess.",
+            m.name
+        );
+        return ExitCode::FAILURE;
+    }
+    println!("Adding third-party model '{}' from {path}", m.name);
+    println!();
+    println!("  license:    {}", m.license);
+    println!("  provenance: {}", m.provenance);
+    println!("  measured:   {}", m.summary);
+    println!("  effect:     adds a DENY-ONLY liveness cue on the lit IR frame; it can");
+    println!("              reject a presentation, it can never approve one the built-in");
+    println!("              gate rejected. False fires cost a retry or the password.");
+    println!();
+    println!("  sha256 matches the artifact irlume measured. Complying with the license");
+    println!("  above, for your use, is your determination and not irlume's.");
+    println!();
+    if !stdin_is_tty() {
+        eprintln!("[models] enabling needs an interactive terminal to confirm the license");
+        return ExitCode::FAILURE;
+    }
+    print!("Enable '{}'? [y/N] ", m.name);
+    let _ = std::io::stdout().flush();
+    let mut yn = String::new();
+    if std::io::stdin().lock().read_line(&mut yn).is_err()
+        || !matches!(yn.trim(), "y" | "Y" | "yes")
+    {
+        println!("[models] cancelled; nothing was changed.");
+        return ExitCode::FAILURE;
+    }
+    install_verified(m, &bytes)
 }
 
 /// The catalog name currently enabled in settings.conf, if any.
@@ -52,8 +125,9 @@ fn file_state(m: &ThirdPartyModel) -> &'static str {
 
 fn list() -> ExitCode {
     let enabled = enabled_name();
-    println!("Third-party models irlume can fetch but does not ship or warrant.");
-    println!("Each entry was measured on real hardware before listing (docs/pad-results/).");
+    println!("Third-party models irlume has MEASURED but does not ship or warrant.");
+    println!("Nothing is listed here that was not measured on real hardware");
+    println!("(docs/pad-results/, docs/THIRD-PARTY-MODELS.md).");
     println!();
     for m in thirdparty::CATALOG {
         let state = if enabled.as_deref() == Some(m.name) {
@@ -69,11 +143,21 @@ fn list() -> ExitCode {
             m.threshold
         );
         println!("    measured:   {}", m.summary);
+        println!(
+            "    obtain:     {}",
+            match m.url {
+                Some(_) => format!("irlume fetches it: sudo irlume models enable {}", m.name),
+                None => format!(
+                    "you supply the file: sudo irlume models add {} <path>",
+                    m.name
+                ),
+            }
+        );
     }
     println!();
     match enabled {
         Some(n) => println!("enabled: {n} · disable with: sudo irlume models disable"),
-        None => println!("none enabled · enable with: sudo irlume models enable <name>"),
+        None => println!("none enabled · see the 'obtain' line above for each model"),
     }
     ExitCode::SUCCESS
 }
@@ -106,6 +190,15 @@ fn enable(name: Option<&str>) -> ExitCode {
         println!("[models] re-fetching and re-verifying anyway.");
     }
 
+    if m.url.is_none() {
+        println!(
+            "[models] '{}' is measured by irlume but not fetched by it: its license makes\n\
+             [models] obtaining the file your decision. See docs/THIRD-PARTY-MODELS.md, then:\n\
+             [models]   sudo irlume models add {} <path-to-{}>",
+            m.name, m.name, m.file
+        );
+        return ExitCode::FAILURE;
+    }
     println!("Enabling third-party model '{}'", m.name);
     println!();
     println!("  license:    {}", m.license);
@@ -157,12 +250,22 @@ pub(crate) fn fetch_and_enable(m: &thirdparty::ThirdPartyModel) -> ExitCode {
         eprintln!("[models] could not create {}: {e}", dir.display());
         return ExitCode::FAILURE;
     }
+    let Some(url) = m.url else {
+        // Reached only if a caller forgets the check at the call site; the
+        // catalog says this model is not irlume's to fetch.
+        eprintln!(
+            "[models] '{}' is not fetchable by irlume; obtain the file yourself, then:\n\
+             [models]   sudo irlume models add {} <path>",
+            m.name, m.name
+        );
+        return ExitCode::FAILURE;
+    };
     let tmp = dir.join(format!(".{}.part", m.file));
     println!("[models] downloading from the publisher's origin ...");
     let status = Command::new("curl")
         .args(["-fSL", "--max-time", "300", "-o"])
         .arg(&tmp)
-        .arg(m.url)
+        .arg(url)
         .status();
     if !matches!(status, Ok(s) if s.success()) {
         let _ = std::fs::remove_file(&tmp);
@@ -189,16 +292,26 @@ pub(crate) fn fetch_and_enable(m: &thirdparty::ThirdPartyModel) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let path = thirdparty::model_path(m);
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        eprintln!("[models] could not install {}: {e}", path.display());
-        return ExitCode::FAILURE;
-    }
-    if let Err(e) =
-        irlume_common::config::write_kv("settings.conf", thirdparty::SETTINGS_KEY, m.name)
-    {
-        eprintln!("[models] weights installed but settings.conf update failed: {e}");
+    let _ = std::fs::remove_file(&tmp);
+    install_verified(m, &bytes)
+}
+
+/// Are these the exact weights irlume measured?
+///
+/// A value rather than an inline comparison so the refusal is testable: this
+/// is the only thing standing between a user and a threshold applied to
+/// weights it was never measured on.
+fn pin_matches(m: &ThirdPartyModel, bytes: &[u8]) -> bool {
+    thirdparty::sha256_hex(bytes) == m.sha256
+}
+
+/// Write already-verified `bytes` into place and enable the cue.
+///
+/// The single installer for both tiers. Callers must have checked the sha256
+/// first; this re-states that in one place so a future third caller cannot
+/// install unpinned weights by forgetting the check.
+fn install_verified(m: &ThirdPartyModel, bytes: &[u8]) -> ExitCode {
+    if !place_verified(m, bytes) {
         return ExitCode::FAILURE;
     }
     restart_daemon();
@@ -208,6 +321,43 @@ pub(crate) fn fetch_and_enable(m: &thirdparty::ThirdPartyModel) -> ExitCode {
     );
     println!("[models] check with: irlume doctor · disable with: sudo irlume models disable");
     ExitCode::SUCCESS
+}
+
+/// The disk half of an install: verify the pin, place the weights atomically,
+/// record the choice. Split from the daemon restart so a test can exercise the
+/// pin against a real writable directory without restarting a service, which
+/// is what a test of the refusal needs: refusing because the directory is
+/// unwritable proves nothing about the pin.
+fn place_verified(m: &ThirdPartyModel, bytes: &[u8]) -> bool {
+    if !pin_matches(m, bytes) {
+        eprintln!(
+            "[models] refusing to install unpinned weights for '{}'",
+            m.name
+        );
+        return false;
+    }
+    let dir = thirdparty::dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[models] could not create {}: {e}", dir.display());
+        return false;
+    }
+    let path = thirdparty::model_path(m);
+    // Atomic replace, never a truncating write. settings.conf keeps naming
+    // this model, so a half-written file is not a failed update: it is a
+    // checksum mismatch the daemon answers by running WITHOUT the cue, and
+    // the built-in gate that remains accepts the print attack. A rename
+    // either publishes the whole artifact or leaves the previous one intact.
+    if let Err(e) = irlume_common::write_atomic_mode(&path, bytes, 0o644) {
+        eprintln!("[models] could not install {}: {e}", path.display());
+        return false;
+    }
+    if let Err(e) =
+        irlume_common::config::write_kv("settings.conf", thirdparty::SETTINGS_KEY, m.name)
+    {
+        eprintln!("[models] weights installed but settings.conf update failed: {e}");
+        return false;
+    }
+    true
 }
 
 fn disable() -> ExitCode {
@@ -327,6 +477,124 @@ pub fn doctor_line() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A synthetic bring-your-own entry. The catalog has no such model yet, so
+    /// the tier the code must handle would otherwise be untested until one is
+    /// measured, which is exactly when a regression would be discovered.
+    fn byo_fixture() -> ThirdPartyModel {
+        ThirdPartyModel {
+            name: "fixture-byo",
+            file: "fixture-byo.onnx",
+            url: None,
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            license: "fixture",
+            provenance: "fixture",
+            threshold: 0.9,
+            summary: "fixture",
+        }
+    }
+
+    #[test]
+    fn every_catalog_entry_carries_a_pin_and_only_fetchable_ones_carry_an_origin() {
+        for m in thirdparty::CATALOG {
+            if let Some(u) = m.url {
+                assert!(
+                    u.starts_with("https://"),
+                    "{}: origin must be https",
+                    m.name
+                );
+            }
+            // Both tiers: the pin is how irlume knows WHICH model is loaded
+            // rather than trusting the file that appeared in the directory.
+            assert_eq!(m.sha256.len(), 64, "{}: every tier needs a pin", m.name);
+        }
+        // And the bring-your-own tier itself, which no catalog entry exercises
+        // today: it must be pinned like any other and must have no origin.
+        let byo = byo_fixture();
+        assert!(byo.url.is_none());
+        assert_eq!(byo.sha256.len(), 64);
+    }
+
+    #[test]
+    fn fetching_a_bring_your_own_model_is_refused_before_any_download() {
+        // The tier's whole point: irlume must not download a model whose
+        // licence made obtaining it the user's decision. `fetch_and_enable`
+        // guards this even though the call sites check first, because a
+        // future caller will not.
+        let byo = byo_fixture();
+        assert!(
+            !matches!(fetch_and_enable(&byo), c if format!("{c:?}") == format!("{:?}", ExitCode::SUCCESS)),
+            "a urlless model must never reach the downloader"
+        );
+    }
+
+    #[test]
+    fn the_installer_refuses_bytes_that_do_not_match_the_pin() {
+        // Sandboxed state dir, so the WRITE would genuinely succeed and the
+        // pin is the only thing that can refuse. Without this the test passes
+        // for the wrong reason: an unprivileged process cannot write to the
+        // real state dir, so it returns FAILURE whether the guard exists or
+        // not, and a mutant deleting the guard survives.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("irlume-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cfg, state) = (root.join("cfg"), root.join("state"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        let old_state = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+
+        let m = byo_fixture();
+        let path = thirdparty::model_path(&m);
+        assert!(!pin_matches(&m, b"not the model"));
+        let refused = place_verified(&m, b"not the model");
+        let nothing_written = !path.exists();
+        // The control: the same call with MATCHING bytes must install, which
+        // is what proves the refusal above came from the pin and not from an
+        // unwritable directory.
+        // Precomputed rather than Box::leak'd into a &'static str: leaking to
+        // satisfy a lifetime is a real leak, and LeakSanitizer is right to
+        // report it. The constant is asserted against the hasher below, so a
+        // change to either is caught rather than silently diverging.
+        let good = b"the measured artifact";
+        const GOOD_SHA: &str = "b9a5820dd4ae8eb1eb7025b3b9b1351d9ff90e658e0c1d22a027e55be4f6f48e";
+        assert_eq!(
+            thirdparty::sha256_hex(good),
+            GOOD_SHA,
+            "the fixture's precomputed digest no longer matches the hasher"
+        );
+        let mut ok = m;
+        ok.sha256 = GOOD_SHA;
+        let accepted = place_verified(&ok, good);
+        let written = thirdparty::model_path(&ok).exists();
+
+        match (old_cfg, old_state) {
+            (Some(c), Some(st)) => {
+                std::env::set_var("IRLUME_CONFIG_DIR", c);
+                std::env::set_var("IRLUME_STATE_DIR", st);
+            }
+            _ => {
+                std::env::remove_var("IRLUME_CONFIG_DIR");
+                std::env::remove_var("IRLUME_STATE_DIR");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(!refused, "unpinned bytes must not install");
+        assert!(
+            nothing_written,
+            "a refused install must leave nothing behind"
+        );
+        assert!(
+            accepted,
+            "matching bytes must install, or the refusal above proves nothing"
+        );
+        assert!(written, "the control install must actually reach disk");
+    }
     use super::*;
 
     /// doctor_line's classification: enabled name vs catalog membership vs
