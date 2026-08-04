@@ -387,6 +387,26 @@ fn enable(user: &str, args: &[String]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    // Disabling face demands more than "a line exists": with --fingerprint-only
+    // the line must sit in a stack a tracked surface reaches (#234), or face
+    // stands down while every real prompt is password-only. One check here
+    // covers the authselect, pam-auth-update and already-wired paths alike.
+    // Coexist mode keeps face active, so it stays on the broad check: a
+    // custom-stack setup loses nothing there, and a dead finger line costs
+    // only a wrong "either factor" message rather than a lost biometric.
+    if !fingerprint_only_permitted(&PamSearchPath::live(), fingerprint_only) {
+        eprintln!(
+            "[fingerprint] an active pam_fprintd.so line exists, but no login surface irlume tracks reaches it"
+        );
+        eprintln!(
+            "[fingerprint] --fingerprint-only refused: it would disable face while no tracked prompt has a fingerprint path"
+        );
+        eprintln!(
+            "[fingerprint] method unchanged: wire pam_fprintd into a stack your login actually uses (see the table below), then re-run"
+        );
+        report_fprintd_coverage(&PamSearchPath::live());
+        return ExitCode::FAILURE;
+    }
     let method = if coexist {
         Method::Both
     } else {
@@ -630,13 +650,15 @@ fn live_pam_stacks(path: &PamSearchPath) -> Vec<String> {
 }
 
 /// True when a PAM stack PAM actually loads carries an auth rule whose module
-/// is `pam_fprintd.so`, i.e. something will really drive the fingerprint
-/// prompt. Unreadable dirs/files count as not wired, and so does a
-/// `\`-continued file: libpam joins those lines before tokenizing, so a
+/// is `pam_fprintd.so`. Unreadable dirs/files count as not wired, and so does
+/// a `\`-continued file: libpam joins those lines before tokenizing, so a
 /// physical line reading `auth ... pam_fprintd.so` can really be the tail of
-/// a session directive's arguments, executed never. This is the gate before
-/// `--fingerprint-only` disables face; standing down on a file it cannot read
-/// the way PAM does is the safe direction.
+/// a session directive's arguments, executed never.
+///
+/// This establishes EXISTENCE only, which gates displays and the "did the
+/// wiring tool write anything" verify. It says nothing about whether a prompt
+/// reaches the line: a package can ship a service file nothing invokes.
+/// Standing face down takes [`fprintd_reaches_tracked_surface`] (#234).
 fn pam_fprintd_wired(path: &PamSearchPath) -> bool {
     live_pam_stacks(path)
         .iter()
@@ -738,65 +760,105 @@ const FP_SURFACES: &[(&str, &str)] = &[
 /// before the first `#`), so a commented-out include or module never counts.
 /// Cycles terminate because a file is visited at most once; the depth cap is a
 /// backstop far above any real stack's include chain.
+///
+/// The walk is in stack ORDER, because reaching the module is not a set
+/// membership question: a rule guaranteed to end authentication earlier in
+/// the stack makes every later line unreachable (#261 review). See
+/// [`guaranteed_auth_exit`] for exactly which rules are modeled that way, and
+/// why the set is that small.
 pub(crate) fn stack_reaches_fprintd(path: &PamSearchPath, service: &str) -> bool {
-    fn walk(path: &PamSearchPath, name: &str, seen: &mut Vec<String>) -> bool {
-        if seen.len() >= 16 || seen.iter().any(|s| s == name) {
-            return false;
-        }
-        seen.push(name.to_string());
-        // Each include target resolves through the search path too: a
-        // machine stack may include a service whose only file is the vendor's.
-        let Some(text) = path.read_service(name) else {
-            return false;
-        };
-        // A `\`-continued file defeats line-oriented reading: libpam joins
-        // those lines before tokenizing, so a physical line that LOOKS like
-        // `auth ... pam_fprintd.so` can really be the tail of a session
-        // directive's arguments, executed never, in any phase (verified: the
-        // spliced line did not run under pam_authenticate). Claiming coverage
-        // from such a line would rebuild the exact over-promise this walker
-        // exists to end, so a continued file contributes nothing: false is the
-        // safe direction (an uncovered surface asks the user to check; a
-        // covered one tells them to rely on it).
-        if crate::pamwire::has_line_continuation(&text) {
-            return false;
-        }
-        for line in text.lines() {
-            let d = crate::pamwire::directive(line);
-            let mut toks = d.split_whitespace();
-            let (t1, t2, t3) = (toks.next(), toks.next(), toks.next());
-            let Some(first) = t1 else { continue };
-            if first == "@include" {
-                if let Some(target) = t2 {
-                    if walk(path, target, seen) {
-                        return true;
-                    }
-                }
-                continue;
-            }
-            // Only the auth phase authenticates; `-auth` is auth with PAM's
-            // missing-module tolerance.
-            if first.strip_prefix('-').unwrap_or(first) != "auth" {
-                continue;
-            }
-            match (t2, t3) {
-                (Some("include" | "substack"), Some(target)) => {
-                    if walk(path, target, seen) {
-                        return true;
-                    }
-                }
-                // The module-path FIELD, not a substring of the directive: an
-                // argument naming the file (`pam_exec.so log=/x/pam_fprintd.so`)
-                // is not a fingerprint rule.
-                _ if crate::pamwire::directive_has_auth_module(line, "pam_fprintd.so") => {
-                    return true
-                }
-                _ => {}
-            }
-        }
-        false
+    walk_auth(path, service, &mut Vec::new()) == AuthWalk::ReachesFprintd
+}
+
+/// What walking a stack's auth phase in order arrives at first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthWalk {
+    /// Fell off the end; an including caller's next line runs.
+    Continues,
+    /// An executable `pam_fprintd.so` rule.
+    ReachesFprintd,
+    /// A rule guaranteed to end authentication, so no later line (in this file
+    /// OR in an including caller) can let a finger answer. For `include` the
+    /// return is immediate; for `substack` the failure is recorded like a
+    /// required module's, and a recorded requisite failure blocks any later
+    /// `sufficient` success from granting, so a fingerprint line after either
+    /// inclusion form cannot complete an authentication (pam.conf(5)).
+    Terminates,
+}
+
+/// A rule guaranteed to end authentication before any later line matters:
+/// `pam_deny` always fails, and a failed `requisite` returns immediately.
+///
+/// Deliberately the ONLY modeled exit. The other candidates are stateful or
+/// conditional, and modeling them from file contents alone would refuse
+/// working setups: `sufficient pam_permit.so` short-circuits only when no
+/// earlier required module failed, and `requisite pam_nologin.so` fails only
+/// while /etc/nologin exists; Arch's real vendor kde-fingerprint stack opens
+/// with exactly that line (pinned in the tests) and its finger works. An
+/// unmodeled rule falls through to "continues", which errs toward permitting,
+/// never toward refusing a finger that genuinely answers.
+fn guaranteed_auth_exit(control: Option<&str>, line: &str) -> bool {
+    control.is_some_and(|c| c.eq_ignore_ascii_case("requisite"))
+        && crate::pamwire::directive_has_auth_module(line, "pam_deny.so")
+}
+
+fn walk_auth(path: &PamSearchPath, name: &str, seen: &mut Vec<String>) -> AuthWalk {
+    if seen.len() >= 16 || seen.iter().any(|s| s == name) {
+        return AuthWalk::Continues;
     }
-    walk(path, service, &mut Vec::new())
+    seen.push(name.to_string());
+    // Each include target resolves through the search path too: a
+    // machine stack may include a service whose only file is the vendor's.
+    let Some(text) = path.read_service(name) else {
+        return AuthWalk::Continues;
+    };
+    // A `\`-continued file defeats line-oriented reading: libpam joins
+    // those lines before tokenizing, so a physical line that LOOKS like
+    // `auth ... pam_fprintd.so` can really be the tail of a session
+    // directive's arguments, executed never, in any phase (verified: the
+    // spliced line did not run under pam_authenticate). Claiming coverage
+    // from such a line would rebuild the exact over-promise this walker
+    // exists to end, so a continued file contributes nothing: "continues" is
+    // the safe direction (an uncovered surface asks the user to check; a
+    // covered one tells them to rely on it).
+    if crate::pamwire::has_line_continuation(&text) {
+        return AuthWalk::Continues;
+    }
+    for line in text.lines() {
+        let d = crate::pamwire::directive(line);
+        let mut toks = d.split_whitespace();
+        let (t1, t2, t3) = (toks.next(), toks.next(), toks.next());
+        let Some(first) = t1 else { continue };
+        if first == "@include" {
+            if let Some(target) = t2 {
+                match walk_auth(path, target, seen) {
+                    AuthWalk::Continues => {}
+                    ended => return ended,
+                }
+            }
+            continue;
+        }
+        // Only the auth phase authenticates; `-auth` is auth with PAM's
+        // missing-module tolerance.
+        if first.strip_prefix('-').unwrap_or(first) != "auth" {
+            continue;
+        }
+        match (t2, t3) {
+            (Some("include" | "substack"), Some(target)) => match walk_auth(path, target, seen) {
+                AuthWalk::Continues => {}
+                ended => return ended,
+            },
+            // The module-path FIELD, not a substring of the directive: an
+            // argument naming the file (`pam_exec.so log=/x/pam_fprintd.so`)
+            // is not a fingerprint rule.
+            _ if crate::pamwire::directive_has_auth_module(line, "pam_fprintd.so") => {
+                return AuthWalk::ReachesFprintd
+            }
+            _ if guaranteed_auth_exit(t2, line) => return AuthWalk::Terminates,
+            _ => {}
+        }
+    }
+    AuthWalk::Continues
 }
 
 /// Per-surface fingerprint coverage: which of the stacks present on this
@@ -812,6 +874,28 @@ pub(crate) fn fprintd_coverage(path: &PamSearchPath) -> Vec<(&'static str, &'sta
         .filter(|(svc, _)| path.service_path(svc).is_some())
         .map(|(svc, label)| (*svc, *label, stack_reaches_fprintd(path, svc)))
         .collect()
+}
+
+/// True when a surface irlume tracks can reach an active `pam_fprintd.so`
+/// auth rule. This is the gate before `--fingerprint-only` disables face
+/// (#234): [`pam_fprintd_wired`] establishes that an active line EXISTS, but a
+/// package can ship a service file nothing invokes, and a line no prompt
+/// drives must not stand face down. The cost is a false refusal for a login
+/// path outside [`FP_SURFACES`]; that failure leaves the method unchanged and
+/// face active, and the refusal names the unreachable line so the admin knows
+/// what was found.
+fn fprintd_reaches_tracked_surface(path: &PamSearchPath) -> bool {
+    fprintd_coverage(path)
+        .iter()
+        .any(|(_, _, reaches)| *reaches)
+}
+
+/// The #234 enable decision as a value, because the flow that consults it
+/// (`enable`) talks to the live `/etc/pam.d` and needs root plus a reader, so
+/// no test can drive it against a fixture. Coexist keeps face active, so only
+/// `--fingerprint-only` demands a reached surface.
+fn fingerprint_only_permitted(path: &PamSearchPath, fingerprint_only: bool) -> bool {
+    !fingerprint_only || fprintd_reaches_tracked_surface(path)
 }
 
 /// Print the coverage table. Advisory: it never changes the enable decision,
@@ -932,6 +1016,178 @@ mod tests {
         .unwrap();
         assert!(pam_fprintd_wired(&PamSearchPath::machine_only(&dir)));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreferenced_carrier_alone_does_not_reach_a_surface() {
+        // The #234 acceptance case: a package ships a service file carrying an
+        // active pam_fprintd line, but nothing on the machine invokes that
+        // service. Existence holds; reachability must not.
+        let dir = pam_dir(
+            "unref-carrier",
+            &[
+                ("example-fingerprint", "auth sufficient pam_fprintd.so\n"),
+                ("sudo", "auth required pam_unix.so\n"),
+            ],
+        );
+        let path = PamSearchPath::machine_only(&dir);
+        assert!(pam_fprintd_wired(&path), "the line exists");
+        assert!(
+            !fprintd_reaches_tracked_surface(&path),
+            "an unreferenced carrier must not license --fingerprint-only"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_vendor_only_carrier_is_also_not_reachable() {
+        // Same acceptance case through the vendor directory, where #231 made
+        // unreferenced carriers likelier: packages ship there, admins do not.
+        let machine = pam_dir("vendor-unref-m", &[("sudo", "auth required pam_unix.so\n")]);
+        let vendor = pam_dir(
+            "vendor-unref-v",
+            &[("example-fingerprint", "auth sufficient pam_fprintd.so\n")],
+        );
+        let path = PamSearchPath::rooted(&machine, Some(&vendor));
+        assert!(pam_fprintd_wired(&path), "the vendor line exists");
+        assert!(!fprintd_reaches_tracked_surface(&path));
+        std::fs::remove_dir_all(machine).unwrap();
+        std::fs::remove_dir_all(vendor).unwrap();
+    }
+
+    #[test]
+    fn a_tracked_surface_reaching_through_an_include_still_counts() {
+        // Fedora's shape: sudo includes system-auth, where authselect puts the
+        // fingerprint line. The tightened gate must not refuse this.
+        let dir = pam_dir(
+            "include-reach",
+            &[
+                ("sudo", "auth include system-auth\n"),
+                (
+                    "system-auth",
+                    "auth sufficient pam_fprintd.so\nauth required pam_unix.so\n",
+                ),
+            ],
+        );
+        assert!(fprintd_reaches_tracked_surface(
+            &PamSearchPath::machine_only(&dir)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn removing_the_tracked_surface_flips_the_gate_to_refusal() {
+        // The negative control from #234's acceptance: with the tracked
+        // surface present the gate permits; delete it, leaving only the
+        // unreferenced carrier, and the same machine must refuse.
+        let dir = pam_dir(
+            "negative-control",
+            &[
+                ("kde-fingerprint", "auth sufficient pam_fprintd.so\n"),
+                ("carrier-nobody-calls", "auth sufficient pam_fprintd.so\n"),
+            ],
+        );
+        let path = PamSearchPath::machine_only(&dir);
+        assert!(fprintd_reaches_tracked_surface(&path));
+        std::fs::remove_file(dir.join("kde-fingerprint")).unwrap();
+        assert!(
+            !fprintd_reaches_tracked_surface(&path),
+            "the carrier alone kept the gate open"
+        );
+        assert!(
+            pam_fprintd_wired(&path),
+            "existence still holds, so only the reach check refused"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn requisite_deny_before_fprintd_does_not_count_as_reached() {
+        // pam_deny always fails and a failed requisite returns immediately, so
+        // PAM is guaranteed never to execute the fingerprint line below it. A
+        // walk that reads text instead of control flow counts it, and the gate
+        // then stands face down on a stack whose prompt can never be answered
+        // by a finger (#261 review).
+        let dir = pam_dir(
+            "deny-before-fprintd",
+            &[(
+                "login",
+                "auth requisite pam_deny.so\nauth sufficient pam_fprintd.so\n",
+            )],
+        );
+        let path = PamSearchPath::machine_only(&dir);
+        assert!(!stack_reaches_fprintd(&path, "login"));
+        assert!(!fingerprint_only_permitted(&path, true));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn requisite_deny_inside_an_include_stops_the_parent_too() {
+        // The termination has to propagate: an included stack that exits
+        // authentication exits it for the caller as well, so a fingerprint
+        // line after the include is just as unreachable.
+        let dir = pam_dir(
+            "deny-in-include",
+            &[
+                (
+                    "login",
+                    "auth include blocker\nauth sufficient pam_fprintd.so\n",
+                ),
+                ("blocker", "auth requisite pam_deny.so\n"),
+            ],
+        );
+        let path = PamSearchPath::machine_only(&dir);
+        assert!(!stack_reaches_fprintd(&path, "login"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_measured_arch_layout_keeps_its_permit() {
+        // Verbatim from a real Arch machine (archhost, 2026-08-04): the only
+        // pam_fprintd carrier is the vendor kde-fingerprint, which
+        // kscreenlocker really invokes; the issue-#231 measured case. Note the
+        // `-auth` tolerant form: a gate that fails to strip the `-` refuses
+        // this whole distro. The tightened #234 gate must keep permitting it.
+        let machine = pam_dir(
+            "arch-real-m",
+            &[(
+                "kde",
+                "#%PAM-1.0\n\nauth       sufficient   pam_irlume.so unseal ondemand\nauth       include                     system-local-login\n\naccount    include                     system-local-login\n",
+            )],
+        );
+        let vendor = pam_dir(
+            "arch-real-v",
+            &[(
+                "kde-fingerprint",
+                "#%PAM-1.0\n\nauth       required                    pam_shells.so\nauth       requisite                   pam_nologin.so\nauth       requisite                   pam_faillock.so      preauth\n-auth      required                    pam_fprintd.so\nauth       optional                    pam_permit.so\nauth       required                    pam_env.so\n\naccount    include                     system-local-login\n",
+            )],
+        );
+        let path = PamSearchPath::rooted(&machine, Some(&vendor));
+        assert!(fprintd_reaches_tracked_surface(&path));
+        assert!(fingerprint_only_permitted(&path, true));
+        std::fs::remove_dir_all(machine).unwrap();
+        std::fs::remove_dir_all(vendor).unwrap();
+    }
+
+    #[test]
+    fn the_enable_decision_keys_on_the_flag_and_the_reach() {
+        // Same unreachable-carrier machine, both flag values: coexist stays
+        // permitted (face remains active, nothing is lost), --fingerprint-only
+        // is refused. A gate that ignores either input fails one of these.
+        let dir = pam_dir(
+            "decision",
+            &[
+                ("carrier-nobody-calls", "auth sufficient pam_fprintd.so\n"),
+                ("sudo", "auth required pam_unix.so\n"),
+            ],
+        );
+        let path = PamSearchPath::machine_only(&dir);
+        assert!(fingerprint_only_permitted(&path, false));
+        assert!(!fingerprint_only_permitted(&path, true));
+        // And with a reached surface, --fingerprint-only is permitted again.
+        std::fs::write(dir.join("sudo"), "auth sufficient pam_fprintd.so\n").unwrap();
+        assert!(fingerprint_only_permitted(&path, true));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
