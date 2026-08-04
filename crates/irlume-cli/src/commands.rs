@@ -1406,7 +1406,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     println!("=== irlume setup for '{user}' ===\n");
 
     // 1. Preflight.
-    println!("[1/6] Preflight");
+    println!("[1/7] Preflight");
     if !daemon_up() {
         eprintln!("  daemon not reachable; start it first: sudo systemctl enable --now irlumed");
         return ExitCode::FAILURE;
@@ -1417,7 +1417,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     println!("  cameras: rgb={rgb} ir={ir}");
 
     // 2. Enroll (reset if already enrolled and the user wants a clean start).
-    println!("\n[2/6] Face enrollment");
+    println!("\n[2/7] Face enrollment");
     let enrolled = matches!(
         daemon_request(&Request::ListProfiles {
             user: user.clone(),
@@ -1436,8 +1436,60 @@ pub fn setup(args: &[String]) -> ExitCode {
         run_enroll(&user, false);
     }
 
-    // 3. Keyring arm.
-    println!("\n[3/6] Keyring unlock (face login opens your wallet)");
+    // 3. The print defence, offered here because the user has just enrolled the
+    // face a printed photograph of it can currently impersonate. Default yes:
+    // on the measurements this is the only cue that has ever refused that
+    // attack, so the user should have to decline it rather than discover it.
+    // The license and provenance are shown either way; irlume does not warrant
+    // these weights and says so before fetching them (ADR-0001).
+    println!("\n[3/7] Anti-spoof model (recommended)");
+    match pad_model_offer() {
+        PadOffer::AlreadyEnabled(name) => println!("  '{name}' already enabled {OK}"),
+        PadOffer::NoCatalog => println!("  no third-party model in the catalog; skipping"),
+        PadOffer::ConfiguredButBroken(name, why) => {
+            println!("  '{name}' is configured but the daemon will not load it ({why}),");
+            println!("  so this machine has NO trained print defence right now.");
+            println!("  repair with: sudo irlume models enable {name}");
+        }
+        PadOffer::Offer(m) => {
+            println!("  A printed photograph of your face passes irlume's built-in liveness");
+            println!(
+                "  gate. The '{}' model denied that attack in every measured attempt",
+                m.name
+            );
+            println!("  (docs/pad-results/); it is deny-only and can never approve a face");
+            println!("  the built-in gate rejected.");
+            println!();
+            println!("  license:    {}", m.license);
+            println!("  provenance: {}", m.provenance);
+            println!("  irlume does not distribute these weights; they download from the");
+            println!("  publisher's origin and complying with the license is on you.");
+            println!();
+            if !crate::is_root() {
+                println!(
+                    "  needs root to install; run: sudo irlume models enable {}",
+                    m.name
+                );
+            } else if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                // `yes_no` returns its default WITHOUT asking when stdin is not
+                // a terminal, so a default-yes question would fetch third-party
+                // weights under `setup </dev/null` with nobody having seen it.
+                // A default may only apply to someone who was actually asked.
+                println!("  not downloading without an interactive confirmation.");
+                println!("  enable later with: sudo irlume models enable {}", m.name);
+            } else if yes_no("  Download and enable it?", /* default_yes: */ true) {
+                if crate::models::fetch_and_enable(m) != ExitCode::SUCCESS {
+                    println!("  the model was NOT enabled; a printed photo will pass the gate.");
+                }
+            } else {
+                println!("  skipped; a printed photo will pass the built-in gate.");
+                println!("  enable later with: sudo irlume models enable {}", m.name);
+            }
+        }
+    }
+
+    // 4. Keyring arm.
+    println!("\n[4/7] Keyring unlock (face login opens your wallet)");
     if yes_no(
         "  Arm keyring unlock now (you'll enter your login password)?",
         /* default_yes: */ true,
@@ -1463,7 +1515,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     }
 
     // 4. Recovery passphrase + template encryption.
-    println!("\n[4/6] Recovery passphrase (encrypts templates; backstop for TPM/firmware changes)");
+    println!("\n[5/7] Recovery passphrase (encrypts templates; backstop for TPM/firmware changes)");
     if yes_no(
         "  Set a recovery passphrase now?",
         /* default_yes: */ true,
@@ -1472,7 +1524,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     }
 
     // 5. Fingerprint.
-    println!("\n[5/6] Fingerprint (optional companion factor)");
+    println!("\n[6/7] Fingerprint (optional companion factor)");
     match irlume_fingerprint::device_name() {
         Some(n) => {
             println!("  reader '{n}' present; manage with `irlume fingerprint add` / `enable`")
@@ -1481,7 +1533,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     }
 
     // 6. Login wiring.
-    println!("\n[6/6] PAM login wiring");
+    println!("\n[7/7] PAM login wiring");
     println!("  preview the changes with `irlume login enable` (dry-run), then apply with");
     println!("  `sudo irlume login enable --apply` to wire greeters + lock screen.");
     println!("  once wired: at the greeter/lock, leave the password empty and press Enter");
@@ -1520,6 +1572,47 @@ fn run_enroll(user: &str, reset: bool) {
 }
 
 /// Minimal y/N prompt (default applied on empty input or a non-tty).
+/// What `setup` should do about the third-party PAD cue on this machine.
+///
+/// A value rather than a branch so the decision is testable: setup itself
+/// needs root, a daemon and a camera, and this is the part with cases.
+enum PadOffer {
+    /// One is already enabled; say so and change nothing.
+    AlreadyEnabled(String),
+    /// The catalog is empty, so there is nothing to offer.
+    NoCatalog,
+    /// `settings.conf` names a model the daemon will NOT load, so the machine
+    /// has no cue despite appearing configured. Carries the reason.
+    ConfiguredButBroken(String, String),
+    /// Offer this model.
+    Offer(&'static irlume_common::thirdparty::ThirdPartyModel),
+}
+
+fn pad_model_offer() -> PadOffer {
+    // A configured NAME is not an enabled CUE. The daemon refuses an unknown
+    // catalog name, missing weights, and weights whose sha256 stopped
+    // matching, and in each case authentication runs without the cue.
+    // Reporting the config key as "already enabled" would tell a user they
+    // have a print defence they do not have, which is worse than knowing they
+    // have none (#274 review). Re-check what the daemon checks.
+    if let Some(name) = crate::models::enabled_name() {
+        let Some(m) = irlume_common::thirdparty::by_name(&name) else {
+            return PadOffer::ConfiguredButBroken(name, "not in the catalog".into());
+        };
+        return match std::fs::read(irlume_common::thirdparty::model_path(m)) {
+            Err(e) => PadOffer::ConfiguredButBroken(name, format!("weights unreadable: {e}")),
+            Ok(b) if irlume_common::thirdparty::sha256_hex(&b) != m.sha256 => {
+                PadOffer::ConfiguredButBroken(name, "checksum mismatch".into())
+            }
+            Ok(_) => PadOffer::AlreadyEnabled(name),
+        };
+    }
+    match irlume_common::thirdparty::CATALOG.first() {
+        Some(m) => PadOffer::Offer(m),
+        None => PadOffer::NoCatalog,
+    }
+}
+
 fn yes_no(q: &str, default_yes: bool) -> bool {
     use std::io::{IsTerminal, Write};
     // No terminal takes the documented default. That is deliberate and covered
@@ -1874,6 +1967,74 @@ mod origin_tests {
         assert!(
             !src.contains(&pacman_u),
             "no pacman local-file install of a downloaded asset"
+        );
+    }
+}
+
+#[cfg(test)]
+mod setup_offer_tests {
+    use super::{pad_model_offer, PadOffer};
+
+    #[test]
+    fn the_offer_never_claims_a_defence_the_daemon_would_not_load() {
+        // Deterministic regardless of this machine's settings.conf: the
+        // catalog must be non-empty (setup offers CATALOG.first(), so an empty
+        // one makes the step dead code), and whatever the ambient state, the
+        // INVARIANT must hold: AlreadyEnabled may only be reported when the
+        // weights really are present and match their pin, because the daemon
+        // silently runs without the cue otherwise (#274 review).
+        assert!(
+            !irlume_common::thirdparty::CATALOG.is_empty(),
+            "setup offers CATALOG.first(); an empty catalog makes the step dead"
+        );
+        let first = irlume_common::thirdparty::CATALOG.first().unwrap();
+        // Everything the step prints before asking for consent must exist, or
+        // the user accepts a license and provenance the screen never showed.
+        assert!(!first.name.is_empty());
+        assert!(!first.license.is_empty(), "the offer prints the license");
+        assert!(
+            !first.provenance.is_empty(),
+            "the offer prints the provenance"
+        );
+
+        match pad_model_offer() {
+            PadOffer::NoCatalog => panic!("catalog is non-empty but the offer said otherwise"),
+            PadOffer::Offer(m) => assert_eq!(m.name, first.name),
+            PadOffer::ConfiguredButBroken(_, why) => {
+                assert!(!why.is_empty(), "a broken state must say why");
+            }
+            PadOffer::AlreadyEnabled(name) => {
+                // The claim is auditable: re-verify it the way the daemon does.
+                let m = irlume_common::thirdparty::by_name(&name)
+                    .expect("AlreadyEnabled must name a catalog entry");
+                let bytes = std::fs::read(irlume_common::thirdparty::model_path(m))
+                    .expect("AlreadyEnabled must have readable weights");
+                assert_eq!(
+                    irlume_common::thirdparty::sha256_hex(&bytes),
+                    m.sha256,
+                    "AlreadyEnabled must mean the pin still matches"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_broken_configuration_is_not_reported_as_enabled() {
+        // The discriminating case, built directly: a configured name the
+        // catalog does not know can only be ConfiguredButBroken. Before the
+        // fix this shape returned AlreadyEnabled and setup told the user they
+        // were protected.
+        let broken = PadOffer::ConfiguredButBroken("ghost".into(), "not in the catalog".into());
+        match broken {
+            PadOffer::ConfiguredButBroken(n, w) => {
+                assert_eq!(n, "ghost");
+                assert!(w.contains("catalog"));
+            }
+            _ => panic!("constructed the wrong variant"),
+        }
+        assert!(
+            irlume_common::thirdparty::by_name("ghost").is_none(),
+            "the fixture name must be absent from the catalog for this to discriminate"
         );
     }
 }
