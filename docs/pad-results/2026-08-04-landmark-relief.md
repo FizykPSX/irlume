@@ -123,31 +123,62 @@ by brightness alone on this hardware. This is an extrapolation from faces
 measured to 120 and is offered as a bound, not as evidence about saturated
 frames; saturation clips regions unevenly and is measured separately (#221).
 
-## The attack this corpus cannot rule out
+## The printed-shadow attack remains untested
 
-The cue reads brightness at the chin, and it cannot tell an emitter shadow from
-a printed one. An attacker who prints a source photograph shot with strong
-top-down lighting, or who simply darkens the chin region of the print, raises
-the ratio without changing the geometry. The banner used here is an evenly lit
-studio portrait, so nothing in this corpus tests that.
+The cue reads brightness at the chin and cannot tell an emitter shadow from a
+printed one, so darkening the chin region of the source image should raise the
+ratio without changing the print's geometry.
 
-The strobe suggests a defence and this corpus cannot validate it. Sampling the
-same landmarks on the emitter-off frame gives the emitter-only contribution by
-subtraction; a geometric shadow exists only in the lit frame, while a printed
-one appears in both. Measured on 2026-08-04:
+What the banner does show is how little contrast its current portrait retains
+at 850nm across the sampled regions. Each value is camera brightness divided by
+the forehead brightness in the same frame (medians):
 
-| class | chin lit | chin ambient | chin emitter-only | cheek/chin raw | cheek/chin emitter-only |
-|---|---|---|---|---|---|
-| face | 25.0 | 3.3 | 21.8 | 3.122 | 2.792 |
-| print | 44.6 | 0.0 | 44.6 | 1.358 | 1.358 |
+| region | real face | vinyl print |
+|---|---|---|
+| nose | 0.858 | 1.137 |
+| cheek | 0.645 | 0.974 |
+| brow (eyebrow) | 0.728 | 0.961 |
+| socket | 0.454 | 0.711 |
+| socket_deep | 0.424 | 0.721 |
+| chin | 0.192 | 0.625 |
 
-Ambient was near zero for both, so the differential barely moves either class
-and demonstrates only that the quantity is computable. Whether it defeats a
-printed shadow is untested and needs a print made to carry one.
+A real eyebrow reads 0.728 of forehead; the printed eyebrow, strongly dark to
+the eye, reads 0.961. Across these regions the face spans 0.192 to 1.000 and
+the print 0.625 to 1.137.
+
+The arithmetic of the attack, holding the measured cheek brightness fixed:
+
+| quantity | value |
+|---|---|
+| print cheek median | 77.8 |
+| print chin median | 50.8 |
+| print cheek/chin | 1.532 |
+| lowest captured face cheek/chin | 2.580 |
+| required print chin | 30.2 |
+| required chin / print forehead | 0.363 |
+
+**This does not rule the attack out, and an earlier revision of this page said
+it did.** The required 0.363 sits below every region sampled here, but these
+are six landmark regions of one portrait, not a tone scale: they differ at once
+in source-image tone, surface orientation, emitter incidence, coating response
+and viewing angle. The lowest of them is not the darkest tone the ink can
+print. Nor is camera brightness over a printed forehead a reflectance
+measurement; reflectance is defined against a reference under stated
+illumination and observation geometry, and no such reference is in frame, so no
+absorption figure can be derived from these numbers either.
+
+What would settle it: a controlled tone scale printed on the same medium, or
+simply the attack itself, a second print whose chin is filled with the darkest
+printable tone. Neither exists here. A physical occluder, dark cloth or an
+infrared-absorbing patch over the chin of an existing print, produces the same
+signal without printing anything and needs no new instrument at all.
 
 ## What would have to be true before a gate
 
-- **A print with a darkened chin**, the cheap attack above, captured and refused.
+- **A deliberately darkened or infrared-absorbing chin**, produced by printing
+  a second attack image or by physical occlusion, captured and refused. The
+  banner carries no controlled tone scale, so nothing here establishes the
+  minimum response its ink and medium can reach.
 - **More than one subject.** Facial relief is the quantity being measured, and
   jaw shape, beard, and chin prominence vary. One subject cannot establish a
   floor.
