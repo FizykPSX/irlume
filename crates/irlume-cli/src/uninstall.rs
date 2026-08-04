@@ -46,6 +46,51 @@ pub fn run(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // A GNOME keyring token arm (#250) means the user's login keyring is keyed
+    // to a secret that exists ONLY in the sealed envelope. Deleting it here
+    // would make that keyring permanently unreachable, and the re-key back to
+    // the password cannot happen from this root process (the keyring control
+    // socket authenticates the session's uid). Refuse until each such user has
+    // disarmed from their own session; this is a data-loss guard, so there is
+    // deliberately no flag to bypass it (`irlume keyring forget --force` per
+    // user is the explicit, per-user override).
+    // Enumerate ENVELOPES, not enrolled users: `keyring arm` needs no
+    // enrollment, so a user can hold a sealed token and never appear in
+    // `storage::list_users()`. And an envelope this cannot READ is not an
+    // envelope that holds no token; the enumerator errors rather than skipping,
+    // because guessing here erases the only copy of the secret a login keyring
+    // is encrypted under.
+    let sealed = match irlume_core::keyring::list_sealed_kinds() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[uninstall] refusing: could not read the sealed-envelope store ({e}). \
+                 One of these may hold a GNOME keyring token, and deleting it would \
+                 leave that keyring encrypted under a secret nothing can reproduce. \
+                 Fix the store (or move it aside deliberately) and re-run."
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let token_users: Vec<&str> = sealed
+        .iter()
+        .filter(|(_, kind)| *kind == irlume_core::envelope::SecretKind::GnomeKeyringToken)
+        .map(|(u, _)| u.as_str())
+        .collect();
+    if !token_users.is_empty() {
+        eprintln!(
+            "[uninstall] refusing: the login keyring of {} is keyed to an irlume-held \
+             token, and uninstalling now would lock it permanently.",
+            token_users.join(", ")
+        );
+        eprintln!(
+            "[uninstall] Have each of these users run `irlume keyring forget` in their \
+             own session first (it re-keys the keyring back to their password), then \
+             re-run the uninstall."
+        );
+        return ExitCode::FAILURE;
+    }
+
     println!("irlume uninstall will:");
     println!("  1. remove irlume from every PAM stack (greeters, sudo, lock screen)");
     println!("  2. stop and disable the irlumed service");

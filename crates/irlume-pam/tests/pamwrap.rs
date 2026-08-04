@@ -691,13 +691,16 @@ fn pamwrap_ondemand_unseal_falls_back_to_verify() {
     assert!(matches!(reqs[1], Request::Authenticate { .. }));
 }
 
-/// `keyring` mode (fingerprint path, post-auth landing): with no password in
-/// the transaction the module asks for the sealed password to unlock the
-/// keyring; with one already present it stays silent. Either way it returns
-/// IGNORE (best-effort), so the trailing pam_permit decides the stack.
+/// `keyring` mode (fingerprint path, post-auth landing): the module always
+/// asks the daemon, and REPORTS whether the transaction already holds a
+/// password rather than deciding on it. That decision moved daemon-side with
+/// #250: a token-armed keyring does not open with the typed password, so only
+/// the daemon, which can read the envelope's kind, can tell whether the unseal
+/// is pointless. Either way the module returns IGNORE (best-effort), so the
+/// trailing pam_permit decides the stack.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_keyring_mode_unseals_only_without_a_password() {
+fn pamwrap_keyring_mode_reports_whether_a_password_is_present() {
     let Some(h) = Harness::try_new("keyring") else {
         return;
     };
@@ -728,23 +731,39 @@ fn pamwrap_keyring_mode_unseals_only_without_a_password() {
         let reqs = log.lock().unwrap();
         assert_eq!(reqs.len(), 1, "{reqs:?}");
         match &reqs[0] {
-            Request::UnsealKeyring { user, service } => {
+            Request::UnsealKeyring {
+                user,
+                service,
+                have_password,
+            } => {
                 assert_eq!(user, "tester");
                 assert_eq!(service.as_deref(), Some("irlume-fp"));
+                assert!(!have_password, "no password was set in this transaction");
             }
             other => panic!("expected UnsealKeyring, daemon saw {other:?}"),
         }
         // (drop the guard before the next run appends)
     }
 
-    // Password already present: the keyring self-unlocks from it; no request.
+    // Password already present: still asked, but flagged, so the daemon can
+    // answer KeyringUnlockNotNeeded for a password envelope without spending a
+    // TPM unseal, and can still release a token for a token envelope.
     let (ok, out) = h.run("irlume-fp-pw", &["authenticate"], "", Some("hunter2"));
     assert!(ok, "{out}");
+    let reqs = log.lock().unwrap();
     assert_eq!(
-        log.lock().unwrap().len(),
-        1,
-        "a present password must mean no daemon contact"
+        reqs.len(),
+        2,
+        "the daemon decides, so it must be asked: {reqs:?}"
     );
+    match &reqs[1] {
+        Request::UnsealKeyring { have_password, .. } => assert!(
+            *have_password,
+            "a password IS present; reporting false would make the daemon spend a \
+             pointless TPM unseal"
+        ),
+        other => panic!("expected UnsealKeyring, daemon saw {other:?}"),
+    }
 }
 
 /// `kr` (Debian `@include` keyring-continue): a COLD face login that released
@@ -830,11 +849,30 @@ fn pamwrap_reseal_stashes_on_auth_and_reseals_on_session() {
     assert!(ok, "auth + session must both pass: {out}");
 
     let reqs = log.lock().unwrap();
+    // The AUTH phase must still contact nobody: acting on a token there is the
+    // bug that let a typo overwrite a good seal. The SESSION phase now makes
+    // two requests, in this order.
     assert_eq!(
         reqs.len(),
-        1,
-        "exactly one reseal, and none during the auth phase: {reqs:?}"
+        2,
+        "reseal, then the token-delivery query, both in the session phase: {reqs:?}"
     );
+    // A typed-password login releases no token in the auth phase, so there is
+    // no stash for open_session to deliver; without asking the daemon here, a
+    // token-armed account's keyring would never be unlocked by a password
+    // login. `have_password: true` lets the daemon answer a password-armed
+    // user without touching the TPM, so the cost lands only on token users.
+    match &reqs[1] {
+        Request::UnsealKeyring {
+            user,
+            have_password,
+            ..
+        } => {
+            assert_eq!(user, "tester");
+            assert!(have_password, "the session phase holds the typed password");
+        }
+        other => panic!("expected the delivery query second, got {other:?}"),
+    }
     match &reqs[0] {
         Request::ResealPassword { user, password } => {
             assert_eq!(user, "tester");
@@ -849,7 +887,9 @@ fn pamwrap_reseal_stashes_on_auth_and_reseals_on_session() {
     drop(reqs);
 
     // A pure face login stashes nothing (blank submit ⇒ empty PAM_AUTHTOK), so
-    // the session half must have nothing to heal with: no daemon contact.
+    // the session half must have nothing to RESEAL. It still asks the daemon
+    // whether a token needs delivering, because a face login that released one
+    // is exactly the case that needs it.
     h.write_service(
         "irlume-reseal-empty",
         &[
@@ -866,9 +906,33 @@ fn pamwrap_reseal_stashes_on_auth_and_reseals_on_session() {
         None,
     );
     assert!(ok, "{out}");
+    let reqs = log.lock().unwrap();
     assert_eq!(
-        log.lock().unwrap().len(),
-        1,
-        "an empty stash must never produce a reseal request"
+        reqs.len(),
+        3,
+        "the two from the run above, plus this run's delivery query and no \
+         reseal: {reqs:?}"
     );
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| matches!(r, Request::ResealPassword { .. })
+                && reqs
+                    .iter()
+                    .filter(|x| matches!(x, Request::ResealPassword { .. }))
+                    .count()
+                    > 1),
+        "an empty stash must never produce a SECOND reseal request: {reqs:?}"
+    );
+    match &reqs[2] {
+        // `true` even though nothing was typed: the flag means "a
+        // password-keyed keyring is already served", which by the session
+        // phase it is, and answering it saves the daemon a TPM unseal this
+        // hook would only discard.
+        Request::UnsealKeyring { have_password, .. } => assert!(
+            *have_password,
+            "the session-phase delivery query always reports a served keyring"
+        ),
+        other => panic!("expected only the delivery query, got {other:?}"),
+    }
 }
