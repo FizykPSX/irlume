@@ -209,6 +209,9 @@ reused for a different meaning. The registry as of this contract:
 | `ir-stream-hello-minimum` | the negotiated IR stream compared with the published Windows Hello IR minimum (340x340@15fps). `info` when no IR node is selected or the dimensions meet it with no reported rate; `unknown` when the node cannot be negotiated right now |
 | `rgb-stream-hello-minimum` | the negotiated RGB stream compared with the published Windows Hello RGB minimum (480x480@7.5fps). Same states as the IR check |
 | `models` | the ONNX weights irlume needs, present and checksummed |
+| `stage-detection-model` | the face-detection stage's model: the resolved file and whether it is shipped or an env override. `fail` when missing, because the daemon cannot start |
+| `stage-landmarks-model` | the landmarks (mesh) stage's model. `warn` when missing: mesh-dependent gates (passive blink liveness, consent gesture) are disabled |
+| `stage-recognition-model` | the recognizer stage's model. `fail` when missing, because the daemon cannot start |
 | `ort-dylib-path` | which ONNX runtime library will be loaded |
 | `third-party-pad-model` | optional third-party presentation-attack weights, if installed |
 | `fingerprint-reader` | whether a fingerprint reader was found |
@@ -316,6 +319,40 @@ store before a later capability can expose them.
 
 Display names are chosen by the user, so treat them as user text rather than
 identifiers: they may contain anything the user typed.
+
+### `irlume models list --json`
+
+Capability: `models-list-json`.
+
+The pipeline stages in order, each with its model **candidate**: the file this
+CLI process's search order lands on, its origin (`shipped`, `caller-env` when
+the calling process's environment chose the path, or `built-in` for the PAD
+stage's gate, which is code rather than a swappable file), and whether it
+opened as a regular file (`readable`). It is a candidate and not a claim about
+the daemon, because the daemon's service unit — or an administrator's drop-in —
+sets the daemon's own environment, which a shell invocation cannot observe. On
+a stock install the candidate coincides with what the daemon loads; an
+authoritative loaded-model report can only ever come from the daemon itself.
+`observed: true` with `readable: false` (a directory at the path, an
+unreadable file) means the daemon's load of that same candidate would fail.
+
+Each stage also reports whether the daemon requires the file to start and
+whether the stage is open to third-party models. Stages open one at a time
+because their failure modes differ; the PAD stage is the only open one today,
+and it carries a `third_party` object with the enabled entry and the measured
+catalog, including each entry's tier (`fetched` by irlume, or `user-supplied`
+when the license makes obtaining the file the user's business) and the weight
+file's state against its pin.
+
+The command needs no daemon, so it still answers when the daemon will not
+start.
+
+`third_party.enabled.known` is keyed on what the read established, not on who
+asked. Observed absence (no config file or key; the config directory is
+world-readable) is `known: true, name: null` from any caller. A read that
+failed — the root-only file denied to an unprivileged caller, or a wrong
+SELinux label denying even root — established nothing and is `known: false`,
+which a consumer must not render as disabled.
 
 ### Error codes
 
