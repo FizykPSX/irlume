@@ -15,6 +15,7 @@
 //!   irlume keyring <arm|status|forget>           TPM-sealed keyring/wallet unlock
 //!   irlume recovery <status|setup|restore|forget> template-key recovery passphrase
 //!   irlume calibrate-closure [--rounds N]        teach the eye-closure consent gesture
+//!   irlume calibrate-closure --measure-only      labelled EAR readings, nothing stored
 //!   irlume fingerprint <status|add|verify|reset|enable|disable> fprintd companion (face OR fingerprint)
 //!   irlume login <status|enable|disable|reconcile> wire face auth into PAM (+--with-polkit for apps)
 //!   irlume logs [-f] [debug on|off]              face-auth journal view + tracing switch
@@ -506,6 +507,21 @@ fn rounds_that_would_register(
     )
 }
 
+/// The `--pose` label for measure-only runs, refusing a swallowed value:
+/// `flag()` blindly returns the next argument, so `--pose --rounds 5` would
+/// label research data '--rounds' and a trailing `--pose` would silently read
+/// as unlabeled; both mislabel the measurement they exist to identify (#267
+/// review). `Err` means the flag was given without a usable label.
+fn measure_pose_label(args: &[String]) -> Result<&str, ()> {
+    match args.iter().position(|a| a == "--pose") {
+        None => Ok("unlabeled"),
+        Some(i) => match args.get(i + 1).map(String::as_str) {
+            Some(v) if !v.starts_with('-') => Ok(v),
+            _ => Err(()),
+        },
+    }
+}
+
 /// Median of a non-empty slice. Takes `&mut` because selecting the middle
 /// element needs an ordering, and EAR readings are floats (`total_cmp`, so a
 /// stray NaN sorts to one end rather than corrupting the comparison).
@@ -569,6 +585,53 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
             }
         },
     };
+    // --measure-only: capture and print EAR medians without storing anything.
+    // The #173 measurement mode: the stored calibration stays untouched, so a
+    // second state (glasses on, different seat, different light) can be
+    // measured side by side against the one the user actually authenticates
+    // with. `--pose` names what the operator is holding; it is recorded in the
+    // output only, since the daemon cannot know what the face is doing.
+    if args.iter().any(|a| a == "--measure-only") {
+        let Ok(pose) = measure_pose_label(args) else {
+            eprintln!("[calibrate] --pose requires a label (e.g. --pose glasses-on-open)");
+            return std::process::ExitCode::from(2);
+        };
+        println!(
+            "[calibrate] measure-only: {rounds} capture(s), pose '{pose}', nothing stored.\n\
+             [calibrate] hold the pose now; each capture starts after a 3s pause."
+        );
+        let mut vals: Vec<f32> = Vec::new();
+        for i in 1..=rounds {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            match daemon_request(&Request::CaptureEarMedian { user: user.clone() }) {
+                Ok(Response::EarMedian(Some(v))) => {
+                    println!("    round {i}: EAR = {v:.4}");
+                    vals.push(v);
+                }
+                Ok(Response::EarMedian(None)) => {
+                    println!("    round {i}: no eye detected (face the camera)");
+                }
+                Ok(Response::Error(e)) => println!("    round {i}: {e}"),
+                Ok(other) => println!("    round {i}: unexpected response: {other:?}"),
+                Err(e) => println!("    round {i}: {e}"),
+            }
+        }
+        if vals.is_empty() {
+            eprintln!("[calibrate] no reading succeeded; nothing to report");
+            return std::process::ExitCode::FAILURE;
+        }
+        // The SAME median the calibration path stores (median_ear averages the
+        // two middles of an even sample); a failed round makes the count even,
+        // and an upper-middle pick there is not a median (#267 review).
+        let median = median_ear(&mut vals);
+        println!(
+            "[calibrate] pose '{pose}': median EAR {median:.4} over {} reading(s) (range {:.4} to {:.4})",
+            vals.len(),
+            vals[0],
+            vals[vals.len() - 1]
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
     let interactive = std::io::stdin().is_terminal();
     // Ask BEFORE spending the user's time on captures, not after.
     let already_calibrated = matches!(
@@ -4078,6 +4141,30 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn measure_pose_label_refuses_swallowed_and_missing_values() {
+        // No flag at all: the honest default.
+        assert_eq!(
+            measure_pose_label(&argv(&["--measure-only"])),
+            Ok("unlabeled")
+        );
+        // A proper label passes through.
+        assert_eq!(
+            measure_pose_label(&argv(&["--measure-only", "--pose", "glasses-on-open"])),
+            Ok("glasses-on-open")
+        );
+        // `--pose --rounds 5` must not label the data '--rounds'.
+        assert_eq!(
+            measure_pose_label(&argv(&["--pose", "--rounds", "5"])),
+            Err(())
+        );
+        // A trailing `--pose` asked for a label and gave none.
+        assert_eq!(
+            measure_pose_label(&argv(&["--measure-only", "--pose"])),
+            Err(())
+        );
     }
 
     #[test]
