@@ -1206,14 +1206,6 @@ impl RgbCamera {
             )));
         }
         let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
-        // Best-effort backlight/low-light correction: tell auto-exposure to
-        // expose for the face, not a bright window behind it. Harmless if
-        // unsupported (NexiGo N930W needs this; verified mean 49→124 + face
-        // detected).
-        let _ = dev.set_control(v4l::control::Control {
-            id: V4L2_CID_BACKLIGHT_COMPENSATION,
-            value: v4l::control::Value::Integer(2),
-        });
         // Pick an uncompressed format the camera actually offers. Some webcams
         // advertise RGB only as MJPEG (or NV12) and reject YUYV; classify()
         // still labels them usable, so without this negotiation they would
@@ -1242,6 +1234,17 @@ impl RgbCamera {
     /// stream until it is dropped, so keep it exactly as long as the burst of
     /// captures that needs it and no longer.
     pub fn session(&self) -> irlume_common::Result<RgbSession<'_>> {
+        // Best-effort backlight/low-light correction: tell auto-exposure to
+        // expose for the face, not a bright window behind it. Harmless if
+        // unsupported (NexiGo N930W needs this; verified mean 49→124 + face
+        // detected). Written here rather than in `open` so that opening for a
+        // read-only purpose (doctor's stream report) changes nothing on the
+        // camera; AE settles during this session's warm-up either way, and the
+        // write is idempotent across repeated sessions.
+        let _ = self.dev.set_control(v4l::control::Control {
+            id: V4L2_CID_BACKLIGHT_COMPENSATION,
+            value: v4l::control::Value::Integer(2),
+        });
         let stream = SafeStream::open(&self.device, &self.dev)?;
         Ok(RgbSession {
             cam: self,
@@ -1249,6 +1252,167 @@ impl RgbCamera {
             warmed: false,
         })
     }
+
+    /// The stream this open camera negotiated. See [`negotiated_stream`].
+    pub fn spec(&self) -> StreamSpec {
+        StreamSpec {
+            width: self.width,
+            height: self.height,
+            fourcc: fourcc_str(&self.chosen),
+            fps: driver_fps(&self.dev),
+        }
+    }
+}
+
+/// The negotiated stream of a camera, for the doctor report (#223).
+#[derive(Clone, Debug)]
+pub struct StreamSpec {
+    pub width: u32,
+    pub height: u32,
+    /// The negotiated pixel format's fourcc, e.g. "GREY" or "YUYV".
+    pub fourcc: String,
+    /// Frames per second from the driver's reported capture interval. `None`
+    /// when the driver does not report one; irlume never sets a rate, so this
+    /// is the default the stream would actually run at.
+    pub fps: Option<f64>,
+}
+
+/// A published stream floor to compare a [`StreamSpec`] against.
+pub struct StreamMinimum {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+}
+
+/// Windows Hello's published stream minimums, the envelope irlume's cue set
+/// was designed around. Microsoft's UVC camera implementation guide
+/// (learn.microsoft.com, "UVC camera implementation guide"): "Windows Hello
+/// has a minimum requirement of 480x480@7.5fps for the RGB stream and
+/// 340x340@15fps for the IR stream."
+pub const HELLO_IR_MIN: StreamMinimum = StreamMinimum {
+    width: 340,
+    height: 340,
+    fps: 15.0,
+};
+pub const HELLO_RGB_MIN: StreamMinimum = StreamMinimum {
+    width: 480,
+    height: 480,
+    fps: 7.5,
+};
+
+impl StreamSpec {
+    /// Whether this stream meets `min`. `Some(false)` when a dimension or a
+    /// reported rate is below it; `None` when the dimensions meet it but the
+    /// driver reports no rate, which is "cannot say", not "meets": collapsing
+    /// an unobserved rate into a pass would make the one unreadable driver
+    /// look like the one that cleared the bar.
+    pub fn meets(&self, min: &StreamMinimum) -> Option<bool> {
+        if self.width < min.width || self.height < min.height {
+            return Some(false);
+        }
+        self.fps.map(|fps| fps >= min.fps)
+    }
+}
+
+/// The driver's reported capture rate for `dev`, from VIDIOC_G_PARM. The
+/// interval is time-per-frame, so the rate is its inverse.
+fn driver_fps(dev: &Device) -> Option<f64> {
+    fps_from_params(Capture::params(dev).ok()?)
+}
+
+/// [`driver_fps`]'s conversion, split out so the capability rule is testable
+/// without hardware. V4L2 specifies that `timeperframe` is meaningful only
+/// when the driver sets `V4L2_CAP_TIMEPERFRAME`; without the flag the fields
+/// are whatever the driver left in the struct, and reading a plausible-looking
+/// `1/30` there would let an unestablished rate publish as a pass. A zero on
+/// either side of the fraction is equally unusable.
+fn fps_from_params(p: v4l::video::capture::Parameters) -> Option<f64> {
+    if !p
+        .capabilities
+        .contains(v4l::parameters::Capabilities::TIME_PER_FRAME)
+    {
+        return None;
+    }
+    let (num, den) = (p.interval.numerator, p.interval.denominator);
+    (num != 0 && den != 0).then(|| f64::from(den) / f64::from(num))
+}
+
+/// `VIDIOC_TRY_FMT`: what `VIDIOC_S_FMT` would negotiate, without changing
+/// driver state. The kernel specifies TRY_FMT as S_FMT's stateless twin (same
+/// adjustment logic, no hardware preparation), which is what lets the doctor
+/// report read a camera without mutating it. The pinned v4l crate exposes only
+/// `set_format`, so this is the same raw-ioctl shape as the VIDIOC_ENUM_FMT
+/// probe above.
+fn try_format(dev: &Device, fmt: &Format) -> std::io::Result<Format> {
+    let mut wire: v4l::v4l_sys::v4l2_format = unsafe { std::mem::zeroed() };
+    wire.type_ = v4l::buffer::Type::VideoCapture as u32;
+    wire.fmt.pix = (*fmt).into();
+    // SAFETY: `dev` owns the fd for the length of this call, and `wire` is a
+    // correctly sized v4l2_format with the pix union arm initialized, which is
+    // what VIDIOC_TRY_FMT reads and writes.
+    let rc = unsafe {
+        libc::ioctl(
+            dev.handle().fd(),
+            v4l::v4l2::vidioc::VIDIOC_TRY_FMT,
+            &mut wire as *mut _ as *mut libc::c_void,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Format::from(unsafe { wire.fmt.pix }))
+}
+
+/// What the capture path would negotiate on `device`, observed read-only: the
+/// same verify + privacy checks and the same candidate walks as
+/// [`RgbCamera::open`] / [`IrCamera::open`], applied through `VIDIOC_TRY_FMT`
+/// instead of `VIDIOC_S_FMT`, so nothing on the camera changes. No buffers,
+/// no streaming, LED off. The candidate selection is shared with the real
+/// open paths rather than reimplemented, so this report cannot drift from
+/// what capture actually asks for (#223).
+pub fn negotiated_stream(device: &str, role: Role) -> irlume_common::Result<StreamSpec> {
+    verify_pinned(device)?;
+    if privacy_engaged(device) {
+        return Err(Error::Hardware(format!(
+            "{device}: hardware privacy switch is ON"
+        )));
+    }
+    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    let (fmt, fourcc) = match role {
+        Role::Rgb => {
+            let chosen = negotiate_rgb_format(device, &dev)?;
+            let fmt = try_format(&dev, &Format::new(RGB_W, RGB_H, FourCC::new(&chosen)))
+                .map_err(|e| map_io(device, e))?;
+            // Mirror open()'s echo check: a driver that answers with a
+            // different fourcc would fail capture, so it must not report as a
+            // negotiated stream here.
+            if fmt.fourcc.repr != chosen {
+                return Err(Error::Hardware(format!(
+                    "{device}: driver gave {}, expected {}",
+                    fourcc_str(&fmt.fourcc.repr),
+                    fourcc_str(&chosen)
+                )));
+            }
+            let cc = fourcc_str(&fmt.fourcc.repr);
+            (fmt, cc)
+        }
+        Role::Ir => {
+            let (fmt, _pix) = negotiate_ir_format_via(device, &dev, try_format)?;
+            let cc = fourcc_str(&fmt.fourcc.repr);
+            (fmt, cc)
+        }
+        _ => {
+            return Err(Error::Hardware(format!(
+                "{device}: no stream to negotiate for this role"
+            )))
+        }
+    };
+    Ok(StreamSpec {
+        width: fmt.width,
+        height: fmt.height,
+        fourcc,
+        fps: driver_fps(&dev),
+    })
 }
 
 /// A running RGB stream. Every capture after the first skips the warm-up.
@@ -1495,6 +1659,19 @@ const IR_CANDIDATES: [(&[u8; 4], IrPixel); 8] = [
 /// walk [`IR_CANDIDATES`] against what the driver advertises, accept the first
 /// one the driver echoes back, and fail with a message naming what it offers.
 fn negotiate_ir_format(device: &str, dev: &Device) -> irlume_common::Result<(Format, IrPixel)> {
+    negotiate_ir_format_via(device, dev, Capture::set_format)
+}
+
+/// The IR candidate walk with the format ioctl injected: capture applies it
+/// through `VIDIOC_S_FMT` ([`negotiate_ir_format`]) while the doctor's
+/// read-only probe applies the SAME walk through `VIDIOC_TRY_FMT`
+/// ([`negotiated_stream`]). One walk, two ioctls, so the probe cannot drift
+/// from what capture negotiates.
+fn negotiate_ir_format_via(
+    device: &str,
+    dev: &Device,
+    apply: impl Fn(&Device, &Format) -> std::io::Result<Format>,
+) -> irlume_common::Result<(Format, IrPixel)> {
     let offered: Vec<[u8; 4]> = Capture::enum_formats(dev)
         .map(|v| v.into_iter().map(|d| d.fourcc.repr).collect())
         .unwrap_or_default();
@@ -1505,7 +1682,7 @@ fn negotiate_ir_format(device: &str, dev: &Device) -> irlume_common::Result<(For
             continue;
         }
         let fmt = Format::new(IR_W, IR_H, FourCC::new(cc));
-        let fmt = Capture::set_format(dev, &fmt).map_err(|e| map_io(device, e))?;
+        let fmt = apply(dev, &fmt).map_err(|e| map_io(device, e))?;
         if &fmt.fourcc.repr == cc {
             return Ok((fmt, pix));
         }
@@ -1746,6 +1923,9 @@ pub struct IrCamera {
     /// The driver's reported quantization for the negotiated format, which is
     /// half of what names the clipping ceiling; see [`clipping_white_level`].
     quantization: Quantization,
+    /// The negotiated fourcc, kept for [`Self::spec`]: `pix` names how the
+    /// bytes decode, not which of several fourccs mapped to it.
+    fourcc: String,
     width: u32,
     height: u32,
     card: String,
@@ -1767,10 +1947,21 @@ impl IrCamera {
             dev,
             pix,
             quantization: fmt.quantization,
+            fourcc: fourcc_str(&fmt.fourcc.repr),
             width: fmt.width,
             height: fmt.height,
             card,
         })
+    }
+
+    /// The stream this open camera negotiated. See [`negotiated_stream`].
+    pub fn spec(&self) -> StreamSpec {
+        StreamSpec {
+            width: self.width,
+            height: self.height,
+            fourcc: self.fourcc.clone(),
+            fps: driver_fps(&self.dev),
+        }
     }
 
     /// Start streaming and fire the emitter.
@@ -3138,6 +3329,51 @@ fn warm_up_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rate_without_the_timeperframe_capability_is_unknown() {
+        // V4L2 defines timeperframe as meaningful only under
+        // V4L2_CAP_TIMEPERFRAME; without the flag the fraction is residue, and
+        // a plausible 1/30 there must not publish as an established rate.
+        let mut p = v4l::video::capture::Parameters::with_fps(30);
+        p.capabilities = v4l::parameters::Capabilities::from(0);
+        assert_eq!(fps_from_params(p), None);
+        // With the flag the same fraction is a real 30fps.
+        p.capabilities = v4l::parameters::Capabilities::TIME_PER_FRAME;
+        assert_eq!(fps_from_params(p), Some(30.0));
+        // A zero numerator or denominator is unusable even when capable.
+        let mut z = v4l::video::capture::Parameters::new(v4l::Fraction::new(0, 30));
+        z.capabilities = v4l::parameters::Capabilities::TIME_PER_FRAME;
+        assert_eq!(fps_from_params(z), None);
+    }
+
+    #[test]
+    fn hello_minimum_verdicts_cover_all_three_outcomes() {
+        let spec = |w, h, fps| StreamSpec {
+            width: w,
+            height: h,
+            fourcc: "GREY".into(),
+            fps,
+        };
+        // The measured ASUS module shape: comfortably above the IR floor.
+        assert_eq!(spec(640, 400, Some(30.0)).meets(&HELLO_IR_MIN), Some(true));
+        // At the floor exactly is meeting it, not below it.
+        assert_eq!(spec(340, 340, Some(15.0)).meets(&HELLO_IR_MIN), Some(true));
+        // ONE dimension below fails, even with plenty of rate; 640x240 has
+        // fewer face pixels than the envelope no matter its width.
+        assert_eq!(spec(640, 240, Some(30.0)).meets(&HELLO_IR_MIN), Some(false));
+        // A reported rate below the floor fails.
+        assert_eq!(spec(640, 400, Some(10.0)).meets(&HELLO_IR_MIN), Some(false));
+        // Dimensions meet, rate unreported: cannot say, which must stay
+        // distinct from a pass (an unobserved rate is not an adequate one).
+        assert_eq!(spec(640, 400, None).meets(&HELLO_IR_MIN), None);
+        // Dimensions below with rate ALSO unreported is still a definite
+        // below, not an unknown: the dimensions alone decide it.
+        assert_eq!(spec(320, 240, None).meets(&HELLO_IR_MIN), Some(false));
+        // The RGB floor has a fractional rate; just below it fails.
+        assert_eq!(spec(640, 480, Some(7.0)).meets(&HELLO_RGB_MIN), Some(false));
+        assert_eq!(spec(640, 480, Some(7.5)).meets(&HELLO_RGB_MIN), Some(true));
+    }
 
     fn unreadable(at: FailedAt, errno: Option<i32>, holder: Option<&str>) -> Unreadable {
         Unreadable {
