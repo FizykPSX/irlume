@@ -18,6 +18,7 @@ coreml = ["ort/coreml"]
 tensorrt = ["ort/tensorrt"]
 
 [dependencies]
+libc.workspace = true   # dlopen/dlsym probe: prove a library is loadable ort BEFORE ort can park on it (#266)
 irlume-common.workspace = true
 irlume-camera.workspace = true
 thiserror.workspace = true
