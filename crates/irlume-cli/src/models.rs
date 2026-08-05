@@ -28,7 +28,7 @@ pub fn run(sub: Option<&str>, args: &[String]) -> ExitCode {
             args.get(2).map(String::as_str),
             args.get(3).map(String::as_str),
         ),
-        Some("disable") => disable(),
+        Some("disable") => disable(args.get(2).map(String::as_str)),
         _ => usage(),
     }
 }
@@ -37,7 +37,7 @@ fn usage() -> ExitCode {
     eprintln!("usage: irlume models [list]");
     eprintln!("       sudo irlume models enable <name>          (irlume fetches it)");
     eprintln!("       sudo irlume models add <name> <path>      (you supply the file)");
-    eprintln!("       sudo irlume models disable");
+    eprintln!("       sudo irlume models disable [name]");
     ExitCode::from(2)
 }
 
@@ -98,9 +98,7 @@ fn add(name: Option<&str>, path: Option<&str>) -> ExitCode {
     println!("  license:    {}", m.license);
     println!("  provenance: {}", m.provenance);
     println!("  measured:   {}", m.summary);
-    println!("  effect:     adds a DENY-ONLY liveness cue on the lit IR frame; it can");
-    println!("              reject a presentation, it can never approve one the built-in");
-    println!("              gate rejected. False fires cost a retry or the password.");
+    println!("  effect:     {}", role_line(m));
     println!();
     println!("  sha256 matches the artifact irlume measured. Complying with the license");
     println!("  above, for your use, is your determination and not irlume's.");
@@ -121,9 +119,26 @@ fn add(name: Option<&str>, path: Option<&str>) -> ExitCode {
     install_verified(m, &bytes)
 }
 
-/// The catalog name currently enabled in settings.conf, if any.
+/// The catalog name currently enabled in settings.conf for the PAD stage.
 pub(crate) fn enabled_name() -> Option<String> {
-    irlume_common::config::read_kv("settings.conf", thirdparty::SETTINGS_KEY)
+    enabled_name_for(thirdparty::SETTINGS_KEY)
+}
+
+/// The catalog name a settings key currently names, if any.
+fn enabled_name_for(key: &str) -> Option<String> {
+    irlume_common::config::read_kv("settings.conf", key)
+}
+
+/// Every (entry, its stage's settings key) currently enabled, across stages.
+fn enabled_entries() -> Vec<(&'static ThirdPartyModel, &'static str)> {
+    thirdparty::CATALOG
+        .iter()
+        .filter(|m| {
+            let key = thirdparty::settings_key_for(m.stage);
+            enabled_name_for(key).as_deref() == Some(m.name)
+        })
+        .map(|m| (m, thirdparty::settings_key_for(m.stage)))
+        .collect()
 }
 
 fn file_state(m: &ThirdPartyModel) -> &'static str {
@@ -136,13 +151,14 @@ fn file_state(m: &ThirdPartyModel) -> &'static str {
 }
 
 fn list() -> ExitCode {
-    let enabled = enabled_name();
     println!("Third-party models irlume has MEASURED but does not ship or warrant.");
     println!("Nothing is listed here that was not measured on real hardware");
-    println!("(docs/pad-results/, docs/THIRD-PARTY-MODELS.md).");
+    println!("(docs/pad-results/, docs/recognition-results/, docs/THIRD-PARTY-MODELS.md).");
     println!();
     for m in thirdparty::CATALOG {
-        let state = if enabled.as_deref() == Some(m.name) {
+        let enabled_here =
+            enabled_name_for(thirdparty::settings_key_for(m.stage)).as_deref() == Some(m.name);
+        let state = if enabled_here {
             format!("ENABLED ({})", file_state(m))
         } else {
             "disabled".into()
@@ -159,10 +175,7 @@ fn list() -> ExitCode {
                 " (NOT OPEN to third-party models yet, #276)"
             }
         );
-        println!(
-            "    role:       deny-only liveness cue, threshold {}",
-            m.threshold
-        );
+        println!("    role:       {}", role_line(m));
         println!("    measured:   {}", m.summary);
         println!(
             "    obtain:     {}",
@@ -176,11 +189,40 @@ fn list() -> ExitCode {
         );
     }
     println!();
-    match enabled {
-        Some(n) => println!("enabled: {n} · disable with: sudo irlume models disable"),
-        None => println!("none enabled · see the 'obtain' line above for each model"),
+    let enabled = enabled_entries();
+    if enabled.is_empty() {
+        println!("none enabled · see the 'obtain' line above for each model");
+    } else {
+        for (m, _) in &enabled {
+            println!(
+                "enabled: {} ({}) · disable with: sudo irlume models disable {}",
+                m.name,
+                m.stage.as_str(),
+                m.name
+            );
+        }
     }
     ExitCode::SUCCESS
+}
+
+/// One line saying what enabling this entry DOES, per stage. Shown in the
+/// listing and in the consent prompts, because "what happens when I say yes"
+/// is the one thing those must not be vague about.
+fn role_line(m: &ThirdPartyModel) -> String {
+    use irlume_common::thirdparty::Stage;
+    match m.stage {
+        Stage::Pad => format!("deny-only liveness cue, threshold {}", m.threshold),
+        Stage::Recognition => format!(
+            "REPLACES the recognizer for RGB matching (measured threshold {}); \
+             IR matching, fusion and dark login are disabled (unmeasured for \
+             this model), and templates enrolled under another recognizer will \
+             not match — re-enroll after enabling",
+            m.threshold
+        ),
+        Stage::Detection | Stage::Landmarks => {
+            format!("(stage not open) threshold {}", m.threshold)
+        }
+    }
 }
 
 fn enable(name: Option<&str>) -> ExitCode {
@@ -236,9 +278,7 @@ fn enable(name: Option<&str>) -> ExitCode {
     println!("  license:    {}", m.license);
     println!("  provenance: {}", m.provenance);
     println!("  measured:   {}", m.summary);
-    println!("  effect:     adds a DENY-ONLY liveness cue on the lit IR frame; it can");
-    println!("              reject a presentation, it can never approve one the built-in");
-    println!("              gate rejected. False fires cost a retry or the password.");
+    println!("  effect:     {}", role_line(m));
     println!();
     println!("  irlume does not distribute these weights. They download now, once, from");
     println!("  the publisher's origin, and complying with the license above is on you.");
@@ -346,12 +386,22 @@ fn install_verified(m: &ThirdPartyModel, bytes: &[u8]) -> ExitCode {
     if !place_verified(m, bytes) {
         return ExitCode::FAILURE;
     }
-    restart_daemon();
+    if let Err(e) = restart_daemon() {
+        eprintln!("[models] settings were updated, but the daemon was NOT restarted: {e}");
+        eprintln!(
+            "[models] the running daemon still uses the previous model; do not enroll or \
+             authenticate until `sudo systemctl restart irlumed.service` succeeds"
+        );
+        return ExitCode::FAILURE;
+    }
     println!(
         "[models] '{}' enabled (sha256 verified) and the daemon restarted.",
         m.name
     );
-    println!("[models] check with: irlume doctor · disable with: sudo irlume models disable");
+    println!(
+        "[models] check with: irlume models · disable with: sudo irlume models disable {}",
+        m.name
+    );
     ExitCode::SUCCESS
 }
 
@@ -411,16 +461,40 @@ fn place_verified(m: &ThirdPartyModel, bytes: &[u8]) -> bool {
     true
 }
 
-fn disable() -> ExitCode {
+fn disable(name: Option<&str>) -> ExitCode {
     if !is_root() {
-        eprintln!("[models] needs root: sudo irlume models disable");
+        eprintln!("[models] needs root: sudo irlume models disable [name]");
         return ExitCode::FAILURE;
     }
-    let Some(name) = enabled_name() else {
-        println!("[models] no third-party model is enabled; nothing to do.");
-        return ExitCode::SUCCESS;
+    let enabled = enabled_entries();
+    let (m, key) = match (name, enabled.as_slice()) {
+        (_, []) => {
+            println!("[models] no third-party model is enabled; nothing to do.");
+            return ExitCode::SUCCESS;
+        }
+        // A name always selects, and must actually be enabled.
+        (Some(n), _) => match enabled.iter().find(|(m, _)| m.name == n) {
+            Some(&(m, key)) => (m, key),
+            None => {
+                eprintln!("[models] '{n}' is not enabled; `irlume models` lists what is");
+                return ExitCode::FAILURE;
+            }
+        },
+        // Bare `disable` keeps its old meaning while it is unambiguous.
+        (None, [(m, key)]) => (*m, *key),
+        (None, many) => {
+            eprintln!("[models] more than one model is enabled; name the one to disable:");
+            for (m, _) in many {
+                eprintln!("[models]   sudo irlume models disable {}", m.name);
+            }
+            return ExitCode::FAILURE;
+        }
     };
-    print!("Disable '{name}' and delete its weights? [y/N] ");
+    print!(
+        "Disable '{}' ({} stage) and delete its weights? [y/N] ",
+        m.name,
+        m.stage.as_str()
+    );
     let _ = std::io::stdout().flush();
     let mut yn = String::new();
     if std::io::stdin().lock().read_line(&mut yn).is_err()
@@ -429,26 +503,69 @@ fn disable() -> ExitCode {
         println!("[models] cancelled; nothing was changed.");
         return ExitCode::FAILURE;
     }
-    if let Some(m) = thirdparty::by_name(&name) {
-        match std::fs::remove_file(thirdparty::model_path(m)) {
-            Ok(()) | Err(_) => {} // absent is fine; the goal is "not on disk"
-        }
+    let path = thirdparty::model_path(m);
+    if let Err(e) = remove_weights(&path) {
+        eprintln!("[models] {e}; settings were not changed");
+        return ExitCode::FAILURE;
     }
     let _ = std::fs::remove_dir(thirdparty::dir()); // only if now empty
-    if let Err(e) = irlume_common::config::write_kv("settings.conf", thirdparty::SETTINGS_KEY, "") {
+    if let Err(e) = irlume_common::config::write_kv("settings.conf", key, "") {
         eprintln!("[models] weights deleted but settings.conf update failed: {e}");
         return ExitCode::FAILURE;
     }
-    restart_daemon();
-    println!("[models] '{name}' disabled: weights deleted, daemon back on the shipped stack.");
+    if let Err(e) = restart_daemon() {
+        eprintln!("[models] settings were updated, but the daemon was NOT restarted: {e}");
+        eprintln!(
+            "[models] the running daemon still uses '{}' until \
+             `sudo systemctl restart irlumed.service` succeeds",
+            m.name
+        );
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "[models] '{}' disabled: weights deleted, daemon back on the shipped stack.",
+        m.name
+    );
     ExitCode::SUCCESS
 }
 
-fn restart_daemon() {
-    let _ = Command::new("systemctl").arg("daemon-reload").status();
-    let _ = Command::new("systemctl")
+/// Restart the daemon so it picks up the changed selection, REPORTING failure.
+///
+/// Swallowing a failed restart here let the command claim a model change the
+/// running daemon had not made — and the enable path invites re-enrollment,
+/// which against the OLD recognizer writes templates the new one will refuse.
+fn restart_daemon() -> Result<(), String> {
+    let reload = Command::new("systemctl")
+        .arg("daemon-reload")
+        .status()
+        .map_err(|e| format!("could not execute systemctl daemon-reload: {e}"))?;
+    if !reload.success() {
+        return Err(format!(
+            "systemctl daemon-reload failed with status {reload}"
+        ));
+    }
+    let restart = Command::new("systemctl")
         .args(["try-restart", "irlumed.service"])
-        .status();
+        .status()
+        .map_err(|e| format!("could not execute systemctl try-restart: {e}"))?;
+    if !restart.success() {
+        return Err(format!(
+            "systemctl try-restart irlumed.service failed with status {restart}"
+        ));
+    }
+    Ok(())
+}
+
+/// Delete a weights file, where only GENUINE ABSENCE counts as success:
+/// any other error means the non-commercial weights are still on disk, and
+/// clearing the selection while claiming "deleted" would break the module's
+/// no-unwarranted-bits invariant precisely when the filesystem misbehaves.
+fn remove_weights(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("could not delete {}: {e}", path.display())),
+    }
 }
 
 fn stdin_is_tty() -> bool {
@@ -499,6 +616,9 @@ pub(crate) fn tui_state() -> TuiState {
 pub(crate) struct StageStatus {
     /// Stage name, machine-API vocabulary ([`irlume_common::thirdparty::Stage::as_str`]).
     pub stage: &'static str,
+    /// The stage itself, for callers that key policy (settings key, catalog
+    /// filtering) rather than display off it.
+    pub stage_kind: irlume_common::thirdparty::Stage,
     /// Whether the stage accepts third-party models today.
     pub open: bool,
     /// The shipped model file this stage runs, `None` for the PAD stage whose
@@ -538,6 +658,7 @@ pub(crate) fn stage_statuses() -> Vec<StageStatus> {
         .into_iter()
         .map(|(stage, file, env, required)| StageStatus {
             stage: stage.as_str(),
+            stage_kind: stage,
             open: stage.open(),
             file: Some(file),
             resolved: crate::commands::resolve_model_candidate(file, env),
@@ -546,6 +667,7 @@ pub(crate) fn stage_statuses() -> Vec<StageStatus> {
         .collect();
     out.push(StageStatus {
         stage: Stage::Pad.as_str(),
+        stage_kind: Stage::Pad,
         open: Stage::Pad.open(),
         file: None,
         resolved: None,
@@ -555,6 +677,26 @@ pub(crate) fn stage_statuses() -> Vec<StageStatus> {
 }
 
 pub fn doctor_line() -> String {
+    // Every enabled stage, not just PAD: with the recognition stage open, a
+    // doctor line saying "none" while a recognizer is selected would be the
+    // primary human diagnostic lying about authentication policy.
+    let enabled = enabled_entries();
+    if enabled.len() > 1
+        || matches!(enabled.first(), Some((m, _)) if m.stage != irlume_common::thirdparty::Stage::Pad)
+    {
+        return enabled
+            .iter()
+            .map(|(m, _)| {
+                format!(
+                    "{} enabled ({} stage; {})",
+                    m.name,
+                    m.stage.as_str(),
+                    file_state(m)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+    }
     if let Some(name) = enabled_name() {
         return match thirdparty::by_name(&name) {
             Some(m) => format!("{name} enabled ({}; deny-only cue)", file_state(m)),
@@ -654,7 +796,7 @@ mod tests {
         let mut closed = byo_fixture();
         closed.name = "fixture-closed";
         closed.file = "fixture-closed.onnx";
-        closed.stage = irlume_common::thirdparty::Stage::Recognition;
+        closed.stage = irlume_common::thirdparty::Stage::Detection;
         closed.sha256 = SHA;
         let refused = place_verified(&closed, bytes);
         let nothing_written = !thirdparty::model_path(&closed).exists();
@@ -745,7 +887,7 @@ mod tests {
         if let Some(c) = without_env {
             assert_eq!(c.origin, "shipped");
         }
-        // The four stages, in pipeline order, exactly one open (pad).
+        // The four stages, in pipeline order; recognition and pad open.
         let stages = stage_statuses();
         let names: Vec<&str> = stages.iter().map(|s| s.stage).collect();
         assert_eq!(names, ["detection", "landmarks", "recognition", "pad"]);
@@ -755,8 +897,157 @@ mod tests {
                 .filter(|s| s.open)
                 .map(|s| s.stage)
                 .collect::<Vec<_>>(),
-            ["pad"]
+            ["recognition", "pad"]
         );
+    }
+
+    #[test]
+    fn a_failed_daemon_restart_is_reported_not_swallowed() {
+        // The enable path invites re-enrollment after a model change; a
+        // swallowed restart failure means those templates are written by the
+        // OLD recognizer and refused by the new one. The command must report
+        // the failure, so both callers refuse to claim activation.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-sysd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+
+        let fake = |code: i32| {
+            std::fs::write(dir.join("systemctl"), format!("#!/bin/sh\nexit {code}\n")).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.join("systemctl"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        };
+        fake(1);
+        std::env::set_var("PATH", &dir);
+        let failed = restart_daemon();
+        fake(0);
+        let succeeded = restart_daemon();
+        std::env::set_var("PATH", &old_path);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let err = failed.expect_err("a nonzero systemctl must be reported");
+        assert!(err.contains("daemon-reload failed"), "got: {err}");
+        succeeded.expect("a zero systemctl must succeed");
+    }
+
+    #[test]
+    fn weight_deletion_refuses_anything_but_genuine_absence() {
+        let root = std::env::temp_dir().join(format!("irlume-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A real file deletes.
+        let f = root.join("w.onnx");
+        std::fs::write(&f, b"bytes").unwrap();
+        remove_weights(&f).expect("a real file must delete");
+        assert!(!f.exists());
+        // Genuine absence is success (the goal is "not on disk").
+        remove_weights(&f).expect("absence must count as deleted");
+        // A directory at the path is NOT absence: the bytes (or something
+        // else) are still there, and claiming deletion would be false.
+        let d = root.join("dir.onnx");
+        std::fs::create_dir(&d).unwrap();
+        let err = remove_weights(&d).expect_err("a directory must refuse");
+        assert!(err.contains("could not delete"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn doctor_line_reports_a_recognition_selection() {
+        // The primary human diagnostic must not say "none" while a
+        // recognizer is selected: that is authentication policy, not a cue.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("irlume-docrec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cfg, state) = (root.join("cfg"), root.join("state"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        let old_state = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+
+        std::fs::write(
+            cfg.join("settings.conf"),
+            "third_party_recognizer=buffalo\n",
+        )
+        .unwrap();
+        let line = doctor_line();
+
+        match old_cfg {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        match old_state {
+            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            line.contains("buffalo enabled (recognition stage"),
+            "got: {line}"
+        );
+    }
+
+    #[test]
+    fn role_lines_state_each_stages_real_effect() {
+        // The role line is the consent text: what saying yes DOES. A pad cue
+        // must say deny-only; a recognizer must say it REPLACES matching, that
+        // the IR side is off, and that re-enrollment is needed. Wrong text
+        // here is wrong consent.
+        let pad = thirdparty::by_name("flir").unwrap();
+        let line = role_line(pad);
+        assert!(line.contains("deny-only"), "got: {line}");
+        let rec = thirdparty::by_name("buffalo").unwrap();
+        let line = role_line(rec);
+        for needle in ["REPLACES", "IR matching", "re-enroll", "0.55"] {
+            assert!(line.contains(needle), "missing '{needle}' in: {line}");
+        }
+    }
+
+    #[test]
+    fn enabled_entries_pairs_each_entry_with_its_own_stage_key() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("irlume-enab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cfg = root.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
+
+        // Nothing enabled.
+        let none = enabled_entries();
+        // Both stages enabled at once: each entry must carry ITS key, because
+        // disable clears exactly the key it is handed.
+        std::fs::write(
+            cfg.join("settings.conf"),
+            "third_party_pad=flir\nthird_party_recognizer=buffalo\n",
+        )
+        .unwrap();
+        let both = enabled_entries();
+
+        match old_cfg {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(none.is_empty());
+        let got: Vec<(&str, &str)> = both.iter().map(|(m, k)| (m.name, *k)).collect();
+        assert!(got.contains(&("flir", thirdparty::SETTINGS_KEY)));
+        assert!(got.contains(&("buffalo", thirdparty::RECOGNIZER_SETTINGS_KEY)));
+        assert_eq!(got.len(), 2);
     }
 
     #[test]

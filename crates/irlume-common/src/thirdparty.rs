@@ -16,9 +16,12 @@
 //! A catalog entry is added only after the model is measured on real hardware
 //! against the published attack species (see docs/pad-results/). Every entry
 //! names its pipeline [`Stage`], and only an OPEN stage can be installed or
-//! wired; the one open stage today is PAD, whose entries the daemon wires as a
-//! DENY-ONLY cue: it may reject a presentation, it can never approve one the
-//! built-in gate rejected.
+//! wired. Two stages are open: PAD, whose entries the daemon wires as a
+//! DENY-ONLY cue (it may reject a presentation, never approve one the
+//! built-in gate rejected; measurements in docs/pad-results/), and
+//! RECOGNITION, whose entries replace the RGB matcher at their measured
+//! threshold with every IR matching path disabled (measurements in
+//! docs/recognition-results/).
 
 use std::path::{Path, PathBuf};
 
@@ -94,14 +97,15 @@ pub enum Stage {
     /// bad landmarks produce confident numbers from the wrong pixels rather
     /// than an error.
     Landmarks,
-    /// The recognizer/embedder. Not open, and gated harder than the wiring:
-    /// a recognition threshold is a false-accept rate over a population, which
-    /// one subject on two cameras cannot measure (#276 carries the protocol
-    /// question that must be answered first).
+    /// The recognizer/embedder. Open only for entries with a measured,
+    /// artifact-specific RGB threshold under the split-source protocol
+    /// (#276): population FAR from public datasets replayed through irlume's
+    /// own pipeline, live genuine floors on this project's cameras. A
+    /// third-party recognizer runs RGB-only; every IR matching path is
+    /// disabled because no entry carries IR-side measurements.
     Recognition,
-    /// Presentation-attack detection (liveness). The only open stage: entries
-    /// are wired as a DENY-ONLY cue, so the worst a bad model does is cost
-    /// retries or the password.
+    /// Presentation-attack detection (liveness). Open for deny-only cues, so
+    /// the worst a bad model does is cost retries or the password.
     Pad,
 }
 
@@ -120,9 +124,13 @@ impl Stage {
     ///
     /// The installer refuses to place weights for a closed stage and the
     /// daemon refuses to wire them, so adding a catalog entry can never outrun
-    /// the safety analysis that opens its stage.
+    /// the safety analysis that opens its stage. PAD opened first (deny-only
+    /// wiring); recognition opened 2026-08-05 with the split-source threshold
+    /// protocol and the stage-4 wiring (#276, #279) — its entries run
+    /// RGB-only, with IR matching, fusion, and dark login disabled because no
+    /// entry carries IR-side measurements.
     pub const fn open(self) -> bool {
-        matches!(self, Stage::Pad)
+        matches!(self, Stage::Pad | Stage::Recognition)
     }
 }
 
@@ -156,7 +164,9 @@ pub struct ThirdPartyModel {
     pub license: &'static str,
     /// Honest provenance status, shown before the user confirms.
     pub provenance: &'static str,
-    /// Decision threshold on the model's P(fake); measured basis in `summary`.
+    /// Decision threshold, in the stage's own unit: P(fake) for a PAD cue,
+    /// the RGB cosine match threshold for a recognizer. Measured basis in
+    /// `summary`.
     ///
     /// Set from where the two classes were actually MEASURED to sit, not from
     /// the publisher's default. A deny-only cue that fires in a score band
@@ -202,6 +212,37 @@ pub const CATALOG: &[ThirdPartyModel] = &[ThirdPartyModel {
               cameras). Genuine-side failures are mapped, not absent: dim \
               strobe frames and direct sun \
               (docs/pad-results/2026-07-17-third-party-pad-candidates.md)",
+},
+ThirdPartyModel {
+    name: "buffalo",
+    stage: Stage::Recognition,
+    file: "w600k_r50.onnx",
+    // Bring-your-own: the InsightFace model zoo licenses all models for
+    // non-commercial research use only, so obtaining the file is the user's
+    // decision. Extract w600k_r50.onnx from the publisher's official
+    // buffalo_l.zip (github.com/deepinsight/insightface, release v0.7) and
+    // install with `sudo irlume models add buffalo <path>`.
+    url: None,
+    sha256: "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43",
+    license: "non-commercial research only (InsightFace model zoo)",
+    provenance: "trained on WebFace600K, scraped from the web without subject \
+                 consent (fails ADR-0001 for shipping, which is why it is \
+                 bring-your-own)",
+    // 0.55, split-source protocol (#276): worst FairFace group 4.02e-4 there,
+    // parity with the shipped stack's worst group at its own operating point
+    // (AuraFace@0.55: 4.17e-4); LFW 4e-5, SFHQ 5.7e-5; live genuine floors
+    // 0.685 (Zenbook, side lamp) and 0.793 (BRIO) with production-shaped
+    // best-of-N clearing 0.55 at every frame where RGB detected at all. 0.60
+    // was REJECTED: its cross-condition margin measured zero (side-lamp
+    // production-shaped minimum 0.553). Do not raise this without re-running
+    // the floor sessions; do not lower it without re-running the FAR legs.
+    threshold: 0.55,
+    summary: "replacement RGB recognizer; measured 2026-08-05: LFW EER 3.9% vs \
+              shipped 4.2%; at the 0.55 operating point the demographic spread \
+              is 3.9x vs the shipped 6.1x with worst-group FAR at parity, and \
+              the worst-served group SHIFTS to Middle Eastern; RGB-only (IR \
+              matching, fusion and dark login disabled: unmeasured for this \
+              model) (docs/recognition-results/2026-08-05-buffalo-l.md)",
 }];
 
 /// Highest P(fake) a genuine face was measured at during qualification
@@ -295,18 +336,24 @@ mod tests {
             }
             assert!(m.threshold > 0.0 && m.threshold < 1.0);
             assert!(m.file.ends_with(".onnx"));
-            // Nothing forbids a closed-stage entry in the catalog (that is the
-            // point of the field), but today every entry is PAD; when that
-            // stops being true, delete this assertion and keep the installer
-            // and daemon refusals it documents.
+            // Every entry's stage must be open: a closed-stage entry cannot
+            // be installed or wired, so listing one would be documentation
+            // pretending to be a catalog. If a measured-but-unwirable entry
+            // is ever wanted, delete this and re-verify the refusals.
             assert!(
                 m.stage.open(),
                 "{}: a closed-stage entry landed; verify the install/wire refusals cover it",
                 m.name
             );
+            // The summary must cite the stage's own results directory.
+            let results_dir = match m.stage {
+                Stage::Pad => "docs/pad-results/",
+                Stage::Recognition => "docs/recognition-results/",
+                Stage::Detection | Stage::Landmarks => "docs/",
+            };
             assert!(
-                m.summary.contains("docs/pad-results/"),
-                "{}: summary must cite the measurement doc",
+                m.summary.contains(results_dir),
+                "{}: summary must cite its measurement doc under {results_dir}",
                 m.name
             );
         }
@@ -343,15 +390,16 @@ mod tests {
             recognizer_override(Some(&pad)).unwrap_err(),
             RecognizerRefusal::WrongStage("pad")
         );
-        // A recognition entry is refused while the stage is closed. When
-        // stage 4 opens (Stage::Recognition.open() flips), this arm changes to
-        // Ok — that flip and this test must land in the same commit as the
-        // first measured entry.
+        // The stage is open (flipped 2026-08-05 with the first measured
+        // entry), so a recognition entry resolves.
         let rec = fixture(Stage::Recognition);
+        assert_eq!(recognizer_override(Some(&rec)).unwrap().name, "fixture");
+        // And the real catalog entry resolves end to end.
         assert_eq!(
-            recognizer_override(Some(&rec)).unwrap_err(),
-            RecognizerRefusal::StageClosed
+            recognizer_override(by_name("buffalo")).unwrap().name,
+            "buffalo"
         );
+        assert_eq!(by_name("buffalo").unwrap().threshold, 0.55);
     }
 
     #[test]
@@ -370,12 +418,14 @@ mod tests {
     }
 
     #[test]
-    fn only_the_pad_stage_is_open() {
-        // The stage gate for #276: PAD is deny-only and open; the grant-capable
-        // and cue-feeding stages are named but closed. Opening one is a
-        // deliberate act that must change this test alongside the wiring.
+    fn open_stages_are_pad_and_recognition_only() {
+        // The stage gate for #276: PAD opened first (deny-only), recognition
+        // opened 2026-08-05 with the measured protocol and the #279 wiring.
+        // The cue-feeding stages stay closed. Opening one is a deliberate act
+        // that must change this test alongside the wiring.
         assert!(Stage::Pad.open());
-        for closed in [Stage::Detection, Stage::Landmarks, Stage::Recognition] {
+        assert!(Stage::Recognition.open());
+        for closed in [Stage::Detection, Stage::Landmarks] {
             assert!(!closed.open(), "{} must stay closed", closed.as_str());
         }
         // as_str is machine-API vocabulary: lowercase, stable.
