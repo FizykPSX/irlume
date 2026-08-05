@@ -34,15 +34,23 @@ pub const SETTINGS_KEY: &str = "third_party_pad";
 /// stages are open at once.
 pub const RECOGNIZER_SETTINGS_KEY: &str = "third_party_recognizer";
 
+/// `settings.conf` key naming the enabled third-party DETECTOR (absent/empty
+/// = the shipped YuNet + short-range rescue). A detection entry replaces the
+/// RESCUE slot only: YuNet stays primary, and the third-party model runs
+/// when YuNet finds no face, which is the deny-safe seat (a rescue failure
+/// is a non-detection, never a grant).
+pub const DETECTOR_SETTINGS_KEY: &str = "third_party_detector";
+
 /// The stage-appropriate settings key for a catalog entry.
 pub const fn settings_key_for(stage: Stage) -> &'static str {
     match stage {
         Stage::Pad => SETTINGS_KEY,
         Stage::Recognition => RECOGNIZER_SETTINGS_KEY,
+        Stage::Detection => DETECTOR_SETTINGS_KEY,
         // No key exists for stages with no wiring; the installer refuses
         // closed stages long before this matters, and giving them a real key
         // here would silently enable whatever wiring later reads it.
-        Stage::Detection | Stage::Landmarks => "third_party_unwired",
+        Stage::Landmarks => "third_party_unwired",
     }
 }
 
@@ -66,13 +74,32 @@ pub enum RecognizerRefusal {
 pub fn recognizer_override(
     entry: Option<&ThirdPartyModel>,
 ) -> Result<&ThirdPartyModel, RecognizerRefusal> {
+    stage_override(entry, Stage::Recognition)
+}
+
+/// [`recognizer_override`] for the detection stage: may this entry be wired
+/// as the RESCUE detector?
+pub fn detector_override(
+    entry: Option<&ThirdPartyModel>,
+) -> Result<&ThirdPartyModel, RecognizerRefusal> {
+    stage_override(entry, Stage::Detection)
+}
+
+/// The shared decision behind the per-stage overrides: catalog membership,
+/// the right stage, and that stage actually open. Pure for the same reason
+/// as ever; the per-stage wrappers exist so a call site cannot pass the
+/// wrong stage for the slot it is wiring.
+fn stage_override(
+    entry: Option<&ThirdPartyModel>,
+    want: Stage,
+) -> Result<&ThirdPartyModel, RecognizerRefusal> {
     let Some(entry) = entry else {
         return Err(RecognizerRefusal::NotInCatalog);
     };
-    if entry.stage != Stage::Recognition {
+    if entry.stage != want {
         return Err(RecognizerRefusal::WrongStage(entry.stage.as_str()));
     }
-    if !Stage::Recognition.open() {
+    if !want.open() {
         return Err(RecognizerRefusal::StageClosed);
     }
     Ok(entry)
@@ -129,6 +156,22 @@ impl Stage {
     /// protocol and the stage-4 wiring (#276, #279) — its entries run
     /// RGB-only, with IR matching, fusion, and dark login disabled because no
     /// entry carries IR-side measurements.
+    /// Detection STAYS CLOSED, and the 2026-08-05 measurement is why the
+    /// reason is now specific rather than absent. That corpus (512 frames,
+    /// docs/pad-results/2026-08-05-fullrange-threshold.md) established an
+    /// operating point for full-range BlazeFace: at 0.55, 61 of 291
+    /// exposure-usable genuine frames fall below threshold and the highest
+    /// empty-scene score is 0.5293, 0.0207 under it.
+    ///
+    /// It does NOT establish authentication safety, because the rescue slot
+    /// is GRANT-CAPABLE: `rescue_detect` fills `rgb_top` when YuNet finds
+    /// nothing, and that box is aligned, embedded, matched, and can reach a
+    /// grant (#299 review corrected the opposite claim). A detector that
+    /// accepts presentations YuNet declines therefore widens the path the
+    /// daemon already warns about, that the built-in gate does not stop a
+    /// life-size print without the opt-in PAD cue. Opening this stage needs
+    /// an end-to-end corpus of prints, screens, and other faces measured on
+    /// frames where YuNet returns nothing.
     pub const fn open(self) -> bool {
         matches!(self, Stage::Pad | Stage::Recognition)
     }
@@ -335,7 +378,15 @@ mod tests {
                 );
             }
             assert!(m.threshold > 0.0 && m.threshold < 1.0);
-            assert!(m.file.ends_with(".onnx"));
+            // Two runtimes exist since #295: ONNX entries run on
+            // onnxruntime, .tflite entries unconverted on the bundled TFLite
+            // runtime. Anything else has no loader and must not be listed.
+            assert!(
+                m.file.ends_with(".onnx") || m.file.ends_with(".tflite"),
+                "{}: no runtime loads '{}'",
+                m.name,
+                m.file
+            );
             // Every entry's stage must be open: a closed-stage entry cannot
             // be installed or wired, so listing one would be documentation
             // pretending to be a catalog. If a measured-but-unwirable entry
@@ -363,6 +414,44 @@ mod tests {
     fn lookup_by_name() {
         assert!(by_name("flir").is_some());
         assert!(by_name("nope").is_none());
+    }
+
+    #[test]
+    fn detector_override_refuses_everything_but_an_open_detection_entry() {
+        use super::*;
+        assert_eq!(
+            detector_override(None).unwrap_err(),
+            RecognizerRefusal::NotInCatalog
+        );
+        let pad = by_name("flir");
+        assert_eq!(
+            detector_override(pad).unwrap_err(),
+            RecognizerRefusal::WrongStage("pad")
+        );
+        // No catalog entry has the detection stage while it is closed, so
+        // the open-stage arm is exercised with a fixture: the wiring is
+        // dormant, not absent, and this pins the refusal that keeps it so.
+        let mut fixture = ThirdPartyModel {
+            name: "fixture-det",
+            stage: Stage::Detection,
+            file: "fixture-det.tflite",
+            url: None,
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            license: "fixture",
+            provenance: "fixture",
+            threshold: 0.55,
+            summary: "fixture",
+        };
+        assert_eq!(
+            detector_override(Some(&fixture)).unwrap_err(),
+            RecognizerRefusal::StageClosed,
+            "a detection entry must be refused while the stage is closed"
+        );
+        fixture.stage = Stage::Pad;
+        assert_eq!(
+            detector_override(Some(&fixture)).unwrap_err(),
+            RecognizerRefusal::WrongStage("pad")
+        );
     }
 
     #[test]
@@ -419,9 +508,13 @@ mod tests {
 
     #[test]
     fn open_stages_are_pad_and_recognition_only() {
-        // The stage gate for #276: PAD opened first (deny-only), recognition
-        // opened 2026-08-05 with the measured protocol and the #279 wiring.
-        // The cue-feeding stages stay closed. Opening one is a deliberate act
+        // The stage gate for #276/#295: PAD opened first (deny-only),
+        // recognition 2026-08-05 with the measured split-source protocol.
+        // DETECTION STAYS CLOSED even though its candidate is measured and
+        // its wiring exists: the rescue slot feeds the grant path, so an
+        // operating-point corpus of genuine and empty frames is not the
+        // evidence that stage needs (#299 review). Landmarks stays closed
+        // for the cue-feeding reason. Opening a stage is a deliberate act
         // that must change this test alongside the wiring.
         assert!(Stage::Pad.open());
         assert!(Stage::Recognition.open());

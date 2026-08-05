@@ -268,7 +268,14 @@ fn role_line(m: &ThirdPartyModel) -> String {
              not match — re-enroll after enabling",
             m.threshold
         ),
-        Stage::Detection | Stage::Landmarks => {
+        Stage::Detection => format!(
+            "REPLACES the RESCUE detector only (YuNet stays primary; measured \
+             threshold {}); runs its published .tflite unconverted on the \
+             bundled TFLite runtime, and the daemon refuses to start if that \
+             runtime is missing while this is enabled",
+            m.threshold
+        ),
+        Stage::Landmarks => {
             format!("(stage not open) threshold {}", m.threshold)
         }
     }
@@ -929,7 +936,9 @@ mod tests {
         let mut closed = byo_fixture();
         closed.name = "fixture-closed";
         closed.file = "fixture-closed.onnx";
-        closed.stage = irlume_common::thirdparty::Stage::Detection;
+        // Landmarks is the one still-closed stage since detection opened
+        // (#295 stage 3); the gate under test is the same.
+        closed.stage = irlume_common::thirdparty::Stage::Landmarks;
         closed.sha256 = SHA;
         let refused = place_verified(&closed, bytes);
         let nothing_written = !thirdparty::model_path(&closed).exists();
@@ -1148,6 +1157,17 @@ mod tests {
         // must say deny-only; a recognizer must say it REPLACES matching, that
         // the IR side is off, and that re-enrollment is needed. Wrong text
         // here is wrong consent.
+        // Detection has no catalog entry while the stage is closed (#299),
+        // so its consent text is pinned with a fixture: the wiring is
+        // dormant, and the text must be right the day an entry lands.
+        let mut det = byo_fixture();
+        det.stage = irlume_common::thirdparty::Stage::Detection;
+        det.threshold = 0.55;
+        let dl = role_line(&det);
+        assert!(
+            dl.contains("RESCUE") && dl.contains("YuNet stays primary") && dl.contains("0.55"),
+            "detection consent text must state the rescue-only seat: {dl}"
+        );
         let pad = thirdparty::by_name("flir").unwrap();
         let line = role_line(pad);
         assert!(line.contains("deny-only"), "got: {line}");

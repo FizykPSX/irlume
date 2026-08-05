@@ -131,6 +131,29 @@ measured 2026-08-05 under the split-source threshold protocol
 sudo irlume models add buffalo /path/to/w600k_r50.onnx
 ```
 
+### full-range BlazeFace: measured, not yet enableable (detection stage)
+
+Google's MediaPipe full-range BlazeFace is measured and its runtime support
+is shipped, but it is **not a catalog entry yet** and the detection stage
+remains closed, so it cannot be enabled.
+
+- **Measured:** 100% detection on every segment of the two-camera stage-3
+  corpus through Google's own runtime, including all far-IR frames the
+  shipped short-range rescue misses at 0%; irlume's decoder holds 0.9354
+  mean IoU parity against that runtime
+  ([bench](pad-results/2026-08-05-stage3-live-detection-bench.md)). Its
+  operating point measured through irlume's pipeline is 0.55
+  ([threshold record](pad-results/2026-08-05-fullrange-threshold.md)).
+- **Why it is not enableable:** the slot it would occupy, the detection
+  rescue, feeds the grant path: a box it supplies where YuNet found nothing
+  is aligned, matched, and can authenticate. The measurement covers genuine
+  frames and empty rooms, not prints, screens, or other faces on the frames
+  where the rescue actually fires. Until that evidence exists, opening the
+  stage would rest on the wrong corpus.
+- **Provenance:** the model card (read 2026-08-05) licenses the weights
+  Apache-2.0 and states consented first-party training data, in-scope to
+  5 meters.
+
 Whether a given licence permits **your** use of a model is your determination.
 irlume prints the licence before enabling anything and distributes no weights.
 
