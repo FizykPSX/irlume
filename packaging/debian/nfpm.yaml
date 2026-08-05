@@ -26,6 +26,9 @@ depends:
   # installing binaries that die at runtime with a GLIBC version error.
   # build-deb.sh asserts the binaries' real floor stays within this declaration.
   - libc6 (>= 2.35)
+  # The bundled TFLite runtime is C++; its GLIBCXX floor is asserted by
+  # build-deb.sh against the GCC-12-era baseline of the declared systems.
+  - libstdc++6
   - libpam0g
   - libtss2-esys-3.0.2-0 | libtss2-esys-3.0.2-0t64
   # tctildr is the TCTI loader the binary links directly; it is NOT pulled in
@@ -62,6 +65,15 @@ contents:
   # Bundled onnxruntime (>=1.24) staged by build-deb.sh
   - src: ../../.deb-staging/onnxruntime/lib/
     dst: /opt/irlume/onnxruntime/lib/
+  # Bundled TFLite C runtime staged by build-deb.sh (#295); the daemon's
+  # resolver probes /usr/share/irlume/tflite, so it ships at the probed path
+  # rather than /opt.
+  - src: ../../.deb-staging/tflite/lib/libtensorflowlite_c.so
+    dst: /usr/share/irlume/tflite/libtensorflowlite_c.so
+  - src: ../../.deb-staging/tflite/LICENSE.tensorflow
+    dst: /usr/share/irlume/tflite/LICENSE.tensorflow
+  - src: ../../.deb-staging/tflite/PROVENANCE
+    dst: /usr/share/irlume/tflite/PROVENANCE
   # systemd unit + an override pointing ORT at the bundled lib
   - src: ../systemd/irlumed.service
     dst: /usr/lib/systemd/system/irlumed.service
