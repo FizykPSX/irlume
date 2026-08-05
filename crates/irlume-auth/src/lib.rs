@@ -1540,16 +1540,18 @@ impl Engine {
             let (mut cx, mut cy, mut fsize, mut contrast) = (0.0, 0.0, 0.0, 0.0);
             let faces = self.det.detect(&view)?;
             if let Some(t) = top_detection(&faces) {
-                let lm = mesh.landmarks(&view, &t.bbox, 0.25)?;
-                let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
-                let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
-                ear = Some(l.min(r));
                 cx = (t.bbox[0] + t.bbox[2]) * 0.5;
                 cy = (t.bbox[1] + t.bbox[3]) * 0.5;
                 fsize = (t.bbox[2] - t.bbox[0]).max(0.0);
-                // Corneal specular contrast from the IR frame at the eye
-                // landmarks (the second liveness cue: collapses on a real blink).
-                contrast = eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
+                // A mesh refusal is one MISSING observation (ear stays None),
+                // never an abort: `?` here turned a single refused frame into
+                // the loss of the whole capture window.
+                if let Some(e) = irlume_vision::mesh_min_ear(mesh, &view, &t.bbox) {
+                    ear = Some(e);
+                    // Corneal specular contrast from the IR frame at the eye
+                    // landmarks (the second liveness cue: collapses on a real blink).
+                    contrast = eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
+                }
             }
             out.push(irlume_liveness::EarSample {
                 idx: i,
@@ -1629,11 +1631,13 @@ impl Engine {
             cy = (t.bbox[1] + t.bbox[3]) * 0.5;
             fsize = (t.bbox[2] - t.bbox[0]).max(0.0);
             if let Some(mesh) = self.mesh.as_mut() {
-                let lm = mesh.landmarks(&view, &t.bbox, 0.25)?;
-                let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
-                let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
-                ear = Some(l.min(r));
-                contrast = eye_glint_contrast(&frame.data, frame.width, frame.height, &t.landmarks);
+                // Same missing-observation rule as capture_ear_samples: a
+                // refused frame costs one EAR reading, not the consent watch.
+                if let Some(e) = irlume_vision::mesh_min_ear(mesh, &view, &t.bbox) {
+                    ear = Some(e);
+                    contrast =
+                        eye_glint_contrast(&frame.data, frame.width, frame.height, &t.landmarks);
+                }
             }
         }
         Ok((
@@ -3336,6 +3340,17 @@ pub fn both_eyes_open(grey: &[u8], w: u32, h: u32, lm: &irlume_vision::Landmarks
     if grey.len() < (w as usize).saturating_mul(h as usize) {
         return false;
     }
+    // A NaN eye coordinate saturates to pixel (0,0) at the cast below, so a
+    // broken landmark source would have this gate reading the frame corner as
+    // an open eye (measured in examples/landmark_failure_probe.rs: a corner
+    // hotspot answered `true`). Eyes we cannot place are eyes we cannot
+    // verify: fail closed.
+    if !lm[0..2]
+        .iter()
+        .all(|&(x, y)| x.is_finite() && y.is_finite())
+    {
+        return false;
+    }
     let iod = ((lm[1].0 - lm[0].0).powi(2) + (lm[1].1 - lm[0].1).powi(2)).sqrt();
     let r = (iod * 0.20).max(2.0) as i32;
     eye_open_at(grey, w, h, lm[0], r) && eye_open_at(grey, w, h, lm[1], r)
@@ -3549,6 +3564,16 @@ pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
     if grey.len() < (w as usize).saturating_mul(h as usize) {
         return 0.0;
     }
+    // NaN saturates to (0,0) at the casts below, and a landmark set with ONE
+    // unplaceable eye is a set the producer got wrong, not half a
+    // measurement: score 0.0 for the whole set rather than letting the valid
+    // eye vouch for it (#293 review; skipping per eye left that hole).
+    if !landmarks[0..2]
+        .iter()
+        .all(|&(x, y)| x.is_finite() && y.is_finite())
+    {
+        return 0.0;
+    }
     let mut peak = 0u8;
     for &(ex, ey) in &landmarks[0..2] {
         let r = GLINT_SEARCH_RADIUS_PX;
@@ -3576,6 +3601,15 @@ pub fn eye_glint_contrast(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -
     // See eye_glint: guard the w*h invariant so a truncated IR frame returns 0.0
     // (flat contrast, fail-closed) rather than indexing past the slice.
     if grey.len() < (w as usize).saturating_mul(h as usize) {
+        return 0.0;
+    }
+    // Whole-set rule, same as eye_glint: one unplaceable eye means the set's
+    // producer got it wrong, and `.max()` over the two eyes would let the
+    // valid one vouch for it (#293 review).
+    if !landmarks[0..2]
+        .iter()
+        .all(|&(x, y)| x.is_finite() && y.is_finite())
+    {
         return 0.0;
     }
     let iod = ((landmarks[1].0 - landmarks[0].0).powi(2)
@@ -4852,6 +4886,47 @@ mod tests {
         // Landmarks fully outside the frame: nothing sampled, peak 0.
         let far: Landmarks5 = [(-500.0, -500.0); 5];
         assert_eq!(eye_glint(&grey, 64, 48, &far), 0.0);
+    }
+
+    #[test]
+    fn nan_landmarks_never_read_the_frame_corner_as_an_eye() {
+        // Rust's saturating float→int cast turns NaN into 0, so before the
+        // finite guards a NaN eye sampled pixel (0,0). With a bright corner
+        // (emitter bloom is a realistic stand-in) the probe measured
+        // eye_glint=255 and both_eyes_open=TRUE from landmarks that do not
+        // exist. All three cues must fail closed instead.
+        let (mut grey, _) = ir_frame_with_glints(false, false);
+        // A SPIKE over darker neighbors, not a uniform block: the contrast
+        // cue is peak minus local mean, so a uniform corner reads 0.0 with or
+        // without the guard and the assertion below would not discriminate
+        // (the mutant that removes the guard survived exactly that way).
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                grey[(y * 64 + x) as usize] = 60;
+            }
+        }
+        grey[0] = 255;
+        let nan: Landmarks5 = [(f32::NAN, f32::NAN); 5];
+        assert_eq!(eye_glint(&grey, 64, 48, &nan), 0.0);
+        assert_eq!(eye_glint_contrast(&grey, 64, 48, &nan), 0.0);
+        assert!(!both_eyes_open(&grey, 64, 48, &nan));
+        // One placeable eye is still not both eyes, and the glint helpers
+        // score the whole set 0.0 rather than letting the valid eye vouch
+        // for a set whose producer emitted a non-finite point (#293 review:
+        // per-eye skipping let a bright valid eye carry the score). The
+        // placeable eye sits ON a bright disk so the unguarded value is
+        // provably nonzero.
+        let (mut bright, lm) = ir_frame_with_glints(true, true);
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                bright[(y * 64 + x) as usize] = 60;
+            }
+        }
+        bright[0] = 255;
+        let one: Landmarks5 = [lm[0], (f32::NAN, 20.0), lm[2], lm[3], lm[4]];
+        assert!(!both_eyes_open(&bright, 64, 48, &one));
+        assert_eq!(eye_glint(&bright, 64, 48, &one), 0.0);
+        assert_eq!(eye_glint_contrast(&bright, 64, 48, &one), 0.0);
     }
 
     #[test]

@@ -32,6 +32,21 @@ pub struct Detection {
     pub landmarks: Landmarks5,
 }
 
+/// A detection every consumer can do arithmetic on: finite box, score, and
+/// keypoints. Model output is untrusted numerics, and Rust's saturating
+/// float→int cast turns a NaN coordinate into pixel (0,0), so a NaN eye
+/// landmark makes the glint cues sample the frame corner as if it were an eye
+/// (measured: `examples/landmark_failure_probe.rs`, where it read a corner
+/// hotspot as an open eye). Dropped at the source, because guarding every
+/// consumer is the pattern that misses one.
+pub fn detection_is_finite(d: &Detection) -> bool {
+    d.bbox.iter().all(|v| v.is_finite())
+        && d.score.is_finite()
+        && d.landmarks
+            .iter()
+            .all(|&(x, y)| x.is_finite() && y.is_finite())
+}
+
 /// Approximate head orientation from the 5 landmarks, with no 3D model: a 2D
 /// heuristic for a frontality gate (Windows Hello uses a ±15° head-orientation
 /// step). It rejects clearly off-angle presentations; it is *not* degree-
@@ -81,6 +96,38 @@ pub fn head_pose(lm: &Landmarks5) -> HeadPose {
         yaw_asym,
         yaw_signed,
         pitch_frac,
+    }
+}
+
+#[cfg(test)]
+mod detection_finite_tests {
+    use super::*;
+
+    #[test]
+    fn one_non_finite_field_anywhere_disqualifies_a_detection() {
+        let good = Detection {
+            bbox: [10.0, 10.0, 60.0, 70.0],
+            score: 0.9,
+            landmarks: [
+                (20.0, 30.0),
+                (50.0, 30.0),
+                (35.0, 45.0),
+                (25.0, 60.0),
+                (45.0, 60.0),
+            ],
+        };
+        assert!(detection_is_finite(&good));
+        let mut bad_box = good.clone();
+        bad_box.bbox[2] = f32::NAN;
+        assert!(!detection_is_finite(&bad_box));
+        let mut bad_score = good.clone();
+        bad_score.score = f32::INFINITY;
+        assert!(!detection_is_finite(&bad_score));
+        // The case that motivated the guard: finite box and score, one NaN
+        // eye. Downstream this samples pixel (0,0) as the eye.
+        let mut bad_eye = good.clone();
+        bad_eye.landmarks[1] = (f32::NAN, 30.0);
+        assert!(!detection_is_finite(&bad_eye));
     }
 }
 
@@ -530,12 +577,23 @@ mod onnx {
         /// (fraction of the box size added on each side; MediaPipe uses ~0.25).
         /// Returns the 468 landmarks as `(x, y)` in ORIGINAL FRAME pixel coords.
         /// The crop is square and centered so aspect ratio is preserved.
+        ///
+        /// Errors when the box is not a meaningful face region
+        /// ([`mesh_box_valid`]) or the model's output fails the geometric
+        /// plausibility check ([`mesh_output_plausible`]). A refusal must
+        /// reach the cues as ABSENT landmarks, never abort a capture window:
+        /// the EAR pipelines consume it through [`mesh_min_ear`], and the
+        /// alignment refine through `.ok()`. A new caller that `?`s this
+        /// error re-creates the #293 defect (one refused frame costing the
+        /// whole consent watch).
         pub fn landmarks(
             &mut self,
             frame: &align::RgbView,
             bbox: &[f32; 4],
             margin: f32,
         ) -> irlume_common::Result<Vec<(f32, f32)>> {
+            mesh_box_valid(bbox, frame.width, frame.height)
+                .map_err(|why| err(format!("mesh refused detector box {bbox:?}: {why}")))?;
             // Square crop centered on the box, expanded by `margin` on each side.
             let (cx, cy) = ((bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5);
             let half = 0.5 * (bbox[2] - bbox[0]).max(bbox[3] - bbox[1]) * (1.0 + 2.0 * margin);
@@ -570,16 +628,150 @@ mod onnx {
             }
             let raw =
                 lm_raw.ok_or_else(|| err(format!("no {MESH_N}/{MESH_N_IRIS}-landmark output")))?;
-            let count = raw.len() / 3;
-            // Map input-space (0..side) coords back to the frame crop.
-            let mut out = Vec::with_capacity(count);
-            for k in 0..count {
-                let lx = raw[3 * k] / self.input as f32 * side + x0;
-                let ly = raw[3 * k + 1] / self.input as f32 * side + y0;
-                out.push((lx, ly));
-            }
-            Ok(out)
+            map_checked_mesh_output(&raw, self.input as f32, x0, y0, side)
+                .map_err(|why| err(format!("mesh output refused: {why}")))
         }
+    }
+
+    /// Map raw mesh output (x,y,z triples in the model's input space) into
+    /// frame coordinates, refusing output that fails
+    /// [`mesh_output_plausible`]. One function on purpose: the mapping is the
+    /// only way `landmarks()` gets its result, so the plausibility check
+    /// cannot be skipped without losing the coordinates themselves (the
+    /// pattern where a validation bolted on beside the data path quietly
+    /// stops being called).
+    pub fn map_checked_mesh_output(
+        raw: &[f32],
+        input: f32,
+        x0: f32,
+        y0: f32,
+        side: f32,
+    ) -> Result<Vec<(f32, f32)>, String> {
+        let count = raw.len() / 3;
+        // Map input-space (0..side) coords back to the frame crop.
+        let mut out = Vec::with_capacity(count);
+        for k in 0..count {
+            let lx = raw[3 * k] / input * side + x0;
+            let ly = raw[3 * k + 1] / input * side + y0;
+            out.push((lx, ly));
+        }
+        mesh_output_plausible(&out, x0, y0, side)?;
+        Ok(out)
+    }
+
+    /// The smaller of the two eye-aspect-ratios from a mesh run, or `None`
+    /// when the mesh refuses the detector box or its own output.
+    ///
+    /// `None` is a MISSING OBSERVATION, the per-frame fail-closed answer for
+    /// the EAR pipelines (`EarSample.ear = None`): the bounded capture window
+    /// continues and the stream consumers deny on absent eyes. The callers
+    /// used to propagate a mesh error with `?`, which was dormant while the
+    /// mesh could only fail on runtime errors; the validity refusals made it
+    /// live, so one refused frame aborted an entire consent watch instead of
+    /// costing one observation (#293 review). Returning `Option` here removes
+    /// the operator: a caller cannot re-introduce the abort without
+    /// reimplementing the mesh call.
+    pub fn mesh_min_ear(
+        mesh: &mut FaceMesh,
+        frame: &align::RgbView,
+        bbox: &[f32; 4],
+    ) -> Option<f32> {
+        let lm = mesh.landmarks(frame, bbox, 0.25).ok()?;
+        Some(eye_ear(&lm, &EAR_LEFT).min(eye_ear(&lm, &EAR_RIGHT)))
+    }
+
+    /// Is `bbox` a face region the mesh can meaningfully run on?
+    ///
+    /// These are validity bounds (is the request geometrically a region at
+    /// all), not tuned thresholds. Measured in
+    /// `examples/landmark_failure_probe.rs` before this gate existed: a
+    /// zero-area box returned 478 identical "landmarks", a NaN box returned
+    /// 478 NaN points, an inverted box placed every point outside its own
+    /// crop, and an off-frame box returned a full mesh of pure edge-clamp
+    /// smear; every one came back `Ok`. Each is a broken or hostile DETECTOR,
+    /// the stage #276 wants to open to third-party models, and the mesh
+    /// output built on one feeds the liveness cues as confident numbers.
+    pub fn mesh_box_valid(bbox: &[f32; 4], frame_w: u32, frame_h: u32) -> Result<(), String> {
+        if !bbox.iter().all(|v| v.is_finite()) {
+            return Err("non-finite coordinates".into());
+        }
+        let (w, h) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
+        if w <= 0.0 || h <= 0.0 {
+            return Err("not a positive-area region".into());
+        }
+        if bbox[2] <= 0.0
+            || bbox[3] <= 0.0
+            || bbox[0] >= frame_w as f32
+            || bbox[1] >= frame_h as f32
+        {
+            return Err("no overlap with the frame".into());
+        }
+        // A face reported larger than the frame that contains it is a broken
+        // detector, not a face. 4x leaves room for a face partly out of frame
+        // plus the crop margins.
+        if w * h > 4.0 * frame_w as f32 * frame_h as f32 {
+            return Err("area exceeds 4x the frame".into());
+        }
+        Ok(())
+    }
+
+    /// Does the mesh's mapped output describe a face-shaped point set?
+    ///
+    /// The mesh emits coordinates in its own input space, which the caller
+    /// maps into the sampled square (`x0..x0+side`), so a healthy model
+    /// CANNOT leave that square: out-of-crop points mean the model is not
+    /// honoring its own input contract (a broken conversion, or a swapped-in
+    /// model with a different output convention). The 25% slop absorbs
+    /// benign overshoot at the crop border without admitting a set that
+    /// mostly lives elsewhere. Non-finite output is a broken op in a
+    /// converted model, and a collapsed extent is a stuck output head; both
+    /// were observed as `Ok` before this gate (see the probe example).
+    pub fn mesh_output_plausible(
+        lm: &[(f32, f32)],
+        x0: f32,
+        y0: f32,
+        side: f32,
+    ) -> Result<(), String> {
+        if !lm.iter().all(|&(x, y)| x.is_finite() && y.is_finite()) {
+            return Err("non-finite landmarks".into());
+        }
+        let slop = side * 0.25;
+        let inside = lm
+            .iter()
+            .filter(|&&(x, y)| {
+                (x0 - slop..=x0 + side + slop).contains(&x)
+                    && (y0 - slop..=y0 + side + slop).contains(&y)
+            })
+            .count();
+        if inside * 2 < lm.len() {
+            return Err(format!(
+                "only {inside}/{} landmarks inside the sampled crop",
+                lm.len()
+            ));
+        }
+        // Collapse is judged on the CENTRAL 80% span, not the extrema: with
+        // min/max, one stray point vouches for 477 stuck ones, and "a stuck
+        // output head plus one corrupt value" is a realistic combination of
+        // the pathologies this gate exists for (#293 review). Requiring the
+        // bulk of the points to spread keeps a single outlier from carrying
+        // the check. The 2px floor is unchanged: validity, not a tuned
+        // threshold, and far below any genuine face (the shipped mesh spans
+        // >100px on a face-sized crop).
+        let central_span = |mut v: Vec<f32>| -> f32 {
+            v.sort_by(f32::total_cmp);
+            let lo = v.len() / 10;
+            let hi = v.len().saturating_sub(1 + lo);
+            if hi <= lo {
+                return 0.0;
+            }
+            v[hi] - v[lo]
+        };
+        let xs: Vec<f32> = lm.iter().map(|&(x, _)| x).collect();
+        let ys: Vec<f32> = lm.iter().map(|&(_, y)| y).collect();
+        if central_span(xs) < 2.0 || central_span(ys) < 2.0 {
+            return Err("landmarks collapsed to a point".into());
+        }
+        Ok(())
     }
 
     /// 6-point eye-aspect-ratio landmark indices (MediaPipe 468 topology): the two
@@ -675,6 +867,11 @@ mod onnx {
             for d in &mut dets {
                 unletterbox(d, scale);
             }
+            // A NaN score already fails the threshold comparison, but a NaN
+            // COORDINATE with a finite score survives decode and NMS, and one
+            // NaN landmark is enough to point a downstream cue at pixel (0,0)
+            // (see `detection_is_finite`).
+            dets.retain(crate::detection_is_finite);
             Ok(dets)
         }
     }
@@ -790,15 +987,19 @@ mod onnx {
             let scale = BLAZE_INPUT as f32;
             let (cx, cy) = (ax + r[0] / scale, ay + r[1] / scale);
             let (bw, bh) = (r[2] / scale, r[3] / scale);
-            Ok(Some((
-                [
-                    (cx - bw / 2.0) * side,
-                    (cy - bh / 2.0) * side,
-                    (cx + bw / 2.0) * side,
-                    (cy + bh / 2.0) * side,
-                ],
-                best_s,
-            )))
+            let bbox = [
+                (cx - bw / 2.0) * side,
+                (cy - bh / 2.0) * side,
+                (cx + bw / 2.0) * side,
+                (cy + bh / 2.0) * side,
+            ];
+            // A NaN regressor with a finite logit decodes into a NaN box that
+            // the mesh refine step would then sample. Same rule as the YuNet
+            // path's `detection_is_finite` retain: no face beats a non-face.
+            if !bbox.iter().all(|v| v.is_finite()) {
+                return Ok(None);
+            }
+            Ok(Some((bbox, best_s)))
         }
     }
 
@@ -954,6 +1155,117 @@ mod onnx {
     }
 
     #[cfg(test)]
+    mod landmark_sanity_tests {
+        use super::*;
+
+        #[test]
+        fn mesh_box_valid_refuses_each_pathology_by_its_own_reason() {
+            // Asserting the REASON, not just rejection: a later guard refusing
+            // the same input for a different reason must not silently take
+            // over a case (the #183 lesson).
+            let ok = [100.0, 80.0, 220.0, 240.0];
+            assert_eq!(mesh_box_valid(&ok, 400, 300), Ok(()));
+            // A face partly out of frame, box bigger than the frame: legal.
+            assert_eq!(
+                mesh_box_valid(&[-50.0, -50.0, 420.0, 330.0], 400, 300),
+                Ok(())
+            );
+            let reason = |b: &[f32; 4]| mesh_box_valid(b, 400, 300).unwrap_err();
+            assert_eq!(reason(&[f32::NAN; 4]), "non-finite coordinates");
+            assert_eq!(
+                reason(&[100.0, 80.0, f32::INFINITY, 240.0]),
+                "non-finite coordinates"
+            );
+            assert_eq!(
+                reason(&[160.0, 160.0, 160.0, 160.0]),
+                "not a positive-area region"
+            );
+            assert_eq!(
+                reason(&[220.0, 240.0, 100.0, 80.0]),
+                "not a positive-area region"
+            );
+            assert_eq!(
+                reason(&[-900.0, -900.0, -700.0, -700.0]),
+                "no overlap with the frame"
+            );
+            assert_eq!(
+                reason(&[500.0, 100.0, 600.0, 200.0]),
+                "no overlap with the frame"
+            );
+            assert_eq!(reason(&[-1e6, -1e6, 1e6, 1e6]), "area exceeds 4x the frame");
+        }
+
+        #[test]
+        fn mesh_output_plausible_separates_face_shapes_from_garbage() {
+            // A face-ish spread inside the (0,0)+200 crop.
+            let face: Vec<(f32, f32)> = (0..468)
+                .map(|i| (40.0 + (i % 24) as f32 * 5.0, 30.0 + (i / 24) as f32 * 7.0))
+                .collect();
+            assert_eq!(mesh_output_plausible(&face, 0.0, 0.0, 200.0), Ok(()));
+            let reason =
+                |lm: &[(f32, f32)]| mesh_output_plausible(lm, 0.0, 0.0, 200.0).unwrap_err();
+            let mut one_nan = face.clone();
+            one_nan[7] = (f32::NAN, 50.0);
+            assert_eq!(reason(&one_nan), "non-finite landmarks");
+            assert_eq!(
+                reason(&vec![(100.0, 100.0); 468]),
+                "landmarks collapsed to a point"
+            );
+            // One stray point must not vouch for 467 stuck ones: extrema-based
+            // extent accepted exactly this (#293 review), which is a stuck
+            // output head plus one corrupt value, and lets a model supply
+            // arbitrary values at the few indices the cues read.
+            let mut one_outlier = vec![(100.0, 100.0); 468];
+            one_outlier[0] = (103.0, 103.0);
+            assert_eq!(reason(&one_outlier), "landmarks collapsed to a point");
+            // Most points far outside the sampled square: the model is not
+            // honoring its own input space.
+            let outside: Vec<(f32, f32)> = (0..468)
+                .map(|i| (900.0 + (i % 24) as f32 * 5.0, 800.0 + (i / 24) as f32 * 7.0))
+                .collect();
+            assert!(reason(&outside).contains("inside the sampled crop"));
+            // Benign border overshoot within the 25% slop is NOT refused: a
+            // tilted chin can land just past the crop edge.
+            let mut overshoot = face.clone();
+            for p in overshoot.iter_mut().take(60) {
+                p.1 = 240.0; // past side=200, inside the 50px slop
+            }
+            assert_eq!(mesh_output_plausible(&overshoot, 0.0, 0.0, 200.0), Ok(()));
+        }
+
+        #[test]
+        fn raw_mesh_output_maps_or_refuses_as_one_operation() {
+            // 468 triples spread over the model's own input space map to a
+            // face-shaped set inside the crop.
+            let mut raw = Vec::with_capacity(468 * 3);
+            for i in 0..468 {
+                raw.extend([
+                    40.0 + (i % 24) as f32 * 5.0,
+                    30.0 + (i / 24) as f32 * 7.0,
+                    0.0,
+                ]);
+            }
+            let out = map_checked_mesh_output(&raw, 192.0, 10.0, 20.0, 300.0).expect("maps");
+            assert_eq!(out.len(), 468);
+            // First point: 40/192*300+10, 30/192*300+20.
+            assert!((out[0].0 - 72.5).abs() < 1e-3 && (out[0].1 - 66.875).abs() < 1e-3);
+            // A NaN raw value is refused by the same call that maps, so the
+            // check cannot be skipped without losing the mapping.
+            raw[9] = f32::NAN;
+            assert_eq!(
+                map_checked_mesh_output(&raw, 192.0, 10.0, 20.0, 300.0),
+                Err("non-finite landmarks".into())
+            );
+            // A model ignoring its input space (values far beyond `input`)
+            // lands outside the crop and is refused.
+            let wild: Vec<f32> = (0..468 * 3).map(|_| 1e5f32).collect();
+            assert!(map_checked_mesh_output(&wild, 192.0, 10.0, 20.0, 300.0)
+                .unwrap_err()
+                .contains("inside the sampled crop"));
+        }
+    }
+
+    #[cfg(test)]
     mod resolver_tests {
         use super::*;
         use std::ffi::OsStr;
@@ -996,8 +1308,9 @@ mod onnx {
 
 #[cfg(feature = "onnx")]
 pub use onnx::{
-    eye_ear, selftest_alignment_identity, Adapter, BlazeRescue, Detector, Embedder, FaceMesh,
-    PadIr, BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
+    eye_ear, mesh_box_valid, mesh_min_ear, mesh_output_plausible, selftest_alignment_identity,
+    Adapter, BlazeRescue, Detector, Embedder, FaceMesh, PadIr, BLAZE_SCORE_THRESHOLD, EAR_LEFT,
+    EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 
 /// Model-backed pipeline tests: run the REAL shipped ONNX models (fetched to
@@ -1223,6 +1536,70 @@ mod model_tests {
         // Determinism: same crop, same points.
         let again = m.landmarks(&view, &bbox, 0.25).expect("landmarks again");
         assert_eq!(lm, again);
+        // Headroom over the collapse gate's 2px central-span floor: even on a
+        // faceless gradient the real mesh spreads its central 80% far above
+        // it, so the validity bound cannot cost a genuine capture.
+        let mut xs: Vec<f32> = lm.iter().map(|&(x, _)| x).collect();
+        xs.sort_by(f32::total_cmp);
+        let span = xs[xs.len() - 1 - xs.len() / 10] - xs[xs.len() / 10];
+        assert!(span > 20.0, "central x-span {span} too close to the floor");
+    }
+
+    #[test]
+    fn a_refused_box_is_a_missing_ear_observation_not_an_error() {
+        // The EAR pipelines consume mesh refusals through `mesh_min_ear`,
+        // which has no error to propagate: one refused frame is one missing
+        // observation, never a lost capture window (#293 review found the
+        // old `?` callers turning the new refusals into authentication-stack
+        // errors).
+        let mut m = facemesh();
+        let (w, h) = (256u32, 256u32);
+        let frame = gradient_frame(w, h);
+        let view = align::RgbView {
+            data: &frame,
+            width: w,
+            height: h,
+        };
+        assert_eq!(mesh_min_ear(&mut m, &view, &[f32::NAN; 4]), None);
+        assert_eq!(
+            mesh_min_ear(&mut m, &view, &[-900.0, -900.0, -700.0, -700.0]),
+            None
+        );
+        // A nominal box still measures: Some, and finite.
+        let ear = mesh_min_ear(&mut m, &view, &[64.0, 64.0, 192.0, 192.0]);
+        assert!(matches!(ear, Some(e) if e.is_finite()), "{ear:?}");
+    }
+
+    #[test]
+    fn facemesh_refuses_garbage_detector_boxes_through_the_real_model() {
+        // The pure gates have their own unit tests; this pins the BOX-gate
+        // WIRING, so a refactor that drops that call from `landmarks()`
+        // fails here even though the gate functions still pass alone. (The
+        // OUTPUT gate's wiring is not pinned by a model test: the real mesh
+        // never emits implausible output. It is structural instead: the
+        // check lives inside `map_checked_mesh_output`, the only mapping
+        // implementation, so skipping it means reimplementing the mapping.)
+        let mut m = facemesh();
+        let (w, h) = (256u32, 256u32);
+        let frame = gradient_frame(w, h);
+        let view = align::RgbView {
+            data: &frame,
+            width: w,
+            height: h,
+        };
+        for bbox in [
+            [f32::NAN; 4],
+            [128.0, 128.0, 128.0, 128.0],
+            [-900.0, -900.0, -700.0, -700.0],
+        ] {
+            let e = m
+                .landmarks(&view, &bbox, 0.25)
+                .expect_err("garbage box must be refused");
+            assert!(
+                e.to_string().contains("mesh refused detector box"),
+                "wrong refusal for {bbox:?}: {e}"
+            );
+        }
     }
 
     #[test]
