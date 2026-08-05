@@ -2749,16 +2749,18 @@ impl Engine {
             self.rgb_threshold,
         )? {
             Some(target) => {
-                let have = enr
+                let room = enr
                     .profiles
                     .iter()
                     .find(|p| p.name == target)
-                    .map_or(0, |p| p.scans.len());
-                let room = MAX_SCANS_PER_PROFILE - have;
+                    .map_or(MAX_SCANS_PER_PROFILE, |p| {
+                        scan_room_in(p, &self.embed_space)
+                    });
                 if room == 0 {
                     return Err(irlume_common::Error::Protocol(format!(
                         "this face is already enrolled as '{target}', which is at the max \
-                         {MAX_SCANS_PER_PROFILE} scans; delete some of its scans first"
+                         {MAX_SCANS_PER_PROFILE} scans for the loaded recognizer; delete \
+                         some of its scans first"
                     )));
                 }
                 want.min(room)
@@ -2788,11 +2790,12 @@ impl Engine {
                 .iter()
                 .position(|p| p.name == target)
                 .expect("merge target came from these profiles");
-            let room = MAX_SCANS_PER_PROFILE - enr.profiles[idx].scans.len();
+            let room = scan_room_in(&enr.profiles[idx], &self.embed_space);
             if room == 0 {
                 return Err(irlume_common::Error::Protocol(format!(
                     "this face is already enrolled as '{target}', which is at the max \
-                     {MAX_SCANS_PER_PROFILE} scans; delete some of its scans first"
+                     {MAX_SCANS_PER_PROFILE} scans for the loaded recognizer; delete \
+                     some of its scans first"
                 )));
             }
             let added = captured.len().min(room);
@@ -2886,13 +2889,19 @@ impl Engine {
         None
     }
 
-    /// Add one scan to an existing profile ("improve recognition"). Errors if the
+    /// Add scans to an existing profile ("improve recognition"). Errors if the
     /// profile is missing or already at MAX_SCANS_PER_PROFILE.
+    /// Add `count` scans (at least one) to an existing profile, in the LOADED recognizer's
+    /// space. This is also how a profile gains templates for a second
+    /// recognizer without re-enrolling as a new person: the operator names
+    /// the profile, which is the only way the link can be made, since
+    /// comparing vectors across embedding spaces is meaningless (#288).
     pub fn add_scan(
         &mut self,
         user: &str,
         profile_name: &str,
-    ) -> irlume_common::Result<(String, usize)> {
+        count: usize,
+    ) -> irlume_common::Result<(Vec<String>, usize)> {
         use irlume_core::storage::{self, FaceScan, MAX_SCANS_PER_PROFILE};
         let mut enr = storage::load(user)?
             .ok_or_else(|| irlume_common::Error::Protocol(format!("'{user}' is not enrolled")))?;
@@ -2903,25 +2912,27 @@ impl Engine {
             .ok_or_else(|| {
                 irlume_common::Error::Protocol(format!("no face profile '{profile_name}'"))
             })?;
-        if enr.profiles[idx].scans.len() >= MAX_SCANS_PER_PROFILE {
+        // Counted for THIS recognizer: a profile holding another model's
+        // scans must still accept this one's, and the limit's false-accept
+        // rationale is about templates compared in one operation (#288).
+        let room = scan_room_in(&enr.profiles[idx], &self.embed_space);
+        if room == 0 {
             return Err(irlume_common::Error::Protocol(format!(
-                "'{profile_name}' already has the max {MAX_SCANS_PER_PROFILE} scans"
+                "'{profile_name}' already has the max {MAX_SCANS_PER_PROFILE} scans for the \
+                 loaded recognizer"
             )));
         }
-        let captured = self
-            .capture_scans(1, enr.pitch_neutral())?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                irlume_common::Error::Protocol(
-                    "no live scan captured; check lighting and framing".into(),
-                )
-            })?;
-        // Anti-mixing: reject a scan whose face belongs to a different profile.
-        if let Some((other, score)) = colliding_profile(
+        let want = count.clamp(1, room);
+        let captured = self.capture_scans(want, enr.pitch_neutral())?;
+        if let Some(why) = short_capture_refusal(captured.len(), want) {
+            return Err(irlume_common::Error::Protocol(why));
+        }
+        // Anti-mixing: reject scans whose face belongs to a different profile.
+        let rgbs: Vec<&[f32]> = captured.iter().map(|c| c.rgb.as_slice()).collect();
+        if let Some((other, score)) = foreign_owner_in_capture(
             &enr,
-            &captured.rgb,
-            Some(profile_name),
+            &rgbs,
+            profile_name,
             &self.embed_space,
             self.rgb_threshold,
         ) {
@@ -2929,7 +2940,7 @@ impl Engine {
                 .profiles
                 .iter()
                 .find(|p| p.name == other)
-                .map_or(0, |p| p.scans.len());
+                .map_or(0, |p| p.scans_in(&self.embed_space));
             let hint = if cnt < MAX_SCANS_PER_PROFILE {
                 format!("if you want this face, add the scan to '{other}' (it has {cnt}/{MAX_SCANS_PER_PROFILE})")
             } else {
@@ -2940,25 +2951,29 @@ impl Engine {
                  Scans of different faces can't be mixed in one profile."
             )));
         }
-        let sname = enr.profiles[idx].next_scan_name();
-        let ir_space = captured.ir.as_ref().map(|_| self.ir_space.clone());
-        enr.profiles[idx].scans.push(FaceScan {
-            name: sname.clone(),
-            rgb: captured.rgb,
-            ir: captured.ir,
-            ir_space,
-            embed_space: Some(self.embed_space.clone()),
-            ir_center_edge_ratio: captured.center_edge_ratio,
-            ir_brightness: captured.brightness,
-            pitch: captured.pitch,
-        });
+        let mut added = Vec::with_capacity(captured.len());
+        for c in captured {
+            let sname = enr.profiles[idx].next_scan_name();
+            let ir_space = c.ir.as_ref().map(|_| self.ir_space.clone());
+            enr.profiles[idx].scans.push(FaceScan {
+                name: sname.clone(),
+                rgb: c.rgb,
+                ir: c.ir,
+                ir_space,
+                embed_space: Some(self.embed_space.clone()),
+                ir_center_edge_ratio: c.center_edge_ratio,
+                ir_brightness: c.brightness,
+                pitch: c.pitch,
+            });
+            added.push(sname);
+        }
         self.refit_profile_calib(&mut enr.profiles[idx]);
         if enr.camera_binding.is_none() {
             enr.camera_binding = Some(self.current_binding());
         }
-        let total = enr.profiles[idx].scans.len();
+        let total = enr.profiles[idx].scans_in(&self.embed_space);
         storage::save(&enr)?;
-        Ok((sname, total))
+        Ok((added, total))
     }
 
     /// One framing-guide sample for guided enrollment: capture, detect, and
@@ -3219,6 +3234,53 @@ fn enroll_merge_target(
         }
     }
     Ok(hit)
+}
+
+/// Why a capture that came back short must be refused, or `None` when it is
+/// complete.
+///
+/// `capture_scans` is best-effort and may return fewer scans than asked for.
+/// A partial save would report success while leaving the recognizer
+/// under-enrolled, so the refusal happens before anything is written, exactly
+/// as enrollment does. A value because the capture it guards sits behind a
+/// camera, so this is the only shape a test can observe.
+fn short_capture_refusal(got: usize, want: usize) -> Option<String> {
+    (got < want).then(|| {
+        format!(
+            "only {got} live scans captured (need {want}); nothing was saved, check              lighting and framing"
+        )
+    })
+}
+
+/// How many more scans this profile may hold for `space`.
+///
+/// Saturating, and counted per recognizer: a profile may legally hold the
+/// limit under each of several recognizers (#288), so subtracting the total
+/// from the limit underflows once a second model's templates exist. Every
+/// site that decides room uses this one function, because the enroll merge
+/// path had two more subtractions that the first cut of the per-space change
+/// missed entirely.
+fn scan_room_in(profile: &irlume_core::storage::FaceProfile, space: &str) -> usize {
+    irlume_core::storage::MAX_SCANS_PER_PROFILE.saturating_sub(profile.scans_in(space))
+}
+
+/// The first captured scan whose face belongs to a DIFFERENT profile, if any.
+///
+/// Every capture is checked, not just the first, so a second person stepping
+/// into frame partway through an add-scan session is caught; the enroll path
+/// checks its whole capture for the same reason. Extracted as a value because
+/// the loop it guards sits behind a camera, so this is the only shape a test
+/// can observe.
+fn foreign_owner_in_capture(
+    enr: &irlume_core::storage::Enrollment,
+    captured_rgb: &[&[f32]],
+    exclude: &str,
+    embed_space: &str,
+    threshold: f32,
+) -> Option<(String, f32)> {
+    captured_rgb
+        .iter()
+        .find_map(|rgb| colliding_profile(enr, rgb, Some(exclude), embed_space, threshold))
 }
 
 /// Best-matching OTHER profile for `probe` (excluding `exclude`), if it reaches
@@ -4028,6 +4090,132 @@ mod tests {
             irlume_core::RGB_MATCH_THRESHOLD
         )
         .is_none());
+    }
+
+    #[test]
+    fn a_short_capture_is_refused_before_anything_is_saved() {
+        // capture_scans is best-effort, so a request for ten that yields one
+        // must refuse rather than save a partial set and report success
+        // (#290 review). The capture sits behind a camera, so the decision is
+        // the observable shape.
+        assert!(short_capture_refusal(3, 3).is_none());
+        assert!(short_capture_refusal(1, 1).is_none());
+        let why = short_capture_refusal(1, 10).expect("a short capture must refuse");
+        assert!(
+            why.contains("only 1 live scans captured (need 10)"),
+            "{why}"
+        );
+        assert!(
+            why.contains("nothing was saved"),
+            "the refusal must say the enrollment is unchanged: {why}"
+        );
+        // Zero is short too, which is the case that always refused.
+        assert!(short_capture_refusal(0, 1).is_some());
+    }
+
+    #[test]
+    fn room_is_counted_in_the_loaded_space_and_never_underflows() {
+        // The bug the per-space limit created: a profile may legally hold the
+        // limit under each of several recognizers, so subtracting the TOTAL
+        // from the limit underflows once a second model's templates exist,
+        // which panics a checked build and wraps to a huge room in release,
+        // bypassing the cap. The enroll merge path had two such subtractions
+        // (#290 review).
+        let mut profile = FaceProfile {
+            name: "P1".into(),
+            scans: Vec::new(),
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        };
+        profile.scans.extend(
+            (0..irlume_core::storage::MAX_SCANS_PER_PROFILE).map(|i| FaceScan {
+                embed_space: Some("embed:model-a".into()),
+                ..scan(vec![i as f32, 0.0, 0.0])
+            }),
+        );
+        profile.scans.extend((0..5).map(|i| FaceScan {
+            embed_space: Some("embed:model-b".into()),
+            ..scan(vec![0.0, i as f32, 0.0])
+        }));
+        assert_eq!(
+            profile.scans.len(),
+            irlume_core::storage::MAX_SCANS_PER_PROFILE + 5,
+            "more total scans than the per-recognizer limit, which is legal"
+        );
+        assert_eq!(scan_room_in(&profile, "embed:model-a"), 0);
+        assert_eq!(
+            scan_room_in(&profile, "embed:model-b"),
+            irlume_core::storage::MAX_SCANS_PER_PROFILE - 5
+        );
+        // A recognizer with nothing enrolled has the full allowance, and the
+        // computation never underflows for any space.
+        assert_eq!(
+            scan_room_in(&profile, "embed:model-c"),
+            irlume_core::storage::MAX_SCANS_PER_PROFILE
+        );
+    }
+
+    #[test]
+    fn every_capture_is_checked_for_a_foreign_owner_not_only_the_first() {
+        // A second person stepping into frame partway through an add-scan
+        // session must be caught. The loop sits behind a camera, so the
+        // decision is the testable shape: a capture whose FIRST scan is clean
+        // and whose second belongs to another profile must still refuse.
+        let mine = unit(vec![1.0, 0.0, 0.0]);
+        let theirs = unit(vec![0.0, 1.0, 0.0]);
+        let enr = Enrollment {
+            user: "u".into(),
+            profiles: vec![
+                FaceProfile {
+                    ir_calib: None,
+                    ir_calibs: Default::default(),
+                    name: "Mine".into(),
+                    scans: vec![scan(mine.clone())],
+                },
+                FaceProfile {
+                    ir_calib: None,
+                    ir_calibs: Default::default(),
+                    name: "Theirs".into(),
+                    scans: vec![scan(theirs.clone())],
+                },
+            ],
+            ..Default::default()
+        };
+        let thr = irlume_core::RGB_MATCH_THRESHOLD;
+        // All mine: nothing to refuse.
+        assert!(foreign_owner_in_capture(
+            &enr,
+            &[&mine, &mine],
+            "Mine",
+            LEGACY_RECOGNIZER_SPACE,
+            thr
+        )
+        .is_none());
+        // The intruder arrives on the SECOND capture: checking only the first
+        // would miss it.
+        assert_eq!(
+            foreign_owner_in_capture(
+                &enr,
+                &[&mine, &theirs],
+                "Mine",
+                LEGACY_RECOGNIZER_SPACE,
+                thr
+            )
+            .map(|(n, _)| n),
+            Some("Theirs".to_string())
+        );
+        // And on the first, the case that always worked.
+        assert_eq!(
+            foreign_owner_in_capture(
+                &enr,
+                &[&theirs, &mine],
+                "Mine",
+                LEGACY_RECOGNIZER_SPACE,
+                thr
+            )
+            .map(|(n, _)| n),
+            Some("Theirs".to_string())
+        );
     }
 
     #[test]
@@ -5714,7 +5902,7 @@ mod engine_tests {
         let mut s = shared();
         let dir = state_sandbox("addscan");
         // Unknown user.
-        let err = s.engine.add_scan("irlume-test-ghost", "P1").unwrap_err();
+        let err = s.engine.add_scan("irlume-test-ghost", "P1", 1).unwrap_err();
         assert!(err.to_string().contains("is not enrolled"), "{err}");
         // Known user, unknown profile.
         let mut e = Enrollment::new("irlume-test-add");
@@ -5725,7 +5913,7 @@ mod engine_tests {
             ir_calibs: Default::default(),
         });
         write_enrollment(&dir, &e);
-        let err = s.engine.add_scan("irlume-test-add", "nope").unwrap_err();
+        let err = s.engine.add_scan("irlume-test-add", "nope", 1).unwrap_err();
         assert!(err.to_string().contains("no face profile 'nope'"), "{err}");
         // Full profile: refused before any capture.
         let mut e = Enrollment::new("irlume-test-full");
@@ -5738,10 +5926,37 @@ mod engine_tests {
             ir_calibs: Default::default(),
         });
         write_enrollment(&dir, &e);
-        let err = s.engine.add_scan("irlume-test-full", "P1").unwrap_err();
+        let err = s.engine.add_scan("irlume-test-full", "P1", 1).unwrap_err();
         assert!(err.to_string().contains("already has the max"), "{err}");
+        // #288: the SAME profile, full of ANOTHER recognizer's scans, is not
+        // full for the loaded one. Without per-space counting a profile that
+        // had reached the limit under one model could never gain templates
+        // for a second, which is the case this feature exists for. It reaches
+        // the capture boundary instead of refusing.
+        let mut e = Enrollment::new("irlume-test-otherfull");
+        e.profiles.push(FaceProfile {
+            name: "P1".into(),
+            scans: (0..irlume_core::storage::MAX_SCANS_PER_PROFILE)
+                .map(|i| FaceScan {
+                    embed_space: Some("embed:another-model".into()),
+                    ..scan512(i, false, None)
+                })
+                .collect(),
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        write_enrollment(&dir, &e);
+        let err = s
+            .engine
+            .add_scan("irlume-test-otherfull", "P1", 1)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no camera found"),
+            "a profile full of another recognizer's scans must still accept \
+             this one's, got: {err}"
+        );
         // Room in the profile: proceeds to the capture boundary.
-        let err = s.engine.add_scan("irlume-test-add", "P1").unwrap_err();
+        let err = s.engine.add_scan("irlume-test-add", "P1", 1).unwrap_err();
         assert!(err.to_string().contains("no camera found"), "{err}");
         teardown_sandbox(&dir);
     }
