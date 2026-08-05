@@ -380,6 +380,10 @@ fn profiles_usage_errors_exit_2() {
         &["profiles", "eyes-open"],
         &["profiles", "eyes-open", "on", "off"],
         &["profiles", "challenge"],
+        // forget-model with no model name; a flag must not be read as one.
+        // (A dangling `--user` gets its own specific error, tested in
+        // a_dangling_user_flag_never_reaches_the_daemon.)
+        &["profiles", "forget-model"],
     ];
     for argv in cases {
         let (code, _, err) = run(&mut sb.cmd(argv));
@@ -392,6 +396,7 @@ fn profiles_usage_errors_exit_2() {
         "add-scan --profile P [--scans N]",
         "rename --profile P [--scan S] --name N",
         "delete --profile P [--scan S]",
+        "forget-model <model>",
         "eyes-open <on|off>",
         "challenge <on|off>",
     ] {
@@ -449,6 +454,7 @@ fn profiles_valid_subcommands_build_requests_and_fail_without_a_daemon() {
         ],
         &["profiles", "eyes-open", "on"],
         &["profiles", "challenge", "off"],
+        &["profiles", "forget-model", "shipped"],
     ];
     for argv in cases {
         let (code, _, err) = run(&mut sb.cmd(argv));
@@ -458,6 +464,53 @@ fn profiles_valid_subcommands_build_requests_and_fail_without_a_daemon() {
             "{argv:?} must have reached the socket: {err}"
         );
         assert!(!err.contains("usage:"), "{argv:?} parsed fine: {err}");
+    }
+}
+
+#[test]
+fn forget_model_refuses_a_name_that_is_not_a_recognizer() {
+    // Refused at resolution, before any daemon request: with no daemon
+    // running, a request attempt would exit 1, so exit 2 proves the order.
+    let sb = Sandbox::new("forgetbad");
+    let (code, _, err) = run(&mut sb.cmd(&["profiles", "forget-model", "nonsense"]));
+    assert_eq!(code, 2, "an unknown model must be a usage error: {err}");
+    assert!(
+        err.contains("unknown model 'nonsense'") && err.contains("shipped"),
+        "the error must list the recognizers: {err}"
+    );
+    let (code, _, err) = run(&mut sb.cmd(&["profiles", "forget-model", "embed:nothex"]));
+    assert_eq!(
+        code, 2,
+        "a malformed space tag must be a usage error: {err}"
+    );
+    assert!(err.contains("64 hex"), "{err}");
+}
+
+#[test]
+fn a_dangling_user_flag_never_reaches_the_daemon() {
+    // `--user` with no value used to fall back to SUDO_USER/$USER, so
+    // `sudo irlume profiles forget-model shipped --user` would have deleted
+    // the INVOKING user's own enrollment (Codex, #292). The request must die
+    // as a usage error before the socket: with no daemon running, reaching
+    // the socket shows as exit 1 and "irlumed is not running".
+    let sb = Sandbox::new("dangleuser");
+    let cases: &[&[&str]] = &[
+        &["profiles", "forget-model", "shipped", "--user"],
+        &["profiles", "delete", "--profile", "P", "--user"],
+        // A flag where the username should be is the same omission.
+        &["profiles", "forget-model", "shipped", "--user", "--json"],
+    ];
+    for argv in cases {
+        let (code, _, err) = run(&mut sb.cmd(argv));
+        assert_eq!(code, 2, "{argv:?} must be a usage error: {err}");
+        assert!(
+            err.contains("--user requires a username"),
+            "{argv:?}: {err}"
+        );
+        assert!(
+            !err.contains("irlumed is not running"),
+            "{argv:?} must not build a request: {err}"
+        );
     }
 }
 

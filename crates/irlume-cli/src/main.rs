@@ -327,6 +327,18 @@ fn shell_single_quote(value: &str) -> String {
 /// to-3 face profiles and their scans via the daemon.
 fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
+    // A supplied `--user` must carry a real username. `user_arg` falls back
+    // to SUDO_USER/$USER when the flag is ABSENT, which is right for the bare
+    // commands, but a dangling `--user` inheriting that fallback would point
+    // a destructive subcommand (forget-model, delete) at the invoking user's
+    // own enrollment. Checked here, not in `user_arg`: the fallback semantics
+    // of an absent flag belong to every caller, this omission does not.
+    if args.iter().any(|a| a == "--user")
+        && !matches!(flag(args, "--user"), Some(u) if !u.is_empty() && !u.starts_with("--"))
+    {
+        eprintln!("[profiles] --user requires a username");
+        return std::process::ExitCode::from(2);
+    }
     let user = user_arg(args);
     let req = match sub {
         None | Some("list") => Request::ListProfiles {
@@ -367,6 +379,25 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
             }
             None => return usage_profiles(),
         },
+        Some("forget-model") => {
+            // Positional: `irlume profiles forget-model <model>` (args[0] is
+            // "profiles", args[1] the subcommand). A flag must not be read as
+            // the model name when the positional is missing.
+            match args
+                .get(2)
+                .map(String::as_str)
+                .filter(|a| !a.starts_with("--"))
+            {
+                Some(name) => match crate::models::recognizer_space_for(name) {
+                    Ok(space) => Request::ForgetRecognizer { user, space },
+                    Err(e) => {
+                        eprintln!("[profiles] {e}");
+                        return std::process::ExitCode::from(2);
+                    }
+                },
+                None => return usage_profiles(),
+            }
+        }
         Some("delete") => match (flag(args, "--profile"), flag(args, "--scan")) {
             (Some(p), Some(s)) => Request::DeleteScan {
                 user,
@@ -949,6 +980,8 @@ fn usage_profiles() -> std::process::ExitCode {
                                                 add templates for a second model)\n  \
         rename --profile P [--scan S] --name N  rename a profile or a scan\n  \
         delete --profile P [--scan S]           delete a profile or a scan\n  \
+        forget-model <model>                    remove one recognizer's scans from every\n  \
+                                                profile (shipped | a catalog name | embed:<sha256>)\n  \
         eyes-open <on|off>                      require eyes open to unlock\n  \
         challenge <on|off>                      opt-in passive blink liveness"
     );
