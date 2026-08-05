@@ -578,10 +578,20 @@ fn stdin_is_tty() -> bool {
 /// so installed-but-unconfirmable gets reported instead of a false "none".
 /// Condensed third-party-model state for a TUI status row, so it can show a
 /// ●/○ icon like the other Settings sections instead of a bare text blob.
+/// One enabled catalog entry, STRUCTURED: consumers decide wording per stage
+/// and per weight state, so a joined display string cannot smear one entry's
+/// checksum failure across every enabled model (#285 review).
+pub(crate) struct TuiEntry {
+    pub name: &'static str,
+    pub stage: irlume_common::thirdparty::Stage,
+    pub weight_state: irlume_common::thirdparty::WeightState,
+}
+
 pub(crate) enum TuiState {
-    /// A catalog model is enabled in settings.conf; carries its name and the
-    /// weight health (checksum ok / mismatch).
-    Enabled { name: String, detail: String },
+    /// One or more catalog models are enabled in settings.conf.
+    Enabled { entries: Vec<TuiEntry> },
+    /// A settings key names something not in the catalog (daemon ignores it).
+    UnknownName { name: String },
     /// Weights are installed but the enabled flag is root-only and we are not
     /// root, so we can report presence but not the on/off state.
     InstalledUnknown { name: String },
@@ -590,12 +600,33 @@ pub(crate) enum TuiState {
 }
 
 pub(crate) fn tui_state() -> TuiState {
-    if let Some(name) = enabled_name() {
-        let detail = match thirdparty::by_name(&name) {
-            Some(m) => format!("deny-only cue · {}", file_state(m)),
-            None => "set in settings.conf but NOT in the catalog (daemon ignores it)".into(),
+    // Every enabled stage, not just PAD: a recognizer selection is
+    // authentication policy, and a settings row reading "none" while one is
+    // enabled would be the TUI lying about it (#280 follow-up).
+    let enabled = enabled_entries();
+    if !enabled.is_empty() {
+        return TuiState::Enabled {
+            entries: enabled
+                .into_iter()
+                .map(|(m, _)| TuiEntry {
+                    name: m.name,
+                    stage: m.stage,
+                    weight_state: thirdparty::weight_state(m),
+                })
+                .collect(),
         };
-        return TuiState::Enabled { name, detail };
+    }
+    // An enabled name that is not in the catalog (daemon ignores it) still
+    // deserves a row so the mismatch is visible.
+    for key in [
+        thirdparty::SETTINGS_KEY,
+        thirdparty::RECOGNIZER_SETTINGS_KEY,
+    ] {
+        if let Some(name) = enabled_name_for(key) {
+            if thirdparty::by_name(&name).is_none() {
+                return TuiState::UnknownName { name };
+            }
+        }
     }
     if !is_root() {
         if let Some(m) = thirdparty::CATALOG
@@ -1051,6 +1082,66 @@ mod tests {
     }
 
     #[test]
+    fn tui_state_reports_every_enabled_stage() {
+        // The settings row must not read "none" (or PAD-only) while a
+        // recognizer is enabled: that is authentication policy on display.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("irlume-tuist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cfg, state) = (root.join("cfg"), root.join("state"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        let old_state = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+
+        std::fs::write(
+            cfg.join("settings.conf"),
+            "third_party_recognizer=buffalo\n",
+        )
+        .unwrap();
+        let rec_only = tui_state();
+        std::fs::write(
+            cfg.join("settings.conf"),
+            "third_party_pad=flir\nthird_party_recognizer=buffalo\n",
+        )
+        .unwrap();
+        let both = tui_state();
+
+        match old_cfg {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        match old_state {
+            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        use irlume_common::thirdparty::Stage;
+        match rec_only {
+            TuiState::Enabled { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].name, "buffalo");
+                assert_eq!(entries[0].stage, Stage::Recognition);
+            }
+            _ => panic!("a recognizer-only selection must show as Enabled"),
+        }
+        match both {
+            TuiState::Enabled { entries } => {
+                let got: Vec<_> = entries.iter().map(|e| (e.name, e.stage)).collect();
+                assert!(got.contains(&("flir", Stage::Pad)));
+                assert!(got.contains(&("buffalo", Stage::Recognition)));
+                assert_eq!(got.len(), 2);
+            }
+            _ => panic!("two enabled stages must both show"),
+        }
+    }
+
+    #[test]
     fn fetching_a_bring_your_own_model_is_refused_before_any_download() {
         // The tier's whole point: irlume must not download a model whose
         // licence made obtaining it the user's decision. `fetch_and_enable`
@@ -1253,7 +1344,10 @@ mod tests {
 
         // tui_state mirrors the same config: an enabled name -> Enabled row.
         match tui_state() {
-            TuiState::Enabled { name, .. } => assert_eq!(name, m.name),
+            TuiState::Enabled { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].name, m.name);
+            }
             _ => panic!("expected Enabled after setting the config key"),
         }
 
