@@ -182,7 +182,12 @@ pub(crate) fn write_wired_marker(
     // plantable by a non-root user, since reconcile trusts its with_sudo flag.
     // A silent failure would leave self-heal disabled without the user knowing,
     // so warn rather than swallow it.
-    if let Err(e) = irlume_common::write_0600(&path, body.as_bytes()) {
+    // Atomic: a short write here reads back as all-false (see
+    // `read_wired_marker`), which silently drops the sudo, polkit and lock
+    // scopes from the self-heal. Reproduced on a full filesystem, where the
+    // truncating helper left 4096 bytes of a partial marker while the atomic
+    // one left the previous marker intact.
+    if let Err(e) = irlume_common::write_0600_atomic(&path, body.as_bytes()) {
         eprintln!(
             "[login] warning: could not write the self-heal marker {}: {e}\n\
              [login] automatic re-wiring after a distro PAM update will not run.",
@@ -285,7 +290,8 @@ fn reconcile() -> ExitCode {
         return ExitCode::FAILURE;
     }
     eprintln!("[login] greeter PAM configuration changed; re-applying irlume wiring");
-    act(true, true, with_sudo, with_polkit)
+    // The lock is already held above; taking it again would deadlock.
+    act_holding_lock(true, true, with_sudo, with_polkit)
 }
 
 /// Whether the ACTIVE display manager's own greeter service carries the module.
@@ -1123,6 +1129,19 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
     } else {
         None
     };
+    act_holding_lock(enable, apply, with_sudo, with_polkit)
+}
+
+/// The body of [`act`], for a caller that ALREADY holds the PAM lock.
+///
+/// `flock` is per open file description, so a second `lock_pam()` from the same
+/// process blocks on the first one forever. `reconcile` took the lock, found a
+/// regression, and called `act`, which took it again: the self-heal deadlocked
+/// on exactly the condition it exists to repair, so it had never once worked.
+/// The hung process is root and holds the lock exclusively, so every other
+/// irlume PAM operation blocked behind it too, and the unit's `Type=oneshot`
+/// default of `TimeoutStartUSec=infinity` meant systemd never killed it.
+fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCode {
     if !apply {
         println!("[login] DRY RUN: showing what `--apply` would change (nothing is written):");
     }
@@ -1439,15 +1458,39 @@ fn wire_service(
                 );
             }
             let current = read(s.etc)?;
-            // Rebuild from the pristine stock: the backup if we've wired before,
-            // else the current file, then strip any irlume lines and re-apply.
+            // Rebuild from the CURRENT file with irlume's own lines stripped,
+            // not from the backup.
+            //
+            // Taking the backup as origin discarded every change made to the
+            // stack after irlume first wired it. A distro update that adds
+            // `pam_faillock` lines is the ordinary case, and re-running
+            // `login enable --apply` deleted them: a security control removed
+            // with no mention, from a command whose stated job is to add a
+            // line. The tail risk is worse than that, since a months-old backup
+            // can name a module the system no longer ships, which is a stack
+            // that denies every login.
+            //
+            // Stripping is a complete inverse: `unwire_lines` matches irlume's
+            // module on the PAM directive and its landing lines on irlume's own
+            // comment tags, so it removes what irlume added and nothing else.
+            // The disable path already refuses to restore a backup that no
+            // longer matches the stripped current file, for this same reason.
             let bak = PathBuf::from(format!("{}{BACKUP}", s.etc));
-            let origin = if bak.exists() {
-                read(&bak.to_string_lossy())?
-            } else {
-                current.clone()
-            };
-            let (base, _) = unwire_lines(&origin);
+            let (base, _) = unwire_lines(&current);
+            // Say so when the stack has moved since irlume wired it. Not a
+            // failure: the rebuild above already keeps the change. The operator
+            // should know their backup no longer describes the file.
+            if bak.exists() {
+                if let Ok(bak_content) = read(&bak.to_string_lossy()) {
+                    if bak_content.trim() != base.trim() {
+                        eprintln!(
+                            "[login] note: {} changed since irlume first wired it; keeping \
+                             those changes and re-applying irlume's lines on top",
+                            s.etc
+                        );
+                    }
+                }
+            }
             let (wired, changed) = wire(&base);
             if !changed {
                 return out(
@@ -1629,6 +1672,82 @@ fn effective_uid() -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// Re-wiring rebuilds from the CURRENT file stripped of irlume's lines, not
+    /// from the `.pre-irlume` backup.
+    ///
+    /// Taking the backup as origin discarded every change made to the stack
+    /// after irlume first wired it. A distro update adding `pam_faillock` is the
+    /// ordinary case, and `login enable --apply` then deleted it: a security
+    /// control removed without a word, by a command whose job is to add a line.
+    /// This pins the property the rebuild rests on, that stripping is a complete
+    /// inverse which touches irlume's lines and nothing else.
+    #[test]
+    fn stripping_a_wired_stack_keeps_what_the_distro_added_later() {
+        let stock = "auth       required     pam_env.so\n                     auth       sufficient   pam_unix.so try_first_pass nullok\n";
+        let (wired, changed) = wire_greeter_impl(stock, true, true, false);
+        assert!(changed, "the fixture must actually wire");
+
+        // The distro later adds faillock above and below, as it does on a real
+        // update; irlume never saw these lines and has no backup containing them.
+        let after_update = wired.replace(
+            "auth       required     pam_env.so",
+            "auth       required     pam_faillock.so preauth\n             auth       required     pam_env.so",
+        ) + "account    required     pam_faillock.so\n";
+
+        let (base, _) = super::unwire_lines(&after_update);
+        assert!(
+            base.contains("pam_faillock.so preauth")
+                && base.contains("account    required     pam_faillock.so"),
+            "stripping must keep every line irlume did not add: {base}"
+        );
+        assert!(
+            !base.contains("pam_irlume.so"),
+            "and must remove every line irlume did add: {base}"
+        );
+        assert!(base.contains("pam_unix.so"), "{base}");
+    }
+
+    /// `flock` is per open file description, so a second `lock_pam()` from the
+    /// SAME process blocks on the first one forever rather than succeeding.
+    ///
+    /// `reconcile` took the lock, found a regression, and called `act`, which
+    /// took it again: the self-heal deadlocked on exactly the condition it
+    /// exists to repair, so it had never once worked. The hung process is root
+    /// and holds the lock exclusively, so every other irlume PAM operation
+    /// queued behind it, and the unit's `Type=oneshot` default of
+    /// `TimeoutStartUSec=infinity` meant systemd never killed it.
+    ///
+    /// This pins the hazard rather than the call graph, because the call graph
+    /// is what drifts. If `lock_pam` is ever made reentrant this test fails and
+    /// the split in `act`/`act_holding_lock` can be revisited.
+    #[test]
+    fn a_second_pam_lock_in_the_same_process_does_not_succeed() {
+        let dir = std::env::temp_dir().join(format!("irlume-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("pam.lock");
+        std::env::set_var("IRLUME_PAM_LOCK", &lock_path);
+
+        let first = super::lock_pam().expect("the first lock must be granted");
+
+        // The second attempt runs on a thread so a deadlock cannot hang the
+        // suite: we assert on whether it reports back, not on it returning.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _second = super::lock_pam();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).is_err(),
+            "a second lock_pam() returned, so re-locking is now safe and the \
+             act/act_holding_lock split should be re-examined"
+        );
+
+        drop(first);
+        std::env::remove_var("IRLUME_PAM_LOCK");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     // Reached through the submodule because the parent has no production use
     // for it; `use super::*` only carries what the parent itself imports.

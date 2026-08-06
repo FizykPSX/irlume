@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-auth"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "irlume-camera",
  "irlume-common",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-camera"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "irlume-common",
  "libc",
@@ -1007,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-cli"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "image",
  "irlume-auth",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-common"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "libc",
  "serde",
@@ -1041,13 +1041,14 @@ dependencies = [
 
 [[package]]
 name = "irlume-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "aes-gcm",
  "argon2",
  "base64 0.23.0",
  "irlume-common",
  "irlume-vision",
+ "libc",
  "pbkdf2",
  "rand 0.10.2",
  "rsa",
@@ -1061,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-daemon"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "irlume-auth",
  "irlume-common",
@@ -1075,11 +1076,11 @@ dependencies = [
 
 [[package]]
 name = "irlume-fingerprint"
-version = "0.8.1"
+version = "0.9.0"
 
 [[package]]
 name = "irlume-gkr-unlock"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "irlume-common",
  "libc",
@@ -1087,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-kwallet-init"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "irlume-common",
  "libc",
@@ -1095,16 +1096,15 @@ dependencies = [
 
 [[package]]
 name = "irlume-liveness"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
- "irlume-camera",
  "irlume-common",
  "irlume-vision",
 ]
 
 [[package]]
 name = "irlume-pam"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "irlume-common",
  "libc",
@@ -1115,10 +1115,9 @@ dependencies = [
 
 [[package]]
 name = "irlume-vision"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "edgefirst-tflite",
- "irlume-camera",
  "irlume-common",
  "libc",
  "ort",
@@ -2686,7 +2685,7 @@ dependencies = [
 [[package]]
 name = "tss-esapi"
 version = "7.7.0"
-source = "git+https://github.com/archledger/rust-tss-esapi?branch=irlume-patches#7567f6048d2bcb42779e80c0dad90e7eacf6185c"
+source = "git+https://github.com/archledger/rust-tss-esapi?rev=7567f6048d2bcb42779e80c0dad90e7eacf6185c#7567f6048d2bcb42779e80c0dad90e7eacf6185c"
 dependencies = [
  "bitfield",
  "enumflags2",
@@ -2708,7 +2707,7 @@ dependencies = [
 [[package]]
 name = "tss-esapi-sys"
 version = "0.6.0"
-source = "git+https://github.com/archledger/rust-tss-esapi?branch=irlume-patches#7567f6048d2bcb42779e80c0dad90e7eacf6185c"
+source = "git+https://github.com/archledger/rust-tss-esapi?rev=7567f6048d2bcb42779e80c0dad90e7eacf6185c#7567f6048d2bcb42779e80c0dad90e7eacf6185c"
 dependencies = [
  "pkg-config",
  "target-lexicon",

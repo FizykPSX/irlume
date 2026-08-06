@@ -145,7 +145,7 @@ asked about.
   "enrollment": { "known": true, "profiles": 1, "scans": 10 },
   "templates": "encrypted",
   "keyring": { "known": true, "armed": true, "policy": "…" },
-  "recovery": { "known": true, "passphrase_set": true },
+  "recovery": { "known": true, "passphrase_set": true, "key_present": true },
   "camera": { "rgb": true, "ir": true },
   "fingerprint": false
 }
@@ -161,6 +161,16 @@ consumer cannot mistake "we could not find out" for "this account has nothing
 enrolled".
 
 `templates` is `encrypted`, `plaintext`, or `unknown`.
+
+`recovery.key_present` is whether the template key that opens an encrypted store
+still exists. It is a separate field rather than a third value of `templates`
+because contract 1 permits added fields and not new enum values, and because the
+two facts are independent: `templates: "encrypted"` with `key_present: false`
+means the enrollment is encrypted and openable by nothing, which no single value
+can say. Treat that combination as needing re-enrollment, not as a recovery
+passphrase problem. A daemon older than 0.9.0 never sends it and it reads as
+`true`, which is the only safe default for a field whose false value means data
+loss.
 
 ### `irlume doctor --json`
 
@@ -329,6 +339,14 @@ now; the entry whose `live` is true can. None is live when the loaded
 recognizer has no templates in that profile, which is what an operator sees
 after switching models before re-adding scans.
 
+`recognizers` is ABSENT, not empty, when the daemon did not report the counts.
+That happens against a daemon older than 0.9.0, which is what a consumer sees
+between the package upgrade and the daemon restart. An empty array would mean
+"no recognizer has templates here", so emitting it beside a populated `scans`
+list would be the unknown-as-zero mistake. Treat a missing `recognizers` as
+unknown and fall back to `scans`; do not treat it as a profile that needs
+re-enrolling.
+
 ### `irlume models list --json`
 
 Capability: `models-list-json`.
@@ -338,7 +356,7 @@ CLI process's search order lands on, its origin (`shipped`, `caller-env` when
 the calling process's environment chose the path, or `built-in` for the PAD
 stage's gate, which is code rather than a swappable file), and whether it
 opened as a regular file (`readable`). It is a candidate and not a claim about
-the daemon, because the daemon's service unit — or an administrator's drop-in —
+the daemon, because the daemon's service unit (or an administrator's drop-in)
 sets the daemon's own environment, which a shell invocation cannot observe. On
 a stock install the candidate coincides with what the daemon loads; an
 authoritative loaded-model report can only ever come from the daemon itself.
@@ -347,11 +365,11 @@ unreadable file) means the daemon's load of that same candidate would fail.
 
 Each stage also reports whether the daemon requires the file to start and
 whether the stage is open to third-party models. Stages open one at a time
-because their failure modes differ; the PAD stage is the only open one today,
-and it carries a `third_party` object with the enabled entry and the measured
-catalog, including each entry's tier (`fetched` by irlume, or `user-supplied`
-when the license makes obtaining the file the user's business) and the weight
-file's state against its pin.
+because their failure modes differ; PAD and recognition are the open ones
+today, and each open stage carries a `third_party` object with the enabled
+entry and its own measured catalog, including each entry's tier (`fetched` by
+irlume, or `user-supplied` when the license makes obtaining the file the
+user's business) and the weight file's state against its pin.
 
 The command needs no daemon, so it still answers when the daemon will not
 start.
@@ -359,8 +377,8 @@ start.
 `third_party.enabled.known` is keyed on what the read established, not on who
 asked. Observed absence (no config file or key; the config directory is
 world-readable) is `known: true, name: null` from any caller. A read that
-failed — the root-only file denied to an unprivileged caller, or a wrong
-SELinux label denying even root — established nothing and is `known: false`,
+failed (the root-only file denied to an unprivileged caller, or a wrong
+SELinux label denying even root) established nothing and is `known: false`,
 which a consumer must not render as disabled.
 
 ### Error codes
@@ -536,8 +554,11 @@ would change something nobody was shown. The supplied id is never trusted as
 input, only compared. On success it returns a `transaction_id`.
 
 A partial apply is reported as a failure and still records its transaction, so
-the surfaces that did change can be rolled back. The id is written to standard
-error in that case, because an error document carries no `data`.
+the surfaces that did change can be rolled back. The id travels IN THE
+DOCUMENT in that case, as a top-level `transaction_id` beside `failed`, not on
+standard error: machine mode promises stdout carries the answer and stderr
+stays empty, and a caller recovering from a half-changed login stack needs the
+id from the same place it reads everything else.
 
 **verify** answers whether the machine is still as that transaction left it,
 per surface: `as-applied`, `changed-since-apply`, or `unreadable`. It also
@@ -562,7 +583,9 @@ rejected rather than sanitised, because the id becomes a filename.
 Error codes: `plan-stale`, `changed-since-apply`, `not-found`,
 `not-authorized` (apply and `rollback --apply` need root, checked before
 anything is written rather than left to a write failing partway),
-`unconfirmed-transaction`, `unsupported-record`, `operation-failed`.
+`unconfirmed-transaction`, `unsupported-record`, `unmanaged-path` (a record
+names a file irlume does not manage, so rollback refuses to touch it),
+`operation-failed`.
 
 A surface's `.pre-irlume` backup is part of the surface. The plan id covers it,
 so a backup that changes between `plan` and `apply` makes the plan stale: wiring
@@ -576,7 +599,7 @@ the next enable rather than sitting inert.
 A rollback that stops partway records which surfaces it put back, durably, as it
 goes. Re-running it resumes: those surfaces are skipped rather than re-checked,
 because a restored file deliberately no longer matches the digest apply left and
-checking it would refuse the whole record — which used to leave the operator
+checking it would refuse the whole record, which used to leave the operator
 rebuilding the rest from the JSON by hand. `verify` reports them as
 `already_restored` and excludes them from `rollback_available`, so drift caused
 by irlume's own restore is not reported as somebody's edit.
@@ -599,8 +622,8 @@ an engine will not do is act on the parts of a newer record it recognises: the
 fields would parse and look reasonable while meaning something else, and a
 record is the recovery path for a machine's login stack.
 
-Every irlume path that changes PAM — `login apply`, `login rollback --apply`,
-the human `login enable`/`disable`, and the self-heal reconcile — holds one
+Every irlume path that changes PAM (`login apply`, `login rollback --apply`,
+the human `login enable`/`disable`, and the self-heal reconcile) holds one
 exclusive lock for the whole operation, so a consumer's transaction cannot
 interleave with another irlume process. The lock does not cover package managers
 or an administrator with an editor, which is why each surface is re-checked

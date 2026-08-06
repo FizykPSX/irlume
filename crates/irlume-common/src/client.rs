@@ -13,7 +13,7 @@
 //! unsealed secret in transit, before it lands inside a zeroizing `SecretBytes`).
 
 use crate::{Request, Response, SOCKET_PATH};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read as _, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -26,6 +26,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// UI: fail fast and let the next tick retry.
 const POLL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1200);
 const POLL_RW_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Largest response this client will accept. The daemon's own replies are far
+/// smaller; the cap exists so a peer that is not the daemon cannot make a
+/// client read forever. Matches the daemon's request cap.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+
 /// Default read/write timeout for management requests.
 const DEFAULT_RW_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -39,7 +44,7 @@ const DEFAULT_RW_TIMEOUT: Duration = Duration::from_secs(30);
 /// capabilities), so in exactly those contexts the compiled default wins, while
 /// the daemon (a clean systemd environment) and dev/test clients keep the
 /// override.
-fn secure_env(name: &str) -> Option<std::ffi::OsString> {
+pub fn secure_env(name: &str) -> Option<std::ffi::OsString> {
     use std::os::unix::ffi::OsStringExt;
     // glibc's secure_getenv; not surfaced by the `libc` crate, so declare it
     // (the shipping targets are all glibc: Fedora, Debian/Ubuntu, Arch).
@@ -102,6 +107,26 @@ pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<R
 /// EACCES/EPERM means the opposite: the socket is there and the daemon is very
 /// likely fine, but this uid may not connect. Say that, and do not suggest
 /// `sudo` or a chmod, because both hide whatever set the mode.
+/// Whether this failure PROVES nobody is listening on the socket.
+///
+/// The distinction matters wherever "the daemon is not there" licenses an act
+/// that would be unsafe if it were: classifying camera nodes is the case that
+/// motivated this. A timeout does NOT prove absence. A daemon busy mid-capture
+/// is exactly what a timed-out short poll looks like, and that is precisely
+/// when it holds the video nodes, so treating a timeout as absence would open
+/// the devices at the worst possible moment (#187). EACCES says the same thing
+/// from the other side: the socket is there and the daemon is very likely fine,
+/// this uid just may not connect.
+pub fn proves_daemon_absent(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
 fn map_connect_failure(e: io::Error) -> io::Error {
     match e.kind() {
         io::ErrorKind::NotFound
@@ -147,9 +172,22 @@ fn request_with_timeouts(
     // The request may carry a password (SealPassword/RecoverySetup); wipe it.
     line.zeroize();
 
-    let mut reader = BufReader::new(&stream);
+    // Capped, like the daemon caps requests. `SO_RCVTIMEO` restarts on every
+    // read, so the rw budget bounds one read and not the exchange: a peer that
+    // dribbles bytes with no newline holds the caller forever and grows the
+    // buffer without bound. That caller can be `pam_irlume` inside a login.
+    // The daemon is honest, but `IRLUME_SOCKET` redirects any non-setuid
+    // invocation, so the peer is not always the daemon.
+    let mut reader = BufReader::new((&stream).take(MAX_RESPONSE_BYTES));
     let mut buf = String::new();
     reader.read_line(&mut buf).map_err(map_connect_failure)?;
+    if buf.len() as u64 >= MAX_RESPONSE_BYTES {
+        buf.zeroize();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response exceeded the size limit; refusing it",
+        ));
+    }
     if buf.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -186,7 +224,6 @@ fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream
 mod tests {
     use super::*;
     use crate::testenv;
-    use std::io::Read as _;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 

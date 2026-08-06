@@ -33,14 +33,21 @@ fn status(user: &str) -> ExitCode {
             encrypted,
             recovery_set,
             tpm_present,
+            key_present,
         }) => {
             println!("[recovery] '{user}':");
             println!(
                 "  templates encrypted : {}",
-                if encrypted {
-                    "yes ✓ (template key sealed in the TPM)"
-                } else {
-                    "no (plaintext at rest)"
+                match (encrypted, key_present) {
+                    (true, true) => "yes ✓ (template key sealed in the TPM)",
+                    // The one state the old bool could not say. Naming it
+                    // matters more than any other line here: the templates are
+                    // safe from a stolen disk and unreadable by their owner, and
+                    // neither `recovery setup` nor a reseal brings them back.
+                    (true, false) =>
+                        "yes, but the TEMPLATE KEY IS GONE: this enrollment \
+                         cannot be opened. Re-enroll to use face login again.",
+                    (false, _) => "no (plaintext at rest)",
                 }
             );
             println!(
@@ -163,7 +170,7 @@ fn forget(user: &str) -> ExitCode {
 /// No-echo passphrase prompt with confirmation (for `setup`); falls back to a
 /// plain stdin line when piped (scripts / tests).
 fn read_passphrase_confirmed() -> Option<String> {
-    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    let pass = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         let first = rpassword::prompt_password("Recovery passphrase: ").ok()?;
         let mut confirm = rpassword::prompt_password("Confirm recovery passphrase: ").ok()?;
         let matched = first == confirm;
@@ -175,21 +182,29 @@ fn read_passphrase_confirmed() -> Option<String> {
             eprintln!("[recovery] passphrases do not match; aborted (nothing set).");
             return None;
         }
-        // Strength floor: this passphrase is the only barrier on the recovery
-        // envelope against an offline attacker with the disk, so reject a trivial
-        // one (a `1`). It is a recovery key, not a login PIN; length is the cheap,
-        // language-neutral proxy for entropy.
-        if first.chars().count() < MIN_RECOVERY_PASSPHRASE_CHARS {
-            eprintln!(
-                "[recovery] passphrase too short (minimum {MIN_RECOVERY_PASSPHRASE_CHARS} \
-                 characters); aborted (nothing set)."
-            );
-            return None;
-        }
-        Some(first)
+        first
     } else {
-        read_piped_line()
+        // No second read to compare against on a pipe, so confirmation is the one
+        // check that cannot apply here. The strength floor below still does, and
+        // it is checked AFTER this branch on purpose: it used to live inside the
+        // terminal arm, which let `irlume recovery setup </dev/null` wrap the
+        // template key under an EMPTY passphrase and report success.
+        read_piped_line()?
+    };
+    // Strength floor: this passphrase is the only barrier on the recovery
+    // envelope against an offline attacker with the disk, so reject a trivial
+    // one (a `1`). It is a recovery key, not a login PIN; length is the cheap,
+    // language-neutral proxy for entropy.
+    if pass.chars().count() < MIN_RECOVERY_PASSPHRASE_CHARS {
+        let what = if pass.is_empty() {
+            "empty passphrase".to_string()
+        } else {
+            format!("passphrase too short (minimum {MIN_RECOVERY_PASSPHRASE_CHARS} characters)")
+        };
+        eprintln!("[recovery] {what}; aborted (nothing set).");
+        return None;
     }
+    Some(pass)
 }
 
 /// Minimum recovery-passphrase length. A recovery key protects the template-key

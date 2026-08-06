@@ -5,7 +5,16 @@ set -e
 # try-restart picks up confinement on an upgrade where the daemon is already
 # running (enable --now is a no-op for a running unit).
 if command -v apparmor_parser >/dev/null 2>&1; then
-    apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed 2>/dev/null || true
+    # SAY SO on failure. This used to discard both the output and the status, so
+    # when the profile declared an ABI the installed parser did not have, every
+    # Debian 12 and Ubuntu 22.04 install came up UNCONFINED and the package still
+    # exited 0. The load is still not fatal (a machine with AppArmor disabled in
+    # the kernel is a normal configuration, and refusing to install there would be
+    # worse), but a confinement that did not take is not something to hide.
+    if ! apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed 2>&1; then
+        echo "irlume: WARNING: the AppArmor profile did not load; irlumed will" >&2
+        echo "irlume: run unconfined. Report the parser error above." >&2
+    fi
 fi
 systemctl daemon-reload 2>/dev/null || true
 # Enable + start ONLY on first install ($2 empty). On an upgrade, re-enabling
@@ -34,6 +43,16 @@ if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
     mkdir -p /var/lib/irlume
     systemctl enable --now irlume-reconcile.timer 2>/dev/null || true
     : > /var/lib/irlume/.reconcile-timer-armed
+fi
+# Run one reconcile on UPGRADE too. The block above is fresh-install only, and
+# its comment claimed the run made "an upgrade adopt an already-wired install"
+# while sitting inside the branch an upgrade never takes: traced against the
+# built package, `configure 0.8.1` called daemon-reload, is-enabled,
+# enable-socket and try-restart, and no reconcile. Fedora's %post and Arch's
+# post_upgrade both run it. It self-gates on the login.wired marker, so it is a
+# no-op on a box that never wired login.
+if [ -n "${2:-}" ]; then
+    systemctl start irlume-reconcile.service 2>/dev/null || true
 fi
 # Upgrading from a version without the socket unit.
 if systemctl is-enabled --quiet irlumed.service 2>/dev/null; then

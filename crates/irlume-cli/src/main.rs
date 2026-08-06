@@ -9,7 +9,7 @@
 //! guided setup. Developer/benchmark tools are gated behind `IRLUME_DEV=1`.
 //! A selection of the main subcommands:
 //!   irlume tui                                   guided setup + live dashboard
-//!   irlume enroll [--user U] [--profile NAME]   register a face profile
+//!   irlume enroll [--user U] [--name NAME] [--scans N]  register a face profile
 //!   irlume identify                              1:N "who is this?"
 //!   irlume doctor                                check cameras/IR/TPM/models
 //!   irlume keyring <arm|status|forget>           TPM-sealed keyring/wallet unlock
@@ -19,7 +19,6 @@
 //!   irlume fingerprint <status|add|verify|reset|enable|disable> fprintd companion (face OR fingerprint)
 //!   irlume login <status|enable|disable|reconcile> wire face auth into PAM (+--with-polkit for apps)
 //!   irlume logs [-f] [debug on|off]              face-auth journal view + tracing switch
-//!   irlume tui                                   interactive setup/management UI
 
 mod bitwarden;
 mod blinkcap;
@@ -166,6 +165,15 @@ fn main() -> std::process::ExitCode {
         {
             machine::models_list(&args)
         }
+        // Refuse rather than ignore: `models --json` reached the human renderer
+        // and printed prose, so a script that asked for JSON silently got
+        // something it could not parse. The capability is `models list --json`.
+        (Some("models"), _) if args.iter().any(|a| a == "--json") => {
+            eprintln!(
+                "[models] --json is available on `models list`; try: irlume models list --json"
+            );
+            std::process::ExitCode::from(2)
+        }
         (Some("models"), sub) => models::run(sub, &args),
         (Some("biopolicy"), sub) => commands::biopolicy(sub, &args),
         (Some("credential-release-challenge"), sub) => {
@@ -210,6 +218,25 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Parse `--scans N` for a command that captures biometrics. A state-changing
+/// biometric command must not silently substitute a different operation: an
+/// unparseable or zero count is a usage error, not "capture the default". This
+/// lives in one place because `enroll` was written without the check that
+/// `profiles add-scan` documents, so `enroll --scans abc` fired a real capture
+/// at the default count. `Ok(None)` means the flag was absent.
+fn scans_flag(args: &[String], tool: &str) -> Result<Option<usize>, std::process::ExitCode> {
+    match flag(args, "--scans") {
+        None => Ok(None),
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n > 0 => Ok(Some(n)),
+            _ => {
+                eprintln!("[{tool}] --scans must be a positive integer");
+                Err(std::process::ExitCode::from(2))
+            }
+        },
+    }
+}
+
 /// `irlume enroll --user U [--name "..."]`: enroll a NEW face profile (captures
 /// the default number of scans) via the daemon, which owns the camera. Default
 /// profile name is "Face Profile N".
@@ -217,7 +244,10 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
     let user = user_arg(args);
     let name = flag(args, "--name").map(String::from);
-    let scans = flag(args, "--scans").and_then(|s| s.parse::<usize>().ok());
+    let scans = match scans_flag(args, "enroll") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     let reset = args.iter().any(|a| a == "--reset");
     if reset {
         eprintln!("[enroll] --reset: wiping '{user}'s existing enrollment first (clears any stale camera binding)");
@@ -347,18 +377,9 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         },
         Some("add-scan") => match flag(args, "--profile") {
             Some(p) => {
-                // A state-changing biometric command must not silently
-                // substitute a different operation: an unparseable or zero
-                // count is a usage error, not "capture one".
-                let scans = match flag(args, "--scans") {
-                    None => None,
-                    Some(raw) => match raw.parse::<usize>() {
-                        Ok(n) if n > 0 => Some(n),
-                        _ => {
-                            eprintln!("[profiles] --scans must be a positive integer");
-                            return std::process::ExitCode::from(2);
-                        }
-                    },
+                let scans = match scans_flag(args, "profiles") {
+                    Ok(s) => s,
+                    Err(code) => return code,
                 };
                 match scans {
                     Some(n) if n > 1 => eprintln!(
@@ -398,18 +419,31 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                 None => return usage_profiles(),
             }
         }
-        Some("delete") => match (flag(args, "--profile"), flag(args, "--scan")) {
-            (Some(p), Some(s)) => Request::DeleteScan {
-                user,
-                profile: p.into(),
-                scan: s.into(),
-            },
-            (Some(p), None) => Request::DeleteProfile {
-                user,
-                profile: p.into(),
-            },
-            _ => return usage_profiles(),
-        },
+        Some("delete") => {
+            // A `--scan` with no value must not widen the deletion from one
+            // scan to the whole profile. `flag` cannot tell "absent" from
+            // "present with nothing after it", and the arms below read absence
+            // as "the user meant the profile", so `profiles delete --profile P
+            // --scan` put `DeleteProfile` on the wire from a command whose
+            // visible intent was a single scan. Same shape as the dangling
+            // `--user` this file resolves above.
+            if args.iter().any(|a| a == "--scan") && flag(args, "--scan").is_none() {
+                eprintln!("[profiles] --scan requires a scan name");
+                return std::process::ExitCode::from(2);
+            }
+            match (flag(args, "--profile"), flag(args, "--scan")) {
+                (Some(p), Some(s)) => Request::DeleteScan {
+                    user,
+                    profile: p.into(),
+                    scan: s.into(),
+                },
+                (Some(p), None) => Request::DeleteProfile {
+                    user,
+                    profile: p.into(),
+                },
+                _ => return usage_profiles(),
+            }
+        }
         Some("rename") => match (
             flag(args, "--profile"),
             flag(args, "--scan"),
@@ -683,7 +717,9 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
             Ok(n) if (1..=10).contains(&n) => n,
             _ => {
                 eprintln!("[calibrate] --rounds takes a number from 1 to 10 (got {v:?})");
-                return std::process::ExitCode::FAILURE;
+                // Usage error, not a runtime failure; the refusal itself was
+                // already right, only the code disagreed with every sibling.
+                return std::process::ExitCode::from(2);
             }
         },
     };
@@ -961,7 +997,19 @@ fn ir_setup(args: &[String]) -> std::process::ExitCode {
 /// measurement on the camera in front of the user can tell the two apart.
 fn camera_tune(args: &[String]) -> std::process::ExitCode {
     use irlume_common::Request;
-    let rounds = flag(args, "--rounds").and_then(|v| v.parse::<usize>().ok());
+    // Same rule as `enroll --scans`: this command fires the IR emitter for up to
+    // a minute, so an unparseable count is a usage error rather than a silent
+    // substitution of the default round count.
+    let rounds = match flag(args, "--rounds") {
+        None => None,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                eprintln!("[camera-tune] --rounds must be a positive integer");
+                return std::process::ExitCode::from(2);
+            }
+        },
+    };
     eprintln!(
         "[camera-tune] measuring this camera under load; it fires the IR emitter \
          for up to a minute…"
@@ -1467,6 +1515,27 @@ fn toggle_value(args: &[String], sub: &str) -> Option<bool> {
 }
 
 pub(crate) fn user_arg(args: &[String]) -> String {
+    // A `--user` with nothing after it is a usage error, never a request to
+    // operate on whoever is invoking.
+    //
+    // `flag` answers None both for "absent" and for "present with no value", so
+    // a trailing `--user` fell through to the SUDO_USER default and silently
+    // retargeted the command at the person typing it. On the destructive verbs
+    // that is total, unconfirmed data loss: `sudo irlume enroll --reset --user`
+    // put `{"Enroll":{"user":"<you>","reset":true}}` on the wire, and the
+    // daemon's reset deletes the enrollment, the template key, and the recovery
+    // envelope together. `recovery forget --user` and `keyring forget --user`
+    // did the same.
+    //
+    // The guard existed, but only inside `profiles`, so it covered one of the
+    // four. It belongs here, where all 24 callers share it: this is a resolver,
+    // and the one thing a resolver must not do is quietly resolve to the wrong
+    // subject. Exiting rather than returning an error keeps every caller's
+    // signature, and there is no sensible way to continue.
+    if args.iter().any(|a| a == "--user") && flag(args, "--user").is_none() {
+        eprintln!("irlume: --user requires a username");
+        std::process::exit(2);
+    }
     flag(args, "--user")
         .map(str::to_string)
         .filter(|s| !s.is_empty())
@@ -1499,13 +1568,72 @@ pub(crate) fn user_arg(args: &[String]) -> String {
 /// (the TUI) refresh from Health on their own poll rather than from here.
 pub(crate) fn caps() -> irlume_camera::Caps {
     static CAPS: std::sync::OnceLock<irlume_camera::Caps> = std::sync::OnceLock::new();
-    *CAPS.get_or_init(|| match daemon_poll(&irlume_common::Request::Health) {
-        Ok(irlume_common::Response::Health { tier, rgb_dev, .. }) => irlume_camera::Caps {
-            ir_pair: tier == "secure",
-            rgb: rgb_dev.is_some() || tier == "secure",
-        },
-        _ => irlume_camera::capabilities(), // the one permitted probe
+    *CAPS.get_or_init(|| {
+        match irlume_common::client::request_poll(&irlume_common::Request::Health) {
+            Ok(irlume_common::Response::Health { tier, rgb_dev, .. }) => irlume_camera::Caps {
+                ir_pair: tier == "secure",
+                rgb: rgb_dev.is_some() || tier == "secure",
+            },
+            // Enumerating opens every node, so it needs POSITIVE evidence that no
+            // daemon holds them. Only a failure that proves nobody is listening is
+            // that evidence; a timeout is what a daemon busy mid-capture looks
+            // like, which is the worst moment to probe.
+            Err(e) if daemon_proven_absent(&e) => irlume_camera::capabilities(), // the one permitted probe
+            // Ambiguous: answer from the configured pair's mere existence, which
+            // never opens anything, and assume the shipped shape when there is no
+            // configuration to read.
+            _ => match irlume_camera::configured_pair_no_probe() {
+                Some((rgb, ir)) => irlume_camera::Caps {
+                    ir_pair: std::path::Path::new(&ir).exists(),
+                    rgb: std::path::Path::new(&rgb).exists(),
+                },
+                None => irlume_camera::Caps {
+                    ir_pair: false,
+                    rgb: false,
+                },
+            },
+        }
     })
+}
+
+/// These two accessors call `request_poll` directly rather than `daemon_poll`,
+/// because `daemon_poll` flattens `io::Error` into a String for its callers'
+/// messages and the error KIND is exactly what decides whether probing the
+/// cameras is safe here.
+fn daemon_proven_absent(e: &std::io::Error) -> bool {
+    irlume_common::client::proves_daemon_absent(e)
+}
+
+/// The RGB and IR node paths in use, asked of the DAEMON first and cached for
+/// the process.
+///
+/// The sibling of [`caps`], and for the same reason: `select_pair` classifies
+/// nodes by OPENING them, so calling it while the daemon streams is a second
+/// opener racing it, which is EBUSY on strict UVC modules (#187). #300 fixed
+/// the TUI; `status`, `status --json`, and `setup` were still enumerating,
+/// measured with strace as four opens of /dev/video0..3 each with the daemon
+/// running. `setup` was the worst: it probed in preflight and enrolled seconds
+/// later on the nodes it had just touched.
+///
+/// The local probe survives only as the daemon-silent fallback, where nothing
+/// else holds the cameras and it is the only source of an answer.
+pub(crate) fn camera_pair() -> (String, String) {
+    static PAIR: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    PAIR.get_or_init(|| {
+        match irlume_common::client::request_poll(&irlume_common::Request::Health) {
+            Ok(irlume_common::Response::Health {
+                rgb_dev, ir_dev, ..
+            }) => (
+                rgb_dev.unwrap_or_else(|| "none".into()),
+                ir_dev.unwrap_or_else(|| "none".into()),
+            ),
+            // Same rule as `caps`: probe only on proven absence.
+            Err(e) if daemon_proven_absent(&e) => irlume_camera::select_pair(), // the one permitted probe
+            _ => irlume_camera::configured_pair_no_probe()
+                .unwrap_or_else(|| ("unknown".into(), "unknown".into())),
+        }
+    })
+    .clone()
 }
 
 pub(crate) fn is_root() -> bool {
@@ -1594,6 +1722,8 @@ pub(crate) fn engine(
 ) -> irlume_common::Result<irlume_auth::Engine> {
     let e = irlume_auth::Engine::load(det, model)?;
     let e = match devices_from_flags(flag(args, "--rgb"), flag(args, "--ir"), || {
+        // deliberate camera probe: this engine is about to OPEN the node it
+        // resolves, so resolving it is the first step of using it.
         irlume_camera::select_pair()
     }) {
         Some((r, i)) => e.with_devices(&r, &i),
@@ -3675,6 +3805,9 @@ fn doctor_run(
 
     // --- stream vs the Windows Hello minimums (#223) -----------------------
     {
+        // deliberate camera probe: doctor's job is to inspect the hardware,
+        // and negotiating a stream format needs the node open. Foreground and
+        // occasional, not a refresh loop, so it is not the #187 shape.
         let (rgb_node, ir_node) = irlume_camera::select_pair();
         stream_minimum_checks(report, &rgb_node, &ir_node);
     }
@@ -3766,10 +3899,25 @@ fn doctor_run(
         dout!(report, "  {}: {line}", s.stage);
         report.check_detail(id, state, line);
     }
-    dout!(
-        report,
-        "  (third-party models: the pad stage only today, #276; `irlume models` lists them)"
-    );
+    // Derived from the catalog, never spelled out: this line said "the pad stage
+    // only today" through the release that opened recognition, so doctor denied a
+    // feature the same binary shipped.
+    {
+        let open: Vec<&str> = irlume_common::thirdparty::Stage::ALL
+            .iter()
+            .filter(|st| st.open())
+            .map(|st| st.as_str())
+            .collect();
+        dout!(
+            report,
+            "  (third-party models accepted for: {}; #276. `irlume models` lists them)",
+            if open.is_empty() {
+                "no stage".to_string()
+            } else {
+                open.join(", ")
+            }
+        );
+    }
     dout!(
         report,
         "[doctor] third-party PAD model: {}",
@@ -3849,15 +3997,16 @@ fn doctor_run(
         Ok(irlume_common::Response::RecoveryStatus {
             encrypted,
             recovery_set,
+            key_present,
             ..
         }) => {
             dout!(
                 report,
                 "[doctor] templates ({user}): {} · recovery passphrase {}",
-                if encrypted {
-                    "ENCRYPTED ✓"
-                } else {
-                    "plaintext at rest"
+                match (encrypted, key_present) {
+                    (true, true) => "ENCRYPTED ✓",
+                    (true, false) => "ENCRYPTED but the TEMPLATE KEY IS MISSING (unreadable)",
+                    (false, _) => "plaintext at rest",
                 },
                 if recovery_set {
                     "SET ✓"

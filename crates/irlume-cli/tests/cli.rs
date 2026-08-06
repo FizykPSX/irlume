@@ -250,7 +250,7 @@ fn dev_commands_with_env_reach_their_usage_errors() {
         (&["enrolldev"], 2, "usage: irlume enrolldev --user U --det"),
         (&["padcapture"], 2, "usage: irlume padcapture --species"),
         (&["padreport"], 2, "usage: irlume padreport --in"),
-        (&["suncal"], 1, "usage: IRLUME_DEV=1 irlume suncal"),
+        (&["suncal"], 2, "usage: IRLUME_DEV=1 irlume suncal"),
         (
             &["selftest", "align"],
             2,
@@ -583,7 +583,7 @@ fn recovery_usage_and_daemon_failures() {
 
     let (code, _, err) = run_stdin(
         &mut sb.cmd(&["recovery", "setup", "--user", "tester"]),
-        "passphrase\n",
+        "correct horse battery\n",
     );
     assert_eq!(code, 1);
     assert!(err.contains("setup failed"), "{err}");
@@ -809,7 +809,8 @@ fn logs_option_errors_never_run_journalctl() {
     sb.fake_tool("journalctl", r#"printf 'JOURNALCTL RAN\n'"#);
 
     let (code, out, err) = run(&mut sb.cmd_with_fakes(&["logs", "--since"]));
-    assert_eq!(code, 1);
+    // A bad option is a usage error (2), not a runtime failure (1).
+    assert_eq!(code, 2);
     assert!(err.contains("--since needs a value"), "{err}");
     assert!(
         !out.contains("JOURNALCTL RAN"),
@@ -817,7 +818,7 @@ fn logs_option_errors_never_run_journalctl() {
     );
 
     let (code, out, err) = run(&mut sb.cmd_with_fakes(&["logs", "--bogus"]));
-    assert_eq!(code, 1);
+    assert_eq!(code, 2);
     assert!(err.contains("unknown option '--bogus'"), "{err}");
     assert!(
         !out.contains("JOURNALCTL RAN"),
@@ -946,7 +947,8 @@ fn selinux_status_classifies_module_state_from_probe_output() {
     assert!(out.contains("unknown"), "{out}");
 
     let (code, _, err) = run(&mut sb.cmd(&["selinux", "bogus"]));
-    assert_eq!(code, 1);
+    // A bad subcommand is a usage error (2), not a runtime failure (1).
+    assert_eq!(code, 2);
     assert!(err.contains("unknown subcommand 'bogus'"), "{err}");
 }
 
@@ -1239,6 +1241,178 @@ fn keyring_success_paths_with_a_live_daemon() {
     assert_eq!(sealed.1, b"hunter2");
 }
 
+/// An encrypted store whose template key is gone is the one state the old
+/// `encrypted` bool could not express, because it was computed FROM the key's
+/// presence. It reported "plaintext at rest", which understates the posture and
+/// hides that the enrollment can no longer be opened by anything, then pointed
+/// the user at `recovery setup`. It happened for real on 2026-08-05 when a
+/// sandboxed root command deleted the live key directory.
+#[test]
+fn an_encrypted_store_with_no_key_says_so_instead_of_plaintext() {
+    let sb = Sandbox::new("orphanedkey");
+    serve(&sock(&sb), |req| match req {
+        Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+            encrypted: true,
+            recovery_set: false,
+            tpm_present: true,
+            key_present: false,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    let (code, out, _) = run(&mut sb.cmd(&["recovery", "status", "--user", "tester"]));
+    assert_eq!(code, 0);
+    assert!(
+        !out.contains("plaintext at rest"),
+        "an encrypted store must never be called plaintext: {out}"
+    );
+    assert!(
+        out.contains("TEMPLATE KEY IS GONE"),
+        "the user must be told the enrollment cannot be opened: {out}"
+    );
+    assert!(
+        out.contains("Re-enroll"),
+        "and told the only remaining move: {out}"
+    );
+}
+
+/// A flag with nothing after it must never silently become a different, wider
+/// operation.
+///
+/// `flag()` answers None both for "absent" and for "present with no value", and
+/// two resolvers read that None as a default: `--user` fell back to SUDO_USER,
+/// and `profiles delete`'s missing `--scan` meant "the whole profile". So
+/// `sudo irlume enroll --reset --user` deleted the enrollment, the template key
+/// and the recovery envelope of the person typing it, unconfirmed, and
+/// `profiles delete --profile P --scan` deleted P. The guard existed but only
+/// inside `profiles`, so it covered one of four commands.
+///
+/// The fixture serves nothing: every case here must be refused BEFORE any
+/// request reaches a daemon, which the empty request log proves.
+#[test]
+fn a_flag_with_no_value_is_refused_before_anything_is_destroyed() {
+    let sb = Sandbox::new("danglingflag");
+    let log = serve(&sock(&sb), |_| Response::Ok("must not be reached".into()));
+
+    let destructive: &[&[&str]] = &[
+        &["enroll", "--reset", "--user"],
+        &["recovery", "forget", "--user"],
+        &["keyring", "forget", "--user"],
+        &["profiles", "delete", "--profile", "P", "--user"],
+        &["profiles", "forget-model", "shipped", "--user"],
+        &["profiles", "delete", "--profile", "P", "--scan"],
+    ];
+    for argv in destructive {
+        let (code, _, err) = run(sb.cmd(argv).env("SUDO_USER", "victim"));
+        assert_eq!(code, 2, "`{}` must be a usage error: {err}", argv.join(" "));
+        assert!(
+            err.contains("requires a"),
+            "`{}` must say what is missing: {err}",
+            argv.join(" ")
+        );
+    }
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "nothing may reach the daemon: {:?}",
+        log.lock().unwrap()
+    );
+
+    // The ordinary forms are untouched.
+    let (code, out, _) = run(&mut sb.cmd(&["status", "--user", "tester"]));
+    assert_eq!(code, 0);
+    assert!(out.contains("tester"), "{out}");
+}
+
+/// A slow daemon is not an absent daemon.
+///
+/// `caps()` and `camera_pair()` fall back to a local probe when the socket poll
+/// fails, and that probe OPENS every video node. The short poll allows 1.2s to
+/// connect and 1.5s to read. A daemon busy mid-capture is exactly what blowing
+/// that budget looks like, and it is also exactly when it holds the nodes, so
+/// treating any failure as absence put the probe at the worst possible moment
+/// (#187 again, by a different route). Only an error that PROVES nobody is
+/// listening licenses the probe.
+///
+/// The fixture accepts the connection and then never answers, which no
+/// existing test did: every other one either serves promptly or has no socket
+/// at all, so both took the success path or the proven-absent path. The
+/// cameras.conf pair is reported back, proving the answer came from
+/// configuration rather than from enumerating hardware.
+#[test]
+fn a_daemon_that_accepts_but_never_answers_is_not_treated_as_absent() {
+    let sb = Sandbox::new("slowdaemon");
+    std::fs::create_dir_all(sb.path("cfg")).unwrap();
+    std::fs::write(
+        sb.path("cfg").join("cameras.conf"),
+        "rgb=/dev/video81
+ir=/dev/video82
+",
+    )
+    .unwrap();
+
+    // Accept, read the request, then hold the connection open and answer
+    // nothing. The client must time out rather than see a closed socket.
+    let sock_path = sock(&sb);
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader};
+                let mut line = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut line);
+                // Outlive the client's 1.5s read budget, holding the fd so the
+                // peer sees a timeout and not an EOF.
+                std::thread::sleep(std::time::Duration::from_secs(6));
+                drop(stream);
+            });
+        }
+    });
+
+    let (_, out, _) = run(&mut sb.cmd(&["status", "--user", "tester"]));
+    assert!(
+        out.contains("/dev/video81") && out.contains("/dev/video82"),
+        "a timed-out poll must fall back to the CONFIGURED pair, never to \
+         enumeration, which opens the nodes the daemon may be holding: {out}"
+    );
+}
+
+/// #187: classifying a video node means OPENING it, and on a UVC module that
+/// answers EBUSY to a second open, doing that while the daemon streams fails the
+/// user's enrollment. #300 stopped the TUI doing it; `status` was still
+/// enumerating, measured with strace as four opens of /dev/video0..3 with the
+/// daemon running. The daemon already reports the pair it selected, so a running
+/// daemon is the authority here too.
+///
+/// The fixture reports device paths that exist on no machine, so seeing them in
+/// the output proves the answer came over the socket rather than from a probe.
+#[test]
+fn status_takes_the_camera_pair_from_the_daemon_not_a_local_probe() {
+    let sb = Sandbox::new("statuscam");
+    serve(&sock(&sb), |req| match req {
+        Request::Health => Response::Health {
+            tier: "secure".into(),
+            rgb_dev: Some("/dev/video91".into()),
+            ir_dev: Some("/dev/video92".into()),
+            mesh: true,
+            adapter: false,
+            version: env!("CARGO_PKG_VERSION").into(),
+            third_party_pad: None,
+            third_party_recognizer: None,
+            third_party_detector: None,
+            apparmor: None,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    let (_, out, _) = run(&mut sb.cmd(&["status", "--user", "tester"]));
+    assert!(
+        out.contains("/dev/video91") && out.contains("/dev/video92"),
+        "status must report the daemon's pair, not one it probed: {out}"
+    );
+}
+
 #[test]
 fn recovery_success_paths_with_a_live_daemon() {
     let sb = Sandbox::new("recoveryok");
@@ -1247,6 +1421,7 @@ fn recovery_success_paths_with_a_live_daemon() {
             encrypted: true,
             recovery_set: false,
             tpm_present: true,
+            key_present: true,
         },
         Request::RecoverySetup { .. } => Response::Ok("recovery passphrase set".into()),
         Request::RecoveryRestore { .. } => Response::Ok("template key restored".into()),
@@ -1283,6 +1458,37 @@ fn recovery_success_paths_with_a_live_daemon() {
     assert!(out.contains("recovery envelope erased"), "{out}");
 }
 
+/// The recovery passphrase is the only barrier on the template-key envelope
+/// against someone holding the disk, and the strength floor used to live inside
+/// the interactive branch. `irlume recovery setup </dev/null` therefore wrapped
+/// the key under an EMPTY passphrase and reported success. Both piped rejections
+/// must happen in the CLI, before any request reaches the daemon.
+#[test]
+fn recovery_setup_enforces_the_strength_floor_on_the_piped_path() {
+    let sb = Sandbox::new("recoveryfloor");
+    // A daemon that would happily accept whatever arrives, so a passing test
+    // means the CLI stopped it rather than the socket being dead.
+    let log = serve(&sock(&sb), |_| Response::Ok("recovery set".into()));
+
+    for (piped, want) in [("", "empty passphrase"), ("short\n", "too short")] {
+        let (code, _, err) = run_stdin(
+            &mut sb.cmd(&["recovery", "setup", "--user", "tester"]),
+            piped,
+        );
+        assert_eq!(code, 2, "must exit 2 on a refused passphrase: {err}");
+        assert!(err.contains(want), "expected {want:?} in: {err}");
+        assert!(
+            err.contains("nothing set"),
+            "the user must be told no envelope was written: {err}"
+        );
+    }
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "a refused passphrase must not reach the daemon: {:?}",
+        log.lock().unwrap()
+    );
+}
+
 #[test]
 fn recovery_setup_error_names_the_enroll_first_remedy() {
     let sb = Sandbox::new("recoveryerr");
@@ -1291,7 +1497,7 @@ fn recovery_setup_error_names_the_enroll_first_remedy() {
     });
     let (code, _, err) = run_stdin(
         &mut sb.cmd(&["recovery", "setup", "--user", "tester"]),
-        "pass\n",
+        "correct horse battery\n",
     );
     assert_eq!(code, 1);
     assert!(err.contains("setup failed: no template key"), "{err}");
@@ -1363,6 +1569,7 @@ fn enroll_reports_a_new_profile_and_forwards_the_flags() {
         created: true,
         added: 3,
         total: 3,
+        room: Some(27),
         added_scans: vec!["Scan 1".into(), "Scan 2".into(), "Scan 3".into()],
     });
     let (code, out, _) = run(&mut sb.cmd(&[
@@ -1396,6 +1603,7 @@ fn enroll_merge_points_at_add_scan() {
         created: false,
         added: 2,
         total: 8,
+        room: Some(22),
         added_scans: vec!["Scan 7".into(), "Scan 8".into()],
     });
     let (code, out, _) = run(&mut sb.cmd(&["enroll", "--user", "tester"]));
@@ -1473,6 +1681,7 @@ fn status_renders_the_full_dashboard_from_daemon_answers() {
             encrypted: true,
             recovery_set: true,
             tpm_present: true,
+            key_present: true,
         },
         _ => Response::Error("unexpected request".into()),
     });
@@ -1574,6 +1783,7 @@ fn setup_walks_every_step_noninteractively() {
             created: true,
             added: 6,
             total: 6,
+            room: Some(24),
             added_scans: Vec::new(),
         },
         Request::SealPassword { .. } => Response::PasswordSealed,

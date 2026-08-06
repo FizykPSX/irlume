@@ -2,7 +2,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.8.1
+Version:        0.9.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -133,6 +133,9 @@ install -d %{buildroot}%{_datadir}/%{name}/tflite
 install -m0755 libtensorflowlite_c-%{tflite_ver}-linux-x64/lib/libtensorflowlite_c.so %{buildroot}%{_datadir}/%{name}/tflite/libtensorflowlite_c.so
 install -m0644 libtensorflowlite_c-%{tflite_ver}-linux-x64/LICENSE.tensorflow %{buildroot}%{_datadir}/%{name}/tflite/LICENSE.tensorflow
 install -m0644 libtensorflowlite_c-%{tflite_ver}-linux-x64/PROVENANCE %{buildroot}%{_datadir}/%{name}/tflite/PROVENANCE
+# Not all of libtensorflowlite_c.so is Apache-2.0: it statically links Eigen
+# (MPL-2.0), XNNPACK, ruy and others. Name them beside the library.
+install -m0644 packaging/licenses/THIRD-PARTY-NOTICES.tflite %{buildroot}%{_datadir}/%{name}/tflite/THIRD-PARTY-NOTICES
 install -Dm0644 packaging/fedora/10-ort.conf %{buildroot}%{_unitdir}/irlumed.service.d/10-ort.conf
 install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/packages/irlume.pp
 # Preset: the daemon is enabled on install (see %%post); it only serves a local
@@ -239,6 +242,23 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Wed Aug 05 2026 archledger <archledger236@gmail.com> - 0.9.0-1
+- A sandboxed run could delete live template keys and recovery envelopes, because those paths ignored IRLUME_STATE_DIR; all state paths now honor the override
+- recovery setup accepted an empty passphrase when stdin was a pipe; the 12-character floor now applies to both paths
+- The AppArmor profile blocked every Tier 2 TPM unseal by omitting /var/lib/systemd/pcrlock.json, so the keyring stopped opening at login
+- The TUI and CLI reported "off"/"none" for state they could not read; an unanswered question now renders as unknown
+- The TUI no longer opens camera nodes while the daemon streams them, which failed enrollment on strict UVC modules (#187)
+- A profile can hold templates for more than one recognizer; profiles add-scan and profiles forget-model manage that state (#288)
+- The recognition stage opens to measured third-party models, starting with buffalo_l (#276)
+- Every catalog entry names its pipeline stage; detection and landmarks stay closed
+- A native TFLite runtime ships at /usr/share/irlume/tflite/ behind a stage gate that stays closed
+- Dark login was unreachable since 0.8.0 and works again (#284)
+- Garbage landmark geometry abstains instead of scoring confident wrong numbers
+- enroll --scans and camera-tune --rounds with a non-numeric value are usage errors, not a capture at the default count
+- The CLI no longer opens video nodes while the daemon streams them, completing the #187 fix that #300 started in the TUI
+- A scan budget an older daemon did not report reads as unknown rather than zero, which had silently under-enrolled during the upgrade window
+- Packit could not build an SRPM at all since the TFLite runtime tag was published; .packit.yaml now filters to release tags
+- CI validates the AppArmor profiles, which nothing checked before
 * Tue Aug 04 2026 archledger <archledger236@gmail.com> - 0.8.1-1
 - A printed photograph of an enrolled face passes the built-in liveness gate; the cue cannot be repaired by tuning it, and the mitigation is `irlume models enable flir` (advisory, #235)
 - A blown infrared frame is refused rather than judged, so clipping no longer silences the PAD cue (#237)

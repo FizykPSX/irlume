@@ -233,6 +233,7 @@ fn status_eyes_open_unarmed_plaintext_and_biopolicy_enforcing() {
             encrypted: false,
             recovery_set: false,
             tpm_present: true,
+            key_present: false,
         },
         _ => Response::Error("unexpected request".into()),
     });
@@ -576,6 +577,7 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             created: false,
             added: 2,
             total: 8,
+            room: Some(22),
             added_scans: Vec::new(),
         },
         Request::SealPassword { .. } => Response::PasswordSealed,
@@ -722,7 +724,12 @@ fn unexpected_responses_for_keyring_and_recovery_writes() {
     let cases: &[(&[&str], &str)] = &[
         (&["keyring", "arm", "--user", "tester"], "pw\n"),
         (&["keyring", "forget", "--user", "tester"], ""),
-        (&["recovery", "setup", "--user", "tester"], "pass\n"),
+        // Must clear the 12-character floor, or the CLI refuses it before the
+        // daemon is asked and this case stops testing the response handling.
+        (
+            &["recovery", "setup", "--user", "tester"],
+            "correct horse battery\n",
+        ),
         (&["recovery", "restore", "--user", "tester"], "pass\n"),
         (&["recovery", "forget", "--user", "tester"], ""),
     ];

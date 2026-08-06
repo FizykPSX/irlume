@@ -730,15 +730,21 @@ pub fn status(args: &[String]) -> ExitCode {
     if let Ok(Response::RecoveryStatus {
         encrypted,
         recovery_set,
+        key_present,
         ..
     }) = daemon_request(&Request::RecoveryStatus { user: user.clone() })
     {
         println!(
             "  templates     : {}",
-            if encrypted {
-                format!("encrypted at rest {OK}")
-            } else {
-                format!("plaintext {WARN} (run `irlume recovery setup`)")
+            match (encrypted, key_present) {
+                (true, true) => format!("encrypted at rest {OK}"),
+                // Reporting this as plaintext both understates the posture and
+                // hides that the enrollment is gone.
+                (true, false) => format!(
+                    "encrypted, but the TEMPLATE KEY IS MISSING {WARN} \
+                     (unreadable; re-enroll)"
+                ),
+                (false, _) => format!("plaintext {WARN} (run `irlume recovery setup`)"),
             }
         );
         println!(
@@ -752,15 +758,12 @@ pub fn status(args: &[String]) -> ExitCode {
     }
 
     // Biopolicy enforcement (opt-in).
-    let bio = irlume_common::config::read_kv("settings.conf", "enforce_biopolicy")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
     println!(
         "  biopolicy     : {}",
-        if bio {
-            format!("ENFORCING {OK} (operation-class gate)")
-        } else {
-            "off (default)".into()
+        match irlume_common::config::enforce_biopolicy_visible() {
+            Some(true) => format!("ENFORCING {OK} (operation-class gate)"),
+            Some(false) => "off (default)".into(),
+            None => "unknown: root-only setting, re-run with sudo".into(),
         }
     );
 
@@ -782,8 +785,16 @@ pub fn status(args: &[String]) -> ExitCode {
         }
     );
 
-    // Cameras.
-    let (rgb, ir) = irlume_camera::select_pair();
+    // Cameras. Ask the DAEMON first: it already holds these nodes and reports
+    // the pair it selected, and classifying a node locally means OPENING it.
+    // On a UVC module that answers EBUSY to a second open, `irlume status` run
+    // during an enrollment fails that enrollment. That is #187, and the #300
+    // fix covered the TUI but left this path enumerating: measured with strace,
+    // `status` opened /dev/video0 through video3 with the daemon running.
+    // Falling back to a local probe when the daemon is down is safe for the
+    // same reason it is in the TUI: nothing else holds the cameras then, and it
+    // is the only source of an answer.
+    let (rgb, ir) = crate::camera_pair();
     println!("  cameras       : rgb={rgb} ir={ir}");
 
     // Fingerprint.
@@ -1052,7 +1063,8 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
         }
         Some(other) => {
             eprintln!("[selinux] unknown subcommand '{other}' (use: status | load)");
-            ExitCode::FAILURE
+            // Usage error, not a runtime failure; see the note in logs::view.
+            ExitCode::from(2)
         }
     }
 }
@@ -1134,6 +1146,26 @@ pub(crate) const REQUIRED_MODELS: [(&str, &str); 2] = [
     ("face_detection_yunet_2023mar.onnx", "IRLUME_DET_MODEL"),
 ];
 
+/// Whether onnxruntime is on disk anywhere irlume or a distro puts it. Pure over
+/// `exists` so the path set is testable without a filesystem, matching
+/// `configured_ort` in irlume-vision.
+///
+/// The distro paths alone are not enough: the irlume packages bundle their own
+/// copy and hand `ORT_DYLIB_PATH` to the daemon through a unit drop-in, which a
+/// bare CLI run never sees. Probing only /usr/lib* made `deps` report the
+/// runtime missing on a machine where the package had installed it.
+fn ort_on_disk(exists: impl Fn(&str) -> bool) -> bool {
+    const DISTRO_ORTS: &[&str] = &[
+        "/usr/lib64/libonnxruntime.so",
+        "/usr/lib/libonnxruntime.so",
+        "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
+    ];
+    DISTRO_ORTS
+        .iter()
+        .chain(irlume_common::PACKAGED_ORT_PATHS.iter())
+        .any(|p| exists(p))
+}
+
 pub fn deps(_args: &[String]) -> ExitCode {
     let mut ok = true;
     let mut check = |label: &str, present: bool, hint: &str| {
@@ -1156,13 +1188,7 @@ pub fn deps(_args: &[String]) -> ExitCode {
     let ort_env = std::env::var("ORT_DYLIB_PATH")
         .ok()
         .filter(|p| std::path::Path::new(p).exists());
-    let ort_sys = [
-        "/usr/lib64/libonnxruntime.so",
-        "/usr/lib/libonnxruntime.so",
-        "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
-    ]
-    .iter()
-    .any(|p| std::path::Path::new(p).exists());
+    let ort_sys = ort_on_disk(|p| std::path::Path::new(p).exists());
     check(
         "onnxruntime",
         loaded || ort_env.is_some() || ort_sys,
@@ -1209,14 +1235,16 @@ pub fn deps(_args: &[String]) -> ExitCode {
 /// so enabling it can restrict which services a face may satisfy but never
 /// locks anyone out.
 pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
-    let on = irlume_common::config::read_kv("settings.conf", "enforce_biopolicy")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
+    let visible = irlume_common::config::enforce_biopolicy_visible();
     match sub {
         None | Some("status") => {
             println!(
                 "[biopolicy] operation-class gate: {}",
-                if on { "ENFORCING" } else { "off (default)" }
+                match visible {
+                    Some(true) => "ENFORCING",
+                    Some(false) => "off (default)",
+                    None => "unknown: root-only setting, re-run with sudo",
+                }
             );
             ExitCode::SUCCESS
         }
@@ -1456,7 +1484,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     }
     println!("  daemon running {OK}");
     let _ = deps(args);
-    let (rgb, ir) = irlume_camera::select_pair();
+    let (rgb, ir) = crate::camera_pair();
     println!("  cameras: rgb={rgb} ir={ir}");
 
     // 2. Enroll (reset if already enrolled and the user wants a clean start).
@@ -1715,7 +1743,7 @@ SETUP & STATUS
 
 ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset]   capture a face profile
-  profiles [list|add-scan|rename|delete|eyes-open|challenge <on|off>]   manage profiles
+  profiles [list|add-scan|rename|delete|forget-model|eyes-open|challenge <on|off>]   manage profiles
   identify              1:N \"who is this?\" (all users as root; else scoped to you)
   calibrate-closure [--rounds N] [--force]   teach the eye-closure gesture for app
                         prompts; captures N rounds (default 3) and stores the median
@@ -1755,8 +1783,10 @@ SYSTEM INTEGRATION
                         camera picker runs this for you)
   camera-tune [--rounds N]        measure whether this camera can stream RGB and
                         IR at once without dimming, and store the answer (sudo)
-  models [enable|disable]         opt-in third-party models (liveness cue, replacement recognizer): measured,
-                        checksum-pinned, deny-only; fetched, never shipped
+  models [list|add|enable|disable [name]]   opt-in third-party models, measured
+                        and checksum-pinned. A PAD entry is a deny-only liveness
+                        cue; a recognition entry REPLACES the RGB matcher at its
+                        measured threshold. Fetched or user-supplied, never shipped
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)
   credential-release-challenge <on|off|status>
@@ -1770,7 +1800,8 @@ SYSTEM INTEGRATION
   version                         print the installed irlume version
 
 MACHINE-READABLE OUTPUT (for desktop integrations; see docs/INTEGRATION.md)
-  --json                on version, status, doctor, profiles list, login status:
+  --json                on version, status, doctor, profiles list, models list,
+                        login status, login plan/verify, auth test --events=jsonl:
                         one line of JSON on stdout, stable check ids and error
                         codes, nothing else printed
   --contract N          declare the contract version you implement; omitted
@@ -1785,6 +1816,30 @@ MACHINE-READABLE OUTPUT (for desktop integrations; see docs/INTEGRATION.md)
 
 #[cfg(test)]
 mod origin_tests {
+    use super::ort_on_disk;
+
+    /// A packaged install puts onnxruntime somewhere no distro path covers and
+    /// exports ORT_DYLIB_PATH to the daemon only, so with irlumed stopped `deps`
+    /// used to print "install onnxruntime" on a machine that already had it.
+    /// That is the exact moment a user runs `deps`, so the advice has to be right.
+    #[test]
+    fn deps_finds_onnxruntime_where_the_packages_put_it() {
+        for packaged in irlume_common::PACKAGED_ORT_PATHS {
+            assert!(
+                ort_on_disk(|p| p == *packaged),
+                "a package-installed runtime at {packaged} must count as present"
+            );
+        }
+        assert!(
+            ort_on_disk(|p| p == "/usr/lib64/libonnxruntime.so"),
+            "a distro-installed runtime must still count"
+        );
+        assert!(
+            !ort_on_disk(|_| false),
+            "nothing on disk anywhere is still absent"
+        );
+    }
+
     use super::{
         arch_names, gz_lists_irlume, installed_version_via, is_copr_repo, latest_release_via,
         ppa_serves_via, ubuntu_codename, version_gt, InstallOrigin,

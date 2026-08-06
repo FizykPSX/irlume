@@ -374,6 +374,10 @@ struct RecoveryInfo {
     encrypted: bool,
     recovery_set: bool,
     tpm_present: bool,
+    /// Whether the key that opens an encrypted store still exists. Encrypted
+    /// with no key means the enrollment cannot be opened by anything, which
+    /// `encrypted` alone cannot say.
+    key_present: bool,
 }
 
 /// Messages streamed from the guided-enroll worker to the UI.
@@ -389,7 +393,10 @@ enum WMsg {
     /// `added_scans` are the scan(s) already appended (undo target on decline).
     MergePrompt {
         profile: String,
-        total: usize,
+        /// Scans the daemon will still accept for this profile in the LOADED
+        /// recognizer's space (#290 made the limit per recognizer). `None`
+        /// when the daemon did not say, which is any daemon older than 0.9.0.
+        room: Option<usize>,
         added_scans: Vec<String>,
     },
 }
@@ -789,11 +796,13 @@ impl LightState {
             encrypted,
             recovery_set,
             tpm_present,
+            key_present,
         }) = crate::daemon_poll(&Request::RecoveryStatus {
             user: user.to_string(),
         }) {
             out.recovery = Some(RecoveryInfo {
                 encrypted,
+                key_present,
                 recovery_set,
                 tpm_present,
             });
@@ -1002,10 +1011,34 @@ impl App {
         }
     }
 
+    /// Enrollment as the chrome may claim it. `None` until ListProfiles has
+    /// ever answered (`profiles_loaded`): an unanswered question must not
+    /// render as "not enrolled", the same rule the Profiles empty state and
+    /// the Done badge already follow.
+    fn enrolled_known(&self) -> Option<bool> {
+        if !self.profiles.is_empty() {
+            Some(true)
+        } else if self.profiles_loaded {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Login wiring as the chrome may claim it. `Probes` holds `login_wired:
+    /// false` until the first sweep lands, and the hint, the Done body and the
+    /// Done footer must not read that default as "not wired" (#187's rule:
+    /// a default is not an observation).
+    fn login_wired_known(&self) -> Option<bool> {
+        self.probes_landed.then_some(self.probes.login_wired)
+    }
+
     /// Capability-aware recommended unlock method (item: "suggest the best one").
     fn recommended(&self) -> &'static str {
         match (self.caps.ir_pair, self.caps.rgb, self.fp_present) {
-            (true, _, _) => "Face (IR) · secure: login, sudo, lock screen, dark mode",
+            // "in the dark", never "dark mode": IR needs no visible light,
+            // but "dark mode" reads as a UI theme.
+            (true, _, _) => "Face (IR) · secure: login, sudo, lock screen, in the dark",
             (false, true, true) => "Fingerprint (secure), or Face (RGB) for lock-screen only",
             (false, true, false) => "Face (RGB) · convenience: lock-screen unlock only",
             (false, false, true) => "Fingerprint",
@@ -1273,7 +1306,12 @@ impl App {
             if up {
                 "running, socket reachable".into()
             } else {
-                "not reachable on /run/irlume.sock".into()
+                // Name the socket the ping actually used: with IRLUME_SOCKET
+                // set, "/run/irlume.sock" described a path nobody probed.
+                format!(
+                    "not reachable on {}",
+                    irlume_common::client::socket_path().display()
+                )
             },
             if up {
                 Fix::None
@@ -1338,23 +1376,10 @@ impl App {
                 .ok()
                 .filter(|p| std::path::Path::new(p).exists())
                 .is_some()
-                || ["/usr/lib64/libonnxruntime.so", "/usr/lib/libonnxruntime.so"]
+                || ORT_FALLBACK_PATHS
                     .iter()
                     .any(|p| std::path::Path::new(p).exists());
-            v.push(mk(
-                "ONNX Runtime",
-                if ort { Sev::Ok } else { Sev::Fail },
-                if ort {
-                    "library found".into()
-                } else {
-                    "libonnxruntime.so not found (daemon down; local probe)".into()
-                },
-                if ort {
-                    Fix::None
-                } else {
-                    Fix::Manual("install onnxruntime or set ORT_DYLIB_PATH".into())
-                },
-            ));
+            v.push(ort_fallback_check(ort));
 
             // Resolve models the way the daemon does (env → /usr/share/irlume/models
             // → repo cwd), NOT just cwd-relative; a packaged install keeps them in
@@ -1472,6 +1497,17 @@ impl App {
                 "Enrollment",
                 Sev::Ok,
                 "loading profiles…".into(),
+                Fix::None,
+            ));
+        } else if !self.profiles_loaded {
+            // No ListProfiles has ever landed (the daemon was down before the
+            // first answer). "no face enrolled yet" here sent users with a
+            // working encrypted enrollment to [e], overwriting good data; an
+            // unanswered question renders as unknown, never as a negative.
+            v.push(mk(
+                "Enrollment",
+                Sev::Warn,
+                "unknown (profile list not read yet)".into(),
                 Fix::None,
             ));
         } else {
@@ -1606,25 +1642,27 @@ impl App {
                 // line. Surface it so the user isn't left typing the keyring
                 // password after every fingerprint login.
                 if fprintd_wired && !self.fp.enrolled.is_empty() && self.probes.tpm_present {
-                    let armed = self.keyring_armed.unwrap_or(false);
                     // DM-aware: the keyring line must be in EVERY login service
                     // the active DM uses (GDM: gdm-password AND gdm-fingerprint).
                     let wired = self.probes.fp_keyring_wired;
-                    if !armed {
+                    // None = the daemon never answered; neither "arm it" nor
+                    // "all good" is supportable, so no row at all (the Daemon
+                    // row above already carries the failure).
+                    if self.keyring_armed == Some(false) {
                         v.push(mk(
                             "FP keyring unlock",
                             Sev::Warn,
                             "wallet won't auto-unlock on fingerprint login; arm the keyring".into(),
                             Fix::Manual("Keyring tab → [a] arm (seal your login password)".into()),
                         ));
-                    } else if !wired {
+                    } else if self.keyring_armed == Some(true) && !wired {
                         v.push(mk(
                             "FP keyring unlock",
                             Sev::Warn,
                             "keyring armed but the login stack lacks the unlock line".into(),
                             Fix::Root(RootFix::LoginEnable),
                         ));
-                    } else {
+                    } else if self.keyring_armed == Some(true) {
                         v.push(mk(
                             "FP keyring unlock",
                             Sev::Ok,
@@ -2208,14 +2246,30 @@ impl App {
                     }
                     WMsg::MergePrompt {
                         profile,
-                        total,
+                        room,
                         added_scans,
                     } => {
-                        // The rest of the requested scans, capped at the profile's
-                        // remaining 30-scan budget (scan 1 already merged in).
-                        let remaining = target
-                            .saturating_sub(1)
-                            .min(irlume_core::storage::MAX_SCANS_PER_PROFILE.saturating_sub(total));
+                        // The rest of the requested scans, capped at the room
+                        // the DAEMON reports for the loaded recognizer. It was
+                        // computed here from the profile's total scan count,
+                        // which is wrong since the limit became per-recognizer
+                        // (#290): a profile holding two models' templates
+                        // under-counted and the UI refused scans the daemon
+                        // would have accepted.
+                        //
+                        // A daemon older than 0.9.0 does not report room at
+                        // all. Treating that silence as zero offered no
+                        // continuation scans and silently under-enrolled, the
+                        // very failure #290 exists to prevent, in the window
+                        // every upgrade passes through between the package
+                        // swap and the daemon restart. Unknown means ask for
+                        // what the user wanted and let the daemon refuse what
+                        // it will; it is the authority either way.
+                        let rest = target.saturating_sub(1);
+                        let remaining = match room {
+                            Some(room) => rest.min(room),
+                            None => rest,
+                        };
                         merge = Some(MergeConfirm {
                             profile,
                             added_scans,
@@ -3728,15 +3782,27 @@ impl App {
     /// lands on a screen not knowing why they're there: no jargon, names the key.
     fn draw_hint(&self, f: &mut Frame, area: Rect) {
         // During a capture the whole UI is about holding still; don't distract.
-        // Kept to ~70 chars so it never wraps off this single row on an 80-col
+        // Kept to ~72 chars so it never wraps off this single row on an 80-col
         // terminal (the "  ℹ " prefix eats ~4). Each names the key to press.
+        //
+        // The four setup screens key their hint off observed state: a fixed
+        // "go configure this" line told a fully configured user to redo every
+        // step, which reads as "your setup did not take". Unknown state
+        // (daemon unreachable, sweep not landed) asserts neither direction;
+        // the tri-state rule the rest of this file follows.
         let text = if self.enroll.is_some() {
             "Look at the camera and hold still; the checklist turns green as you go."
         } else {
             match self.screen {
-                SC_WELCOME => {
-                    "New here? Press [e] to scan your face; your password still works too."
-                }
+                SC_WELCOME => match self.enrolled_known() {
+                    Some(true) => {
+                        "You're enrolled; ↑↓ + Enter opens a section, [i] tests recognition."
+                    }
+                    Some(false) => {
+                        "New here? Press [e] to scan your face; your password still works too."
+                    }
+                    None => "Guided setup: Tab walks the steps; each screen names its keys.",
+                },
                 SC_REPAIR => {
                     "A red row is a problem: highlight it, press [f] to fix or [g] for logs."
                 }
@@ -3745,12 +3811,38 @@ impl App {
                     "Press [e] to add a face, or [a] to add scans so it knows you better."
                 }
                 SC_IDENTIFY => "A 'does it recognize me?' test. Press [i] and look at the camera.",
-                SC_KEYRING => {
-                    "Let your login open your password wallet: press [a], type your password."
-                }
-                SC_RECOVERY => "Set a backup passphrase so a broken TPM seal never forces a re-enroll; press [s].",
+                SC_KEYRING => match self.keyring_armed {
+                    Some(true) => {
+                        "Armed: face login opens your wallet. New password? Re-arm with [a]."
+                    }
+                    Some(false) => {
+                        "Let your login open your password wallet: press [a], type your password."
+                    }
+                    None => {
+                        "Seals your login password in the TPM so face login opens your wallet."
+                    }
+                },
+                SC_RECOVERY => match self.recovery.map(|r| r.recovery_set) {
+                    Some(true) => {
+                        "Recovery passphrase set; [t] restores access if the TPM seal breaks."
+                    }
+                    Some(false) => {
+                        "Set a backup passphrase so a broken TPM seal can't force re-enroll: [s]."
+                    }
+                    None => {
+                        "A backup passphrase keeps your enrollment usable if the TPM seal breaks."
+                    }
+                },
                 SC_FINGERPRINT => "Optional backup: press [a] to add a fingerprint too.",
-                SC_PAM => "Turn on face login for your screen: press [w] (asks for your password).",
+                SC_PAM => match self.login_wired_known() {
+                    Some(true) => {
+                        "Face login is wired in; [s] shows status, [x] un-wires a service."
+                    }
+                    Some(false) => {
+                        "Turn on face login for your screen: press [w] (asks for your password)."
+                    }
+                    None => "Wires face login into your greeter, lock screen and sudo.",
+                },
                 SC_SETTINGS => {
                     "[enter] toggles the eyes-open check, [c] the blink challenge; other settings are root or read-only."
                 }
@@ -3885,9 +3977,20 @@ impl App {
             // saying "no profiles" would tell an enrolled user their face is
             // gone every time they open this tab.
             let msg = if self.profiles_load.is_some() {
-                "\nLoading profiles… (decrypting the enrollment under the TPM key)"
+                "\nLoading profiles… (decrypting the enrollment under the TPM key)".to_string()
+            } else if let Some(err) = &self.enroll_error {
+                // The load FAILED (daemon up, enrollment unreadable). The [e]
+                // prompt here invited overwriting an enrollment that exists;
+                // Repair carries the recovery guidance.
+                format!("\nProfile list unreadable: {err}\n\nDo not re-enroll over it; see the Repair tab first.")
+            } else if !self.profiles_loaded {
+                // Never answered (daemon unreachable): the enrollment may
+                // exist and be fine, so no "none" and no enroll prompt.
+                "\nProfile list not read yet: irlumed is not reachable, so nothing is known about your enrollment.\n\nStart the daemon (Repair tab) and this list loads by itself."
+                    .to_string()
             } else {
                 "\nNo face profiles yet.\n\nPress [e] to enroll; irlume will guide your framing and capture automatically."
+                    .to_string()
             };
             f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }).dim(), area);
             return;
@@ -3943,8 +4046,16 @@ impl App {
         // these: `sel` is clamped to the real rows above).
         let mut items = items;
         items.push(ListItem::new(Line::raw("")));
+        // Pre-split like the two lines below: ratatui Lists never wrap a
+        // ListItem, so one long line here was clipped at the terminal edge
+        // and the sentence ended mid-word at every width. 74 columns is the
+        // budget (80-col terminal minus borders and padding).
         items.push(ListItem::new(Line::from(Span::styled(
-            "  Tips: look different sometimes (glasses, low light)? Add scans to your profile with Improve Recognition ([a]); same identity, not a second profile.",
+            "  Tips: look different sometimes (glasses, low light)? Add scans with",
+            Style::new().dim(),
+        ))));
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  Improve Recognition ([a]); same identity, not a second profile.",
             Style::new().dim(),
         ))));
         items.push(ListItem::new(Line::from(Span::styled(
@@ -4023,7 +4134,7 @@ impl App {
                 // Kept to FOUR lines: this panel does not scroll, so a fifth line
                 // pushes the bottom section off a short terminal.
                 Line::from(Span::styled(
-                    "  Releasing your TPM-sealed keyring password needs CONTINUOUS NODDING (or a",
+                    "  Releasing your TPM-sealed keyring password needs CONTINUOUS NODDING (or an",
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
@@ -4047,17 +4158,32 @@ impl App {
                 ]),
                 Line::raw(""),
                 section("Biopolicy operation-class gate"),
-                Line::from(vec![
-                    Span::raw("  state  "),
-                    if bio {
-                        Span::styled(
-                            "● ENFORCING",
-                            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        Span::styled("○ off (default)", Style::new().dim())
-                    },
-                ]),
+                {
+                    // The shared tri-state reader, not the raw config read the
+                    // [b] direction uses: settings.conf is 0600 root-only, so
+                    // the raw read showed "off (default)" here while the Done
+                    // dashboard said "◐ root-only" for the same key. Same
+                    // truthy set and env override as the daemon.
+                    let (icon, icon_style, label) =
+                        match irlume_common::config::enforce_biopolicy_visible() {
+                            Some(true) => (
+                                "●",
+                                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                                "ENFORCING",
+                            ),
+                            Some(false) => ("○", Style::new().dim(), "off (default)"),
+                            None => (
+                                "◐",
+                                Style::new().fg(th().warn),
+                                "on/off is root-only; run the TUI with sudo to see it",
+                            ),
+                        };
+                    Line::from(vec![
+                        Span::raw("  state  "),
+                        Span::styled(format!("{icon} "), icon_style),
+                        Span::styled(label, Style::new().dim()),
+                    ])
+                },
                 Line::from(Span::styled(
                     "  When on: only Login/Elevation may release the keyring; lock-screen",
                     Style::new().dim(),
@@ -4451,22 +4577,32 @@ impl App {
     }
 
     fn draw_recovery(&self, f: &mut Frame, area: Rect) {
-        let r = self.recovery.unwrap_or_default();
-        let enc = if r.encrypted {
-            Span::styled(
+        // None = RecoveryStatus never answered. The old default here claimed
+        // "plaintext at rest" and "No TPM" about templates that are encrypted
+        // on a TPM machine, one Tab away from the Keyring tab saying "TPM
+        // ● present"; a failed read establishes nothing (docs/MACHINE-API.md).
+        let enc = match self.recovery {
+            Some(r) if r.encrypted && r.key_present => Span::styled(
                 "● encrypted",
                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled("○ plaintext at rest", Style::new().dim())
+            ),
+            // Encrypted with the key gone: safe from a stolen disk and
+            // unreadable by its owner. Neither a reseal nor a recovery
+            // passphrase brings it back, so say re-enroll and say it loudly.
+            Some(r) if r.encrypted => Span::styled(
+                "✗ encrypted, TEMPLATE KEY MISSING (re-enroll)",
+                Style::new().fg(th().err).add_modifier(Modifier::BOLD),
+            ),
+            Some(_) => Span::styled("○ plaintext at rest", Style::new().dim()),
+            None => Span::styled("◐ unknown (daemon unreachable)", Style::new().fg(th().warn)),
         };
-        let rec = if r.recovery_set {
-            Span::styled(
+        let rec = match self.recovery {
+            Some(r) if r.recovery_set => Span::styled(
                 "● set",
                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled("○ not set", Style::new().dim())
+            ),
+            Some(_) => Span::styled("○ not set", Style::new().dim()),
+            None => Span::styled("◐ unknown (daemon unreachable)", Style::new().fg(th().warn)),
         };
         let mut lines = vec![
             section("Recovery + template encryption"),
@@ -4483,16 +4619,26 @@ impl App {
             )),
             Line::raw(""),
         ];
-        if !r.tpm_present {
-            lines.push(Line::from(Span::styled(
-                "  No TPM on this host: templates stay plaintext; recovery N/A.",
-                Style::new().fg(th().err),
-            )));
-        } else if r.encrypted && !r.recovery_set {
-            lines.push(Line::from(Span::styled(
-                "  ⚠ No backstop: set one now, or a broken seal means re-enrolling.",
-                Style::new().fg(th().err),
-            )));
+        match self.recovery {
+            Some(r) if !r.tpm_present => {
+                lines.push(Line::from(Span::styled(
+                    "  No TPM on this host: templates stay plaintext; recovery N/A.",
+                    Style::new().fg(th().err),
+                )));
+            }
+            Some(r) if r.encrypted && !r.recovery_set => {
+                lines.push(Line::from(Span::styled(
+                    "  ⚠ No backstop: set one now, or a broken seal means re-enrolling.",
+                    Style::new().fg(th().err),
+                )));
+            }
+            Some(_) => {}
+            None => {
+                lines.push(Line::from(Span::styled(
+                    "  Nothing here has been read; start irlumed (Repair tab) to see it.",
+                    Style::new().dim(),
+                )));
+            }
         }
         lines.push(Line::raw(""));
         lines.push(action_line(&[
@@ -4550,13 +4696,15 @@ impl App {
                 ),
             ]));
         }
-        // Show the envelope's actual policy tier when the daemon reports it;
-        // the static text is the pre-KeyringInfo default (and what a fresh
-        // arm lands on when neither Tier 1 nor Tier 2 exists on this box).
-        let binding = self
-            .keyring_policy
-            .clone()
-            .unwrap_or_else(|| "PCR-7 (Secure Boot state)".to_string());
+        // Show the envelope's actual policy tier when the daemon reports it.
+        // The static text is the pre-KeyringInfo default; it only applies once
+        // the daemon has ANSWERED (an old daemon, or a fresh arm landing on
+        // the literal tier). Unanswered, it read as this machine's binding.
+        let binding = match (&self.keyring_policy, self.keyring_armed) {
+            (Some(p), _) => p.clone(),
+            (None, None) => "unknown (daemon unreachable)".to_string(),
+            (None, Some(_)) => "PCR-7 (Secure Boot state)".to_string(),
+        };
         lines.extend([
             Line::from(vec![
                 Span::raw("  TPM      "),
@@ -4621,7 +4769,10 @@ impl App {
                     Style::new().dim(),
                 )));
             }
-        } else {
+        } else if self.keyring_armed == Some(false) {
+            // Only an OBSERVED not-armed earns this line; with the daemon
+            // unreachable the state row above already says unknown, and
+            // "won't open your wallet" would contradict it.
             let how = if self.caps.ir_pair {
                 "face"
             } else {
@@ -4673,25 +4824,27 @@ impl App {
     /// Hub rows for the Welcome screen: each visible section with its live
     /// state, selectable and Enter-jumpable (hub-and-spoke: the summary IS
     /// the navigation, the tab ribbon stays for direct access).
-    fn hub_rows(&self) -> Vec<(&'static str, bool, usize)> {
+    fn hub_rows(&self) -> Vec<(&'static str, Option<bool>, usize)> {
         let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
-        let rec = self.recovery.unwrap_or_default();
-        let all: [(&'static str, bool, usize); 7] = [
-            ("checks & repair", self.daemon_up, SC_REPAIR),
-            ("cameras", self.caps.rgb, SC_CAMERAS),
-            ("enrollment", scans > 0, SC_PROFILES),
+        // None = never observed (the daemon has not answered); the badge
+        // renders it as unknown. `unwrap_or(false)` here turned every
+        // unanswered question into "○ no", two of them security claims.
+        let all: [(&'static str, Option<bool>, usize); 7] = [
+            ("checks & repair", Some(self.daemon_up), SC_REPAIR),
+            ("cameras", Some(self.caps.rgb), SC_CAMERAS),
             (
-                "keyring unlock",
-                self.keyring_armed.unwrap_or(false),
-                SC_KEYRING,
+                "enrollment",
+                self.profiles_loaded.then_some(scans > 0),
+                SC_PROFILES,
             ),
+            ("keyring unlock", self.keyring_armed, SC_KEYRING),
             (
                 "recovery + encryption",
-                rec.encrypted && rec.recovery_set,
+                self.recovery.map(|r| r.encrypted && r.recovery_set),
                 SC_RECOVERY,
             ),
-            ("login wiring", self.probes.login_wired, SC_PAM),
-            ("settings", true, SC_SETTINGS),
+            ("login wiring", self.login_wired_known(), SC_PAM),
+            ("settings", Some(true), SC_SETTINGS),
         ];
         all.into_iter()
             .filter(|(_, _, sc)| self.visible.contains(sc))
@@ -4802,9 +4955,14 @@ impl App {
                 style = style.fg(th().accent).add_modifier(Modifier::BOLD);
             }
             let badge = if label == "enrollment" {
-                count_badge(self.profiles.len(), scans, self.live_scans())
+                count_badge(
+                    self.profiles_loaded,
+                    self.profiles.len(),
+                    scans,
+                    self.live_scans(),
+                )
             } else {
-                onoff(ok)
+                onoff_opt(ok)
             };
             let marker = if selected { '▸' } else { ' ' };
             lines.insert(
@@ -4934,15 +5092,26 @@ impl App {
             Span::styled(format!("Secure Boot {} · ", sb.0), Style::new().fg(sb.1)),
             Span::styled(self.probes.boot_mode.clone(), Style::new().dim()),
         ]));
+        // The seal tier is a three-rung ladder (signed PCR-11 > pcrlock NV >
+        // literal PCR-7; see irlume-core/src/pcrsig.rs). The daemon's
+        // KeyringInfo names the armed envelope's actual rung, which is what
+        // the Keyring tab shows; a local artifact probe can only prove Tier 1
+        // availability, so without an answer this line told every Tier-2
+        // pcrlock user their seal sat on the weakest tier.
         lines.push(Line::from(vec![
             Span::styled("  PCR policy ", Style::new().dim()),
             Span::styled(
-                if irlume_core::pcrsig::signed_policy_available() {
-                    "signed (PCR-11)"
+                if let Some(p) = &self.keyring_policy {
+                    p.clone()
+                } else if !self.daemon_up {
+                    "unknown (daemon unreachable)".to_string()
+                } else if self.keyring_armed == Some(true) {
+                    "unreported by this daemon".to_string()
+                } else if irlume_core::pcrsig::signed_policy_available() {
+                    "signed (PCR-11, Tier 1) available".to_string()
                 } else {
-                    "literal PCR-7"
-                }
-                .to_string(),
+                    "not armed; tier decided at arm time".to_string()
+                },
                 Style::new().dim(),
             ),
         ]));
@@ -5221,8 +5390,10 @@ impl App {
 
     fn draw_done(&self, f: &mut Frame, area: Rect) {
         let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
-        let rec = self.recovery.unwrap_or_default();
-        let wired = self.probes.login_wired;
+        // Tri-state, not the raw probe bool: before the first sweep lands the
+        // bool is a default, and this screen must not read a default as "one
+        // step left" (nor as done).
+        let wired = self.login_wired_known();
         let lines = vec![
             section("Setup dashboard"),
             Line::raw(""),
@@ -5236,7 +5407,12 @@ impl App {
             ]),
             Line::from(vec![
                 Span::raw("  enrollment        "),
-                count_badge(self.profiles.len(), scans, self.live_scans()),
+                count_badge(
+                    self.profiles_loaded,
+                    self.profiles.len(),
+                    scans,
+                    self.live_scans(),
+                ),
             ]),
             Line::from(vec![
                 Span::raw("  eyes-open gate    "),
@@ -5248,7 +5424,7 @@ impl App {
             ]),
             Line::from(vec![
                 Span::raw("  keyring unlock    "),
-                onoff(self.keyring_armed.unwrap_or(false)),
+                onoff_opt(self.keyring_armed),
             ]),
             Line::from(vec![
                 Span::raw("  keyring gesture   "),
@@ -5260,21 +5436,28 @@ impl App {
             ]),
             Line::from(vec![
                 Span::raw("  templates enc     "),
-                onoff(rec.encrypted),
+                onoff_opt(self.recovery.map(|r| r.encrypted)),
             ]),
             Line::from(vec![
                 Span::raw("  recovery pass     "),
-                onoff(rec.recovery_set),
+                onoff_opt(self.recovery.map(|r| r.recovery_set)),
             ]),
             Line::from(vec![
                 Span::raw("  biopolicy         "),
-                onoff(biopolicy_on()),
+                // Same tri-state as the gesture row above: the CLI half fixed
+                // this in `status` (settings.conf is 0600 root-only, so an
+                // unreadable key must not print as off), and the two surfaces
+                // must agree on the daemon's truthy set and env override.
+                match irlume_common::config::enforce_biopolicy_visible() {
+                    Some(v) => onoff(v),
+                    None => Span::styled("◐ root-only", Style::new().fg(th().warn)),
+                },
             ]),
             Line::from(vec![
                 Span::raw("  fingerprint       "),
                 onoff(self.fp.available),
             ]),
-            Line::from(vec![Span::raw("  login wiring      "), onoff(wired)]),
+            Line::from(vec![Span::raw("  login wiring      "), onoff_opt(wired)]),
             Line::raw(""),
             Line::from(Span::styled(
                 if !self.daemon_up {
@@ -5283,14 +5466,16 @@ impl App {
                     "  Not set up yet; enroll a face (Welcome [e]) to begin."
                 } else if self.profiles.is_empty() {
                     "  No face hardware; fingerprint/password remain your methods."
-                } else if !wired {
+                } else if wired == Some(false) {
                     "  One step left: your login screen isn't wired yet; press [w] (sudo; password stays the fallback)."
+                } else if wired.is_none() {
+                    "  Checking login wiring; the row above fills in when the probe lands."
                 } else {
                     "  All set. irlume keeps running as a daemon; this panel is safe to quit."
                 },
                 Style::new().dim(),
             )),
-            if !self.profiles.is_empty() && !wired {
+            if !self.profiles.is_empty() && wired == Some(false) {
                 Line::from(vec![
                     Span::styled("  [w]", Style::new().fg(th().accent)),
                     Span::styled(" wire login    [r] refresh    [q] quit", Style::new().dim()),
@@ -5354,13 +5539,17 @@ impl App {
     }
 
     /// Per-screen action keys, ordered primary-first: the footer shows
-    /// the first three, the [?] overlay shows them all.
+    /// the first three, the [?] overlay shows them all. Every bound key of a
+    /// screen belongs here; the overlay claims to be the full keymap, so a
+    /// key documented only in body text is invisible once the body scrolls
+    /// or the user reaches for [?].
     fn screen_actions(&self) -> &'static [(&'static str, &'static str)] {
         match self.screen {
             SC_WELCOME => &[
                 ("e", "enroll"),
                 ("i", "identify"),
                 ("r", "refresh"),
+                ("enter", "open the selected section"),
                 ("U", "uninstall"),
             ],
             SC_REPAIR => &[
@@ -5375,6 +5564,7 @@ impl App {
                 ("enter", "use"),
                 ("s", "setup emitter"),
                 ("p", "list units"),
+                ("t", "tune capture"),
             ],
             SC_PROFILES => &[
                 ("e", "enroll"),
@@ -5383,7 +5573,12 @@ impl App {
                 ("d", "delete"),
             ],
             SC_IDENTIFY => &[("i", "identify")],
-            SC_KEYRING => &[("a", "arm"), ("r", "reseal"), ("f", "forget")],
+            SC_KEYRING => &[
+                ("a", "arm"),
+                ("r", "reseal"),
+                ("f", "forget"),
+                ("p", "refresh pcrlock policy"),
+            ],
             SC_RECOVERY => &[("s", "set"), ("t", "restore"), ("f", "forget")],
             SC_FINGERPRINT => &[
                 ("a", "enroll finger"),
@@ -5408,7 +5603,17 @@ impl App {
                 ("b", "biopolicy"),
                 ("m", "3rd-party model"),
             ],
-            SC_DONE => &[("w", "wire login"), ("u", "update"), ("r", "refresh")],
+            // [w] only while wiring is OBSERVED missing: the body hides its
+            // [w] line on a wired box, and a footer still offering it invites
+            // a needless `sudo irlume login enable --apply` re-run. Unknown
+            // state (no sweep yet) advertises nothing either way.
+            SC_DONE => {
+                if self.login_wired_known() == Some(false) {
+                    &[("w", "wire login"), ("u", "update"), ("r", "refresh")]
+                } else {
+                    &[("u", "update"), ("r", "refresh")]
+                }
+            }
             _ => &[("r", "refresh")],
         }
     }
@@ -5472,7 +5677,7 @@ impl App {
     /// of the CURRENT screen (tier two of the disclosure ladder).
     fn help_body(&self) -> String {
         let mut b = String::from(
-            "Global\n  Tab / \u{2190}\u{2192}  switch tab      \u{2191}\u{2193}  select\n               v  basic/all tabs       PgUp/Dn  activity log\n               M  release mouse (highlight/copy)   q  quit\n\nThis screen\n",
+            "Global\n  Tab / \u{2190}\u{2192}  switch tab      \u{2191}\u{2193}  select\n               v  basic/all tabs       PgUp/Dn  activity log\n               h  home (the Welcome tab)\n               M  release mouse (highlight/copy)   q  quit\n\nThis screen\n",
         );
         for (k, d) in self.screen_actions() {
             b.push_str(&format!("  {k:<7} {d}\n"));
@@ -5568,6 +5773,16 @@ fn onoff(on: bool) -> Span<'static> {
     }
 }
 
+/// [`onoff`] with the honest third state: `None` means the question was never
+/// answered (daemon unreachable), which must render as unknown, never as "no".
+/// Same glyph and reasoning as the Done tab's root-only badge.
+fn onoff_opt(state: Option<bool>) -> Span<'static> {
+    match state {
+        Some(v) => onoff(v),
+        None => Span::styled("◐ unknown", Style::new().fg(th().warn)),
+    }
+}
+
 /// A screen state row: 2-space indent, label padded to `w`, then the value
 /// span. One shape for every status line so screens line up the same way.
 fn state_row(label: &str, w: usize, value: Span<'static>) -> Line<'static> {
@@ -5605,8 +5820,16 @@ fn method_label(method: &str) -> String {
 /// scans the loaded recognizer can match, `None` when the daemon does not
 /// report it. Zero live scans is a warning, not a green badge: enrollment
 /// that cannot match is not healthy, however many scans it holds (#288).
-fn count_badge(profiles: usize, scans: usize, live: Option<usize>) -> Span<'static> {
+/// `known` = a ListProfiles has landed; an empty list before that is "not
+/// observed", and "○ none" there prompted enrolled users to re-enroll.
+fn count_badge(known: bool, profiles: usize, scans: usize, live: Option<usize>) -> Span<'static> {
     if profiles == 0 {
+        if !known {
+            return Span::styled(
+                "◐ unknown (profile list not read)",
+                Style::new().fg(th().warn),
+            );
+        }
         return Span::styled("○ none", Style::new().dim());
     }
     match live {
@@ -5618,6 +5841,40 @@ fn count_badge(profiles: usize, scans: usize, live: Option<usize>) -> Span<'stat
             format!("● {profiles} profile(s), {scans} scan(s)"),
             Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
         ),
+    }
+}
+
+/// Where the down-mode fallback probe looks for libonnxruntime.so. The first
+/// two are the packaged bundle locations (keep in step with PACKAGED_ORTS in
+/// crates/irlume-vision/src/lib.rs, the canonical list): the packages export
+/// ORT_DYLIB_PATH only inside the daemon's unit drop-in, so this process's
+/// environment cannot see it and the probe false-failed on every packaged
+/// install until these paths were scanned too.
+const ORT_FALLBACK_PATHS: &[&str] = &[
+    "/usr/share/irlume/onnxruntime/lib/libonnxruntime.so",
+    "/opt/irlume/onnxruntime/lib/libonnxruntime.so",
+    "/usr/lib64/libonnxruntime.so",
+    "/usr/lib/libonnxruntime.so",
+];
+
+/// The Repair row for the ONNX fallback probe (daemon down). Not-found is a
+/// Warn, not a Fail: with the daemon down the probe is a guess about an env
+/// it cannot see, and the Daemon row above already carries the real failure;
+/// a Fail here sent users off to install packages they may already have.
+fn ort_fallback_check(found: bool) -> Check {
+    Check {
+        label: "ONNX Runtime".into(),
+        sev: if found { Sev::Ok } else { Sev::Warn },
+        detail: if found {
+            "library found".into()
+        } else {
+            "not seen by a local probe; the daemon's unit may set its own path".into()
+        },
+        fix: if found {
+            Fix::None
+        } else {
+            Fix::Manual("start the daemon first; it reports its real ONNX state".into())
+        },
     }
 }
 
@@ -5636,6 +5893,22 @@ fn map_ok(resp: Response) -> (bool, String) {
         Response::Error(e) => (false, e),
         o => (false, format!("unexpected: {o:?}")),
     }
+}
+
+/// Does `reason` carry any word the summary line does not already say?
+/// Word-set based, not equality: daemons phrase the echo with connectives
+/// ("live face, BUT no enrolled match"), so an exact compare never fires.
+fn reason_adds_information(summary: &str, reason: &str) -> bool {
+    let words = |s: &str| -> Vec<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    };
+    let known = words(summary);
+    words(reason)
+        .iter()
+        .any(|w| w != "but" && !known.contains(w))
 }
 
 fn map_identify(resp: Response) -> (bool, String) {
@@ -5657,14 +5930,25 @@ fn map_identify(resp: Response) -> (bool, String) {
             live,
             reason,
             ..
-        } => (
-            false,
-            if live {
-                format!("live face, no enrolled match ({reason})")
+        } => {
+            let summary = if live {
+                "live face, no enrolled match"
             } else {
-                format!("no live face ({reason})")
-            },
-        ),
+                "no live face"
+            };
+            // The daemon's reason often restates the summary ("live face, but
+            // no enrolled match"), which rendered as "live face, no enrolled
+            // match (live face, but no enrolled match)". Append it only when
+            // it says something the summary does not.
+            (
+                false,
+                if reason_adds_information(summary, &reason) {
+                    format!("{summary} ({reason})")
+                } else {
+                    summary.to_string()
+                },
+            )
+        }
         Response::Error(e) => (false, e),
         o => (false, format!("unexpected: {o:?}")),
     }
@@ -5824,13 +6108,13 @@ fn enroll_worker(
                 Ok(Response::Enrolled {
                     created: false,
                     profile: resolved,
-                    total,
+                    room,
                     added_scans,
                     ..
                 }) => {
                     let _ = send(WMsg::MergePrompt {
                         profile: resolved,
-                        total,
+                        room,
                         added_scans,
                     });
                     return;
@@ -6070,6 +6354,14 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(120, 50)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
         rendered(&term)
+    }
+
+    /// The first rendered line containing `needle`, for row-scoped assertions:
+    /// a badge must be tied to ITS row, not merely found somewhere on screen.
+    fn row_with<'a>(text: &'a str, needle: &str) -> &'a str {
+        text.lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no line contains '{needle}':\n{text}"))
     }
 
     fn profile(name: &str, scans: &[&str]) -> ProfileSummary {
@@ -7812,10 +8104,11 @@ mod tests {
         let mut app = test_app();
         let (tx, enroll) = fake_enroll(0, ENROLL_SCANS);
         app.enroll = Some(enroll);
-        // 28 of 30 scans already on the profile: only 2 more fit the budget.
+        // Two slots left for the loaded recognizer, so the modal offers 2 even
+        // though the requested target is larger.
         tx.send(WMsg::MergePrompt {
             profile: "Alice".into(),
-            total: 28,
+            room: Some(2),
             added_scans: vec!["scan28".into()],
         })
         .unwrap();
@@ -7823,17 +8116,14 @@ mod tests {
         assert!(app.enroll.is_none(), "the worker hands off to the modal");
         let mc = app.enroll_merge.as_ref().expect("the merge modal is up");
         assert_eq!(mc.profile, "Alice");
-        assert_eq!(
-            mc.remaining, 2,
-            "remaining = min(target-1, 30-scan budget left)"
-        );
+        assert_eq!(mc.remaining, 2, "remaining = min(target-1, room)");
         // Below the budget the requested count minus the merged scan survives.
         let (tx, enroll) = fake_enroll(0, ENROLL_SCANS);
         app.enroll = Some(enroll);
         app.enroll_merge = None;
         tx.send(WMsg::MergePrompt {
             profile: "Alice".into(),
-            total: 5,
+            room: Some(25),
             added_scans: vec!["scan5".into()],
         })
         .unwrap();
@@ -7841,6 +8131,78 @@ mod tests {
         assert_eq!(
             app.enroll_merge.as_ref().unwrap().remaining,
             ENROLL_SCANS - 1
+        );
+    }
+
+    /// The upgrade window: a 0.9.0 TUI talking to a still-running 0.8.1
+    /// daemon, which is every upgrade between the package swap and the daemon
+    /// restart. That daemon never sends `room`. While the field was a plain
+    /// `usize` it defaulted to 0, indistinguishable from a genuinely full
+    /// profile, so the modal offered zero continuation scans and the user who
+    /// asked for ten got the one merged scan with nothing saying so. That is
+    /// the silent under-enrollment #290 exists to prevent.
+    #[test]
+    fn an_unreported_room_falls_back_to_the_requested_count() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        let (tx, enroll) = fake_enroll(0, ENROLL_SCANS);
+        app.enroll = Some(enroll);
+        tx.send(WMsg::MergePrompt {
+            profile: "Alice".into(),
+            room: None,
+            added_scans: vec!["scan1".into()],
+        })
+        .unwrap();
+        app.poll();
+        assert_eq!(
+            app.enroll_merge.as_ref().expect("modal is up").remaining,
+            ENROLL_SCANS - 1,
+            "a daemon that did not say must not read as a full profile"
+        );
+
+        // Some(0) is a different answer and still means full.
+        let (tx, enroll) = fake_enroll(0, ENROLL_SCANS);
+        app.enroll = Some(enroll);
+        app.enroll_merge = None;
+        tx.send(WMsg::MergePrompt {
+            profile: "Alice".into(),
+            room: Some(0),
+            added_scans: vec!["scan1".into()],
+        })
+        .unwrap();
+        app.poll();
+        assert_eq!(
+            app.enroll_merge.as_ref().expect("modal is up").remaining,
+            0,
+            "an explicit zero is a real answer and must still cap"
+        );
+    }
+
+    /// The mixed-recognizer state this release creates: a profile can hold more
+    /// than MAX_SCANS_PER_PROFILE scans in total across recognizers while the
+    /// loaded one still has room. Deriving remaining from `total` computed 0
+    /// here, so the user asked for ten scans, got the one merged scan, and the
+    /// new recognizer was left under-enrolled with no message saying so. The
+    /// daemon counts per recognizer and sends the answer; the TUI uses it.
+    #[test]
+    fn merge_remaining_follows_the_daemons_room_not_the_profile_total() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        let (tx, enroll) = fake_enroll(0, ENROLL_SCANS);
+        app.enroll = Some(enroll);
+        tx.send(WMsg::MergePrompt {
+            profile: "Alice".into(),
+            // The profile holds more than MAX_SCANS_PER_PROFILE across both
+            // recognizers, yet the loaded one still has most of its own budget.
+            room: Some(25),
+            added_scans: vec!["scan1".into()],
+        })
+        .unwrap();
+        app.poll();
+        assert_eq!(
+            app.enroll_merge.as_ref().expect("modal is up").remaining,
+            ENROLL_SCANS - 1,
+            "a full profile-wide count must not zero out a recognizer with room"
         );
     }
 
@@ -8041,9 +8403,11 @@ mod tests {
             text.contains("Face (IR)"),
             "the IR tier must be recommended on IR hardware"
         );
+        // Enrolled (a profile is present), so the hint must not read as a
+        // first-run greeting; the state-aware variants have their own test.
         assert!(
-            text.contains("New here? Press [e]"),
-            "the Welcome hint line is missing"
+            text.contains("You're enrolled"),
+            "the Welcome hint line is missing:\n{text}"
         );
         assert!(text.contains("step 1/"), "the wizard position is missing");
         // No-camera tier: the recommendation flips to password-only.
@@ -8056,6 +8420,9 @@ mod tests {
     fn profiles_screen_renders_empty_state_and_scan_tree() {
         let mut app = test_app();
         app.screen = SC_PROFILES;
+        // The empty state requires an OBSERVED empty list; unobserved renders
+        // unknown (see the unanswered-question tests).
+        app.profiles_loaded = true;
         let text = draw_text(&app);
         assert!(text.contains("No face profiles yet"));
         assert!(text.contains("Press [e] to enroll"));
@@ -8373,6 +8740,7 @@ mod tests {
         // No TPM: plaintext + the recovery-N/A line.
         app.recovery = Some(RecoveryInfo {
             encrypted: false,
+            key_present: false,
             recovery_set: false,
             tpm_present: false,
         });
@@ -8382,6 +8750,7 @@ mod tests {
         // Encrypted without a backstop: the warning line.
         app.recovery = Some(RecoveryInfo {
             encrypted: true,
+            key_present: true,
             recovery_set: false,
             tpm_present: true,
         });
@@ -8392,6 +8761,7 @@ mod tests {
         // Fully set: both badges green, no warning.
         app.recovery = Some(RecoveryInfo {
             encrypted: true,
+            key_present: true,
             recovery_set: true,
             tpm_present: true,
         });
@@ -8799,7 +9169,10 @@ mod tests {
 
     #[test]
     fn footer_lists_each_screens_action_keys() {
-        let app = test_app();
+        let mut app = test_app();
+        // The Done footer offers [w] only on OBSERVED-unwired state; give the
+        // sweep so the case below exercises the offer, not the unknown state.
+        app.probes_landed = true;
         let footer = |app: &App| {
             let mut term = Terminal::new(TestBackend::new(200, 3)).unwrap();
             term.draw(|f| app.draw_footer(f, f.area())).unwrap();
@@ -8820,7 +9193,6 @@ mod tests {
             (SC_SETTINGS, "eyes-open", "3rd-party model"),
             (SC_DONE, "wire login", "refresh"),
         ];
-        let mut app = app;
         for (screen, primary, in_overlay) in cases {
             app.screen = screen;
             assert!(
@@ -8960,6 +9332,8 @@ mod tests {
     fn run_checks_trusts_daemon_health_over_local_probes() {
         let _sock = dead_socket();
         let mut app = test_app();
+        // The "no face enrolled yet" verdict needs an observed empty list.
+        app.profiles_loaded = true;
         app.health = Some(HealthInfo {
             tier: "secure".into(),
             rgb_dev: Some("/dev/video0".into()),
@@ -9089,5 +9463,437 @@ mod tests {
             Fix::Manual(m) => assert!(m.contains("reseal"), "fix points at reseal: {m}"),
             _ => panic!("expected a manual fix pointing at reseal"),
         }
+    }
+
+    // ---- an unanswered question renders as unknown, never as a negative ----
+    // The machine-API contract (docs/MACHINE-API.md): a failed read
+    // "established nothing", and a consumer must not render it as disabled.
+    // These pin the TUI surfaces that used to claim "none"/"no"/"plaintext"
+    // while the daemon had never answered.
+
+    #[test]
+    fn an_unanswered_profile_list_renders_unknown_not_none() {
+        // Daemon down before the first ListProfiles landed: every surface
+        // that said "none" here invited a re-enroll over an enrollment that
+        // exists (reproduced on three machines).
+        let mut app = test_app();
+        assert!(!app.profiles_loaded && app.profiles_load.is_none());
+
+        // Profiles tab: no absence claim, no [e] invitation.
+        app.screen = SC_PROFILES;
+        let text = draw_text(&app);
+        assert!(!text.contains("No face profiles yet"), "{text}");
+        assert!(!text.contains("Press [e] to enroll"), "{text}");
+        assert!(text.contains("Profile list not read yet"), "{text}");
+
+        // Repair: the Enrollment verdict is unknown, not "no face enrolled".
+        app.run_checks();
+        let enroll = app
+            .repair
+            .iter()
+            .find(|c| c.label == "Enrollment")
+            .expect("an Enrollment row");
+        assert!(enroll.detail.contains("unknown"), "{}", enroll.detail);
+        assert!(
+            !enroll.detail.contains("no face enrolled"),
+            "{}",
+            enroll.detail
+        );
+
+        // Welcome hub: the three unanswered rows carry the unknown badge.
+        app.screen = SC_WELCOME;
+        app.visible = (0..SCREENS.len()).collect();
+        let text = draw_text(&app);
+        assert!(
+            row_with(&text, "enrollment").contains("◐ unknown"),
+            "{text}"
+        );
+        assert!(
+            row_with(&text, "keyring unlock").contains("◐ unknown"),
+            "{text}"
+        );
+        assert!(
+            row_with(&text, "recovery + encryption").contains("◐ unknown"),
+            "{text}"
+        );
+
+        // Done dashboard: same rule for its four claim rows.
+        app.screen = SC_DONE;
+        let text = draw_text(&app);
+        assert!(
+            row_with(&text, "enrollment").contains("◐ unknown"),
+            "{text}"
+        );
+        assert!(
+            row_with(&text, "keyring unlock").contains("◐ unknown"),
+            "{text}"
+        );
+        assert!(
+            row_with(&text, "templates enc").contains("◐ unknown"),
+            "{text}"
+        );
+        assert!(
+            row_with(&text, "recovery pass").contains("◐ unknown"),
+            "{text}"
+        );
+    }
+
+    /// The store is encrypted and its key is gone, which is what a lost
+    /// template key looks like from the panel. Rendering that as "encrypted"
+    /// hides that the enrollment can no longer be opened by anything.
+    #[test]
+    fn recovery_screen_names_an_encrypted_store_whose_key_is_gone() {
+        let mut app = test_app();
+        app.screen = SC_RECOVERY;
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            key_present: false,
+            recovery_set: false,
+            tpm_present: true,
+        });
+        let text = draw_text(&app);
+        assert!(
+            text.contains("TEMPLATE KEY MISSING"),
+            "an orphaned store must be named, not shown as healthy: {text}"
+        );
+        assert!(
+            !text.contains("● encrypted"),
+            "it must not read as a clean encrypted state: {text}"
+        );
+    }
+
+    #[test]
+    fn recovery_screen_renders_unknown_when_never_answered() {
+        // recovery = None used to default-render "plaintext at rest" and
+        // "No TPM on this host", both false on the machines that hit it, and
+        // one Tab away from the Keyring tab saying "TPM ● present".
+        let mut app = test_app();
+        app.screen = SC_RECOVERY;
+        assert!(app.recovery.is_none());
+        let text = draw_text(&app);
+        assert!(!text.contains("plaintext at rest"), "{text}");
+        assert!(!text.contains("No TPM on this host"), "{text}");
+        assert!(!text.contains("○ not set"), "{text}");
+        assert!(text.contains("◐ unknown (daemon unreachable)"), "{text}");
+    }
+
+    #[test]
+    fn the_ort_fallback_probe_covers_packaged_installs_and_never_hard_fails() {
+        // The packages bundle onnxruntime outside the system lib dirs and set
+        // ORT_DYLIB_PATH only inside the daemon's unit drop-in, so the probe
+        // must scan the PACKAGED_ORTS locations (irlume-vision/src/lib.rs)
+        // itself or it false-fails on every packaged install.
+        for packaged in [
+            "/usr/share/irlume/onnxruntime/lib/libonnxruntime.so",
+            "/opt/irlume/onnxruntime/lib/libonnxruntime.so",
+        ] {
+            assert!(
+                ORT_FALLBACK_PATHS.contains(&packaged),
+                "fallback probe misses the packaged path {packaged}"
+            );
+        }
+        // With the daemon down the probe is a guess about an env it cannot
+        // see; a Fail sent users to install packages they already have.
+        let miss = ort_fallback_check(false);
+        assert!(miss.sev == Sev::Warn, "a guess must not be a hard failure");
+        assert!(miss.detail.contains("local probe"), "{}", miss.detail);
+        let hit = ort_fallback_check(true);
+        assert!(hit.sev == Sev::Ok);
+    }
+
+    #[test]
+    fn repair_reports_the_daemons_seal_tier_not_the_weakest_rung() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        // Down: the tier is unknown; "literal PCR-7" told a Tier-2 pcrlock
+        // user their seal sat on the weakest rung, contradicting the Keyring
+        // tab one Tab away.
+        let text = draw_text(&app);
+        assert!(!text.contains("literal PCR-7"), "{text}");
+        assert!(
+            row_with(&text, "PCR policy").contains("unknown (daemon unreachable)"),
+            "{text}"
+        );
+        // The daemon's KeyringInfo names the rung: show it verbatim, exactly
+        // as the Keyring tab does.
+        app.daemon_up = true;
+        app.keyring_armed = Some(true);
+        app.keyring_policy = Some("pcrlock NV 0x1a2b (Tier 2)".into());
+        let text = draw_text(&app);
+        assert!(
+            row_with(&text, "PCR policy").contains("pcrlock NV 0x1a2b (Tier 2)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_daemon_row_names_the_socket_actually_probed() {
+        // IRLUME_SOCKET redirects every request the TUI makes; the row
+        // hardcoded /run/irlume.sock, a path nobody probed.
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.run_checks();
+        let d = app
+            .repair
+            .iter()
+            .find(|c| c.label == "Daemon (irlumed)")
+            .expect("a Daemon row");
+        assert!(
+            d.detail.contains("/nonexistent/irlume-test.sock"),
+            "{}",
+            d.detail
+        );
+    }
+
+    #[test]
+    fn keyring_binding_and_advice_wait_for_the_daemon() {
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        let text = draw_text(&app);
+        // The pre-KeyringInfo default described a binding nobody read.
+        assert!(!text.contains("PCR-7 (Secure Boot state)"), "{text}");
+        assert!(
+            row_with(&text, "binding").contains("unknown (daemon unreachable)"),
+            "{text}"
+        );
+        // And no armed-state consequence line off an unanswered question.
+        assert!(!text.contains("Not armed;"), "{text}");
+    }
+
+    #[test]
+    fn identify_deny_reasons_that_echo_the_summary_are_not_repeated() {
+        // The daemon's deny reason restates the summary with a connective;
+        // appending it rendered "live face, no enrolled match (live face,
+        // but no enrolled match)". Informative reasons keep their
+        // parenthetical (pinned by map_identify_formats_match_and_both_miss_reasons).
+        let (ok, msg) = map_identify(Response::Identified {
+            user: None,
+            profile: None,
+            score: 0.0,
+            live: true,
+            reason: "live face, but no enrolled match".into(),
+        });
+        assert!(!ok);
+        assert_eq!(msg, "live face, no enrolled match");
+        let (_, msg) = map_identify(Response::Identified {
+            user: None,
+            profile: None,
+            score: 0.0,
+            live: false,
+            reason: "no live face".into(),
+        });
+        assert_eq!(msg, "no live face");
+        // An empty reason: no dangling "()" either.
+        let (_, msg) = map_identify(Response::Identified {
+            user: None,
+            profile: None,
+            score: 0.0,
+            live: true,
+            reason: String::new(),
+        });
+        assert_eq!(msg, "live face, no enrolled match");
+    }
+
+    #[test]
+    fn done_biopolicy_row_uses_the_shared_tri_state_reader() {
+        // Same rule the CLI `status` fix established (commit 156417f): the
+        // daemon's truthy set and its env override decide what displays, not
+        // a bare settings.conf read that shows "enforce_biopolicy=yes" as no.
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("IRLUME_ENFORCE_BIOPOLICY");
+        std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", "yes");
+        let mut app = test_app();
+        app.screen = SC_DONE;
+        let text = draw_text(&app);
+        match old {
+            Some(v) => std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", v),
+            None => std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY"),
+        }
+        assert!(row_with(&text, "biopolicy").contains("● yes"), "{text}");
+    }
+
+    #[test]
+    fn settings_biopolicy_row_uses_the_shared_tri_state_reader() {
+        // The Done dashboard and this row must agree: on a box whose 0600
+        // settings.conf holds `enforce_biopolicy=yes`, Done said "◐ root-only"
+        // (or "● yes" under the env override) while the raw read here showed
+        // "○ off (default)". The env override is how the test pins the shared
+        // reader: the raw read ignores it.
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("IRLUME_ENFORCE_BIOPOLICY");
+        std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", "yes");
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        let text = draw_text(&app);
+        match old {
+            Some(v) => std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", v),
+            None => std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY"),
+        }
+        assert!(
+            text.contains("ENFORCING"),
+            "the Settings biopolicy row must read the shared tri-state:\n{text}"
+        );
+    }
+
+    #[test]
+    fn setup_hints_follow_observed_state_not_defaults() {
+        // Each setup hint has three honest states: not done (instruct), done
+        // (describe), never observed (assert neither). The fixed per-screen
+        // instruction told a fully configured box to redo every step.
+        let mut app = test_app();
+
+        // Welcome: unknown until ListProfiles has answered.
+        assert!(!draw_text(&app).contains("New here?"));
+        app.profiles_loaded = true;
+        assert!(draw_text(&app).contains("New here? Press [e]"));
+        app.profiles = vec![profile("a", &["s1"])];
+        assert!(draw_text(&app).contains("You're enrolled"));
+
+        // Keyring: keyring_armed is already tri-state.
+        app.screen = SC_KEYRING;
+        let text = draw_text(&app);
+        assert!(!text.contains("press [a], type your password"), "{text}");
+        app.keyring_armed = Some(false);
+        assert!(draw_text(&app).contains("press [a], type your password"));
+        app.keyring_armed = Some(true);
+        assert!(draw_text(&app).contains("Armed: face login opens your wallet"));
+
+        // Recovery: unknown until RecoveryStatus has answered.
+        app.screen = SC_RECOVERY;
+        let text = draw_text(&app);
+        assert!(!text.contains("Set a backup passphrase"), "{text}");
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            recovery_set: false,
+            tpm_present: true,
+            key_present: true,
+        });
+        assert!(draw_text(&app).contains("Set a backup passphrase"));
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            recovery_set: true,
+            tpm_present: true,
+            key_present: true,
+        });
+        assert!(draw_text(&app).contains("Recovery passphrase set"));
+
+        // Login wiring: unknown until the first probe sweep lands.
+        app.screen = SC_PAM;
+        let text = draw_text(&app);
+        assert!(!text.contains("Turn on face login"), "{text}");
+        app.probes_landed = true;
+        app.probes.login_wired = false;
+        assert!(draw_text(&app).contains("Turn on face login"));
+        app.probes.login_wired = true;
+        assert!(draw_text(&app).contains("Face login is wired in"));
+    }
+
+    #[test]
+    fn profiles_tips_fit_an_80_column_terminal_whole() {
+        // ratatui Lists never wrap a ListItem, so the tips must be pre-split;
+        // the old single-line tip ended mid-sentence ("…same identity, not a")
+        // at every width. Rendering at 80 columns proves the whole sentence
+        // survives the narrowest supported terminal.
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("Alice", &["s1"])];
+        let mut term = Terminal::new(TestBackend::new(80, 45)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let text = rendered(&term);
+        assert!(
+            text.contains("second profile."),
+            "the Tips sentence is cut off mid-sentence:\n{text}"
+        );
+    }
+
+    #[test]
+    fn done_offers_wire_login_only_when_wiring_is_observed_missing() {
+        let mut app = test_app();
+        app.screen = SC_DONE;
+        app.daemon_up = true;
+        app.profiles = vec![profile("a", &["s1"])];
+        let footer = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(200, 3)).unwrap();
+            term.draw(|f| app.draw_footer(f, f.area())).unwrap();
+            rendered(&term)
+        };
+        // No sweep yet: the probe default is not an observation, so neither
+        // the footer, the overlay, nor the body may claim wiring is missing.
+        assert!(!footer(&app).contains("wire login"), "{}", footer(&app));
+        assert!(!app.help_body().contains("wire login"));
+        let text = draw_text(&app);
+        assert!(!text.contains("One step left"), "{text}");
+        assert!(!text.contains("All set"), "{text}");
+        // Observed unwired: the offer appears in body and footer.
+        app.probes_landed = true;
+        app.probes.login_wired = false;
+        assert!(footer(&app).contains("wire login"));
+        assert!(draw_text(&app).contains("One step left"));
+        // Observed wired: the body says done and no chrome advertises [w],
+        // which on a wired box would re-run `sudo irlume login enable`.
+        app.probes.login_wired = true;
+        let f = footer(&app);
+        assert!(!f.contains("wire login"), "{f}");
+        assert!(!app.help_body().contains("wire login"));
+        let text = draw_text(&app);
+        assert!(text.contains("All set"), "{text}");
+        assert!(row_with(&text, "login wiring").contains("● yes"), "{text}");
+    }
+
+    #[test]
+    fn ir_recommendation_names_darkness_not_a_ui_theme() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        let text = draw_text(&app);
+        assert!(
+            row_with(&text, "Recommended").contains("in the dark"),
+            "{text}"
+        );
+        // "dark mode" reads as a UI theme, not an IR capability.
+        assert!(!text.contains("dark mode"), "{text}");
+    }
+
+    #[test]
+    fn gesture_explainer_uses_the_right_article_across_its_line_break() {
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        let text = draw_text(&app);
+        // The hand-wrapped pair rendered "…NODDING (or a / eye closure)".
+        assert!(
+            row_with(&text, "CONTINUOUS NODDING").contains("(or an"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_lists_every_bound_key_of_the_screen() {
+        let mut app = test_app();
+        // Global: 'h' jumps home from any tab.
+        assert!(app.help_body().contains("home"), "{}", app.help_body());
+        // Welcome: Enter opens the selected hub section.
+        app.screen = SC_WELCOME;
+        assert!(
+            app.help_body().contains("open the selected section"),
+            "{}",
+            app.help_body()
+        );
+        // Cameras: [t] tune capture is bound and documented in body text.
+        app.screen = SC_CAMERAS;
+        assert!(
+            app.help_body().contains("tune capture"),
+            "{}",
+            app.help_body()
+        );
+        // Keyring: [p] refreshes the pcrlock policy on a Tier-2 seal.
+        app.screen = SC_KEYRING;
+        assert!(app.help_body().contains("pcrlock"), "{}", app.help_body());
     }
 }

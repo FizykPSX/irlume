@@ -690,6 +690,10 @@ fn main() {
     // sends requests cannot exhaust memory. Well above any real client: the
     // greeter, the lock screen, a TUI and sudo together are a handful.
     const MAX_CONNECTION_THREADS: usize = 64;
+    /// Slots an unprivileged peer may not take. The greeter, the lock screen
+    /// and a sudo stack together are a handful, so a small reserve is enough to
+    /// keep the login path answerable while an unprivileged peer floods.
+    const ROOT_RESERVED_SLOTS: usize = 16;
     let live_threads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // How long a throttled connection is held before being closed, and how many
@@ -746,9 +750,25 @@ fn main() {
                     // descriptors one abusive peer can pin.
                     continue;
                 }
+                // Reserve the top of the pool for root.
+                //
+                // The cap is global, and a connection occupies a slot from
+                // accept until its read times out 15 seconds later, so an
+                // unprivileged peer that opens 64 sockets and sends NOTHING is
+                // never charged by `refusal_throttled` (which only counts
+                // arbiter refusals) and locks the socket for everyone: measured,
+                // a root peer's Ping got "daemon busy" for as long as the
+                // attacker held them. Root is where the login path lives, so it
+                // keeps slots an ordinary uid cannot take. The fallback when the
+                // peer cannot be identified is to treat it as unprivileged.
+                let peer_is_root = peer_cred(&stream).is_ok_and(|p| p.uid == 0);
+                let ceiling = if peer_is_root {
+                    MAX_CONNECTION_THREADS
+                } else {
+                    MAX_CONNECTION_THREADS - ROOT_RESERVED_SLOTS
+                };
                 let live = std::sync::Arc::clone(&live_threads);
-                if live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_CONNECTION_THREADS
-                {
+                if live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= ceiling {
                     live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = respond(
                         stream,
@@ -1906,9 +1926,13 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
                 return Some(Response::Error(format!("not authorized to query '{user}'")));
             }
             Response::RecoveryStatus {
-                encrypted: irlume_core::template_key::has_key(user),
+                // The store's own shape, not the key's presence: those differ
+                // exactly when the key is gone, and that case has to be
+                // reportable rather than collapsed into "plaintext".
+                encrypted: irlume_core::storage::store_is_encrypted(user).unwrap_or(false),
                 recovery_set: irlume_core::template_key::has_recovery(user),
                 tpm_present: irlume_core::template_key::tpm_available(),
+                key_present: irlume_core::template_key::has_key(user),
             }
         }
         Request::ListProfiles {
@@ -3019,18 +3043,23 @@ fn enroll_response(outcome: irlume_auth::EnrollOutcome) -> Response {
             created: true,
             added: scans,
             total: scans,
+            // A brand-new profile holds only this recognizer's scans, so the
+            // per-recognizer room is the plain remainder.
+            room: Some(irlume_core::storage::MAX_SCANS_PER_PROFILE.saturating_sub(scans)),
             added_scans: Vec::new(),
         },
         irlume_auth::EnrollOutcome::Merged {
             name,
             added,
             total,
+            room,
             added_scans,
         } => Response::Enrolled {
             profile: name,
             created: false,
             added,
             total,
+            room: Some(room),
             added_scans,
         },
     }
@@ -3567,6 +3596,7 @@ mod tests {
             name: "Face Profile 1".into(),
             added: 1,
             total: 8,
+            room: 22,
             added_scans: vec!["Face Scan 8".into()],
         });
         match merged {
@@ -3575,11 +3605,18 @@ mod tests {
                 created,
                 added,
                 total,
+                room,
                 added_scans,
             } => {
                 assert_eq!(profile, "Face Profile 1");
                 assert!(!created, "a merge must not claim a new profile was created");
                 assert_eq!((added, total), (1, 8));
+                assert_eq!(
+                    room,
+                    Some(22),
+                    "the daemon's per-recognizer room must reach the client, not \
+                     be recomputed there from the profile-wide total"
+                );
                 assert_eq!(added_scans, vec!["Face Scan 8".to_string()]);
             }
             other => panic!("merge must answer Enrolled, got {other:?}"),

@@ -6,7 +6,7 @@
 name: irlume
 arch: amd64
 platform: linux
-version: 0.8.1
+version: 0.9.0
 section: admin
 priority: optional
 maintainer: archledger <archledger236@gmail.com>
@@ -72,6 +72,8 @@ contents:
     dst: /usr/share/irlume/tflite/libtensorflowlite_c.so
   - src: ../../.deb-staging/tflite/LICENSE.tensorflow
     dst: /usr/share/irlume/tflite/LICENSE.tensorflow
+  - src: ../licenses/THIRD-PARTY-NOTICES.tflite
+    dst: /usr/share/irlume/tflite/THIRD-PARTY-NOTICES
   - src: ../../.deb-staging/tflite/PROVENANCE
     dst: /usr/share/irlume/tflite/PROVENANCE
   # systemd unit + an override pointing ORT at the bundled lib

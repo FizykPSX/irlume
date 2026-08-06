@@ -80,6 +80,24 @@ impl std::fmt::Debug for SecretBytes {
     }
 }
 
+/// Where the irlume packages install onnxruntime: Fedora/Copr first, then the
+/// Debian/Ubuntu universal .deb and PPA layout (packaging/README.md records
+/// both). Their systemd drop-in hands `ORT_DYLIB_PATH` to the DAEMON only, so
+/// anything running as a bare CLI has to probe these paths itself.
+///
+/// Shared rather than restated: `irlume deps` kept its own shorter list that
+/// had neither packaged path, so with the daemon stopped it told users to
+/// install onnxruntime on machines where the package had already installed it,
+/// at exactly the moment they were debugging a failed login.
+pub const PACKAGED_ORT_PATHS: &[&str] = &[
+    "/usr/share/irlume/onnxruntime/lib/libonnxruntime.so",
+    "/opt/irlume/onnxruntime/lib/libonnxruntime.so",
+];
+
+fn default_true() -> bool {
+    true
+}
+
 /// Per-user enrolled templates + TPM-sealed release secrets.
 pub const STATE_DIR: &str = "/var/lib/irlume";
 
@@ -733,7 +751,27 @@ pub enum Response {
         profile: String,
         created: bool,
         added: usize,
+        /// Scans in the profile across EVERY recognizer. Display only: the
+        /// scan limit is counted per recognizer (#290), so this is not the
+        /// number to compute a remaining budget from. Use `room`.
         total: usize,
+        /// How many more scans this profile may take IN THE LOADED
+        /// RECOGNIZER'S SPACE, which is what the limit actually governs.
+        /// Carried rather than recomputed by the client: deriving it from
+        /// `total` under-counts on a multi-model profile and refuses scans
+        /// the daemon would accept.
+        ///
+        /// `None` means the daemon did not say, which is every daemon older
+        /// than 0.9.0. That is NOT the same as `Some(0)`, a profile that is
+        /// genuinely full, and the difference is load-bearing: a plain
+        /// `usize` defaulted to 0, so a 0.9.0 client talking to a
+        /// still-running 0.8.1 daemon (the window every upgrade passes
+        /// through, between the package swap and the daemon restart) offered
+        /// zero continuation scans and silently under-enrolled, which is the
+        /// failure #290 exists to prevent. A caller seeing `None` uses its
+        /// own requested count and lets the daemon refuse what it will.
+        #[serde(default)]
+        room: Option<usize>,
         added_scans: Vec<String>,
     },
     SelfTest {
@@ -878,9 +916,16 @@ pub enum Response {
     /// (`RecoveryStatus`): whether templates are encrypted (a sealed key exists)
     /// and whether a recovery passphrase is set.
     RecoveryStatus {
+        /// Whether the STORE is encrypted at rest, from its own on-disk shape.
         encrypted: bool,
         recovery_set: bool,
         tpm_present: bool,
+        /// Whether the template key that opens an encrypted store still exists.
+        /// False with `encrypted` true means the enrollment cannot be opened by
+        /// anything, which no other field can express. Defaults to true so a
+        /// pre-0.9.0 daemon, which never sends it, does not read as key-missing.
+        #[serde(default = "default_true")]
+        key_present: bool,
     },
 }
 
@@ -1320,6 +1365,7 @@ mod tests {
                 created: true,
                 added: 3,
                 total: 3,
+                room: Some(27),
                 added_scans: vec![],
             },
             Response::Enrolled {
@@ -1327,6 +1373,7 @@ mod tests {
                 created: false,
                 added: 1,
                 total: 8,
+                room: Some(22),
                 added_scans: vec!["scan8".into()],
             },
         ] {
@@ -1339,6 +1386,7 @@ mod tests {
                         created: c1,
                         added: a1,
                         total: t1,
+                        room: r1,
                         added_scans: s1,
                     },
                     Response::Enrolled {
@@ -1346,10 +1394,11 @@ mod tests {
                         created: c2,
                         added: a2,
                         total: t2,
+                        room: r2,
                         added_scans: s2,
                     },
                 ) => {
-                    assert_eq!((p1, c1, a1, t1, s1), (p2, c2, a2, t2, s2));
+                    assert_eq!((p1, c1, a1, t1, r1, s1), (p2, c2, a2, t2, r2, s2));
                 }
                 _ => panic!("Enrolled did not round-trip to Enrolled"),
             }
