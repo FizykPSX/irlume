@@ -8,9 +8,11 @@
 //! The model takes 146 of the landmarker-generation mesh's 478 points as
 //! [1, 146, 2] pixel coordinates and returns 52 expression coefficients
 //! (ARKit blendshape order; index 9/10 = eyeBlinkLeft/Right). The subset
-//! includes the 10 iris points (468-477), so the shipped 468-point ONNX
-//! mesh CANNOT feed it: this probe runs the native landmarker mesh, and any
-//! production use would require the native-mesh switch first.
+//! includes the 10 iris points (468-477). Both meshes emit them (the
+//! shipped ONNX is the landmarker-generation conversion, 478 points,
+//! measured), but their iris points have never been parity-checked against
+//! each other (#306 compares the 468 shared-topology points only), so this
+//! probe runs the NATIVE landmarker mesh, the model's own source.
 //!
 //! Index list and tensor convention read from
 //! mediapipe/tasks/cc/vision/face_landmarker/face_blendshapes_graph.cc

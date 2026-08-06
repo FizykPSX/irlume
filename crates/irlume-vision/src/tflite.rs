@@ -180,9 +180,12 @@ impl TfliteSession {
     /// `Engine::load_with_recognizer_bytes`: the digest and the loaded
     /// model can never diverge because they are the same bytes.
     ///
-    /// `threads` caps CPU threads for the interpreter; XNNPACK is applied
-    /// explicitly (the C API does not auto-apply it), so inference speed
-    /// does not depend on how the shared library was built.
+    /// `threads` caps CPU threads for the interpreter. XNNPACK is applied
+    /// explicitly even though the bundled 2.19 build would lazily
+    /// auto-apply it at AllocateTensors (BuiltinOpResolver registers a
+    /// delegate creator; 2026-08-06 research note): the explicit delegate
+    /// pins the thread count and keeps delegation independent of how a
+    /// replacement shared library was built.
     pub fn from_pinned_bytes(
         bytes: &[u8],
         expected_sha256: &str,
