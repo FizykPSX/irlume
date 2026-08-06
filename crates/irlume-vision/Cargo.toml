@@ -7,7 +7,10 @@ license.workspace = true
 [features]
 default = ["onnx", "tflite"]
 # ONNX inference (AuraFace embedder, YuNet detector). Off => align/cosine only.
-onnx = ["dep:ort"]
+# FaceMesh dispatches to the TFLite backend for the production mesh, so
+# enabling onnx requires the tflite binding (MR !3 review: the independent
+# combination stopped compiling).
+onnx = ["dep:ort", "tflite"]
 # Native TFLite/LiteRT runtime (#295): runs pinned .tflite artifacts
 # unconverted via a dlopen'd libtensorflowlite_c; absence is a recoverable
 # runtime answer, not a build requirement, so the feature costs nothing on

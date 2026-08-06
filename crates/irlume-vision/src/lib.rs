@@ -1693,24 +1693,20 @@ mod mesh_backend_tests {
         );
     }
 
-    /// End-to-end over the REAL runtime and the REAL pinned mesh, the
-    /// tflite.rs smoke pattern: self-skips loudly unless
-    /// `IRLUME_TFLITE_MESH_TEST_MODEL` and `IRLUME_TFLITE_LIB` are set.
+    /// End-to-end over the REAL runtime and the REAL pinned mesh. Ignored
+    /// by default and ENFORCED in CI via run-tests-guarded --require with
+    /// both env vars set (MR !3 review: the self-skipping version executed
+    /// no backend anywhere, and its refusal arm accepted unusable output;
+    /// the synthetic frame is measured to SERVE a full set on the pinned
+    /// model, so anything less is a failure).
     #[test]
+    #[ignore = "requires the packaged TFLite runtime and pinned mesh; CI runs it explicitly"]
     fn pinned_landmarker_mesh_serves_landmarks_via_facemesh() {
-        let Ok(model_path) = std::env::var("IRLUME_TFLITE_MESH_TEST_MODEL") else {
-            eprintln!("skipping: IRLUME_TFLITE_MESH_TEST_MODEL not set");
-            return;
-        };
-        if std::env::var("IRLUME_TFLITE_LIB").is_err() {
-            eprintln!("skipping: IRLUME_TFLITE_LIB not set");
-            return;
-        }
-        let mut mesh = FaceMesh::load_from_file(&model_path).expect("load tflite mesh");
-        // A noise frame with a centered box: the backend must EXECUTE and
-        // either return a full landmark set or refuse on plausibility, the
-        // same two outcomes the ONNX backend has. Any other error means the
-        // native path broke somewhere before the shared checks.
+        let model_path = std::env::var("IRLUME_TFLITE_MESH_TEST_MODEL")
+            .expect("IRLUME_TFLITE_MESH_TEST_MODEL must name the pinned production mesh");
+        std::env::var("IRLUME_TFLITE_LIB")
+            .expect("IRLUME_TFLITE_LIB must name the production TFLite runtime");
+        let mut mesh = FaceMesh::load_from_file(&model_path).expect("load pinned TFLite mesh");
         let (w, h) = (320u32, 240u32);
         let data: Vec<u8> = (0..(w * h * 3)).map(|i| (i * 37 % 251) as u8).collect();
         let view = super::align::RgbView {
@@ -1718,13 +1714,11 @@ mod mesh_backend_tests {
             width: w,
             height: h,
         };
-        match mesh.landmarks(&view, &[80.0, 40.0, 240.0, 200.0], 0.25) {
-            Ok(lm) => assert_eq!(lm.len(), super::MESH_N_IRIS),
-            Err(e) => assert!(
-                e.to_string().contains("mesh output refused"),
-                "unexpected native-mesh failure: {e}"
-            ),
-        }
+        let lm = mesh
+            .landmarks(&view, &[80.0, 40.0, 240.0, 200.0], 0.25)
+            .expect("the production backend must return a usable landmark set");
+        assert_eq!(lm.len(), super::MESH_N_IRIS);
+        assert!(lm.iter().all(|(x, y)| x.is_finite() && y.is_finite()));
     }
 }
 

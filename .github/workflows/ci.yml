@@ -125,7 +125,7 @@ jobs:
       # rather than a surprise, so it fails here until the schema documents it.
       - name: machine API conformance (real binary against the published schema)
         run: |
-          command -v apt-get >/dev/null && sudo apt-get install -y --no-install-recommends python3-jsonschema || python3 -c "import jsonschema" 
+          command -v apt-get >/dev/null && sudo apt-get install -y --no-install-recommends python3-jsonschema || python3 -c "import jsonschema"
           python3 scripts/machine-api-conformance.py \
             --irlume target/release/irlume --strict
 

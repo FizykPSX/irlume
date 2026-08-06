@@ -58,6 +58,13 @@ build-test:
     # Guarded because `cargo test` exits 0 even when it discovers no tests
     # at all. The floor sits well below the real count (707 at 0.7.0).
     - ./scripts/run-tests-guarded.sh --min 650 -- cargo test --workspace --locked
+    # The production TFLite mesh, end to end and ENFORCED: the test is
+    # ignored by default (it needs the packaged runtime), so a rename or a
+    # silent skip fails the --require guard instead of reading as green.
+    - IRLUME_TFLITE_LIB=/usr/share/irlume/tflite/libtensorflowlite_c.so
+      IRLUME_TFLITE_MESH_TEST_MODEL=models/face_landmarks_detector.tflite
+      ./scripts/run-tests-guarded.sh --require pinned_landmarker_mesh_serves_landmarks_via_facemesh
+      -- cargo test -p irlume-vision --locked -- --ignored pinned_landmarker_mesh_serves_landmarks_via_facemesh
 
 audit:
   stage: audit

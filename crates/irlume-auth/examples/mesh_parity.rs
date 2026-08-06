@@ -401,6 +401,9 @@ fn main() {
             emitted, manifest_total,
             "external corpus incompletely walked"
         );
+        // A run where nothing compared proves nothing; bounds over an empty
+        // set pass vacuously (MR !3 review).
+        assert!(compared > 0, "external run compared zero frames");
     } else {
         assert_eq!(
             emitted, EXPECTED_EMITTED,

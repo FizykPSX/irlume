@@ -214,9 +214,10 @@ exists it is not a candidate for wiring.
   disagree on the short-range ordering, so a third machine would not be
   redundant.
 - Open/closed blendshape separation (no closed-eye frames in the corpus).
-- Multi-thread determinism of the native runtime: the parity gates all ran
-  single-threaded, and a 2-thread production mesh should re-run the
-  mesh_parity gate at its production thread count before shipping.
+- Multi-thread determinism is now answered for the mesh: mesh_parity at
+  the production thread count (2) reproduces the 1-thread CSV
+  byte-identically on this machine. The other tflite models' recorded
+  parity runs remain single-threaded.
 - Full-range Blaze accuracy beyond the 2026-08-05 corpus; nothing new today.
 
 ## Future optimization candidates, unbenchmarked
