@@ -5,13 +5,15 @@
 # contributor who follows the developer guide gets the same result CI does.
 name: CI
 
+# SECURITY: push-trigger only, the preflight.yml pattern. All jobs run on
+# the self-hosted runner, and a pull_request run executes the workflow file
+# from the PR head, so a fork PR could edit its way onto the personal
+# machine. A push can only come from someone with push access; same-repo
+# branches (and therefore same-repo PRs) get every required check from the
+# push run. Fork PRs get no checks and need a maintainer-pushed branch.
 on:
   push:
-    branches: [main]
-  # No base-branch filter on pull_request: stacked PRs (a branch targeting
-  # another feature branch) previously ran ZERO checks and could only be
-  # gated after retargeting to main. Every PR gets the same gate now.
-  pull_request:
+    branches: ["**"]
 
 # Least privilege for GITHUB_TOKEN: this workflow only reads the repo
 # (checkout + LFS); nothing here publishes or writes.
@@ -24,7 +26,7 @@ permissions:
 # commit land on main untested.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Branch protection on `main` requires these four job names as status checks:
 #   "fmt · clippy · build · test", "cargo-deny (advisories · licenses ·
@@ -34,7 +36,7 @@ concurrency:
 jobs:
   check:
     name: fmt · clippy · build · test
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, arch]
     timeout-minutes: 30
     steps:
       # Actions are pinned to a commit SHA (the tag in the comment is what it
@@ -59,9 +61,16 @@ jobs:
 
       - name: Install system build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
+          # Self-hosted Arch runner: the toolchain deps are preinstalled
+          # (base-devel, clang, pam, tpm2-tss); apt path kept for any future
+          # hosted fallback.
+          if command -v apt-get >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
+          else
+            for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
+          fi
 
       - name: Install Rust 1.88 (MSRV) with rustfmt + clippy
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -116,7 +125,7 @@ jobs:
       # rather than a surprise, so it fails here until the schema documents it.
       - name: machine API conformance (real binary against the published schema)
         run: |
-          sudo apt-get install -y --no-install-recommends python3-jsonschema
+          command -v apt-get >/dev/null && sudo apt-get install -y --no-install-recommends python3-jsonschema || python3 -c "import jsonschema" 
           python3 scripts/machine-api-conformance.py \
             --irlume target/release/irlume --strict
 
@@ -125,7 +134,7 @@ jobs:
       # throwaway per run.
       - name: Start swtpm (software TPM)
         run: |
-          sudo apt-get install -y --no-install-recommends swtpm libtss2-tcti-swtpm0
+          command -v swtpm >/dev/null || sudo apt-get install -y --no-install-recommends swtpm libtss2-tcti-swtpm0
           mkdir -p /tmp/swtpm
           swtpm socket --tpm2 --tpmstate dir=/tmp/swtpm \
             --server type=tcp,port=2321,disconnect --ctrl type=tcp,port=2322 \
@@ -156,6 +165,10 @@ jobs:
           # 0.12.x won't load on the runner kernel) plus pam_wrapper/pamtester
           # for the PAM FFI tests. video8/9 are fed by ffmpeg; video10 is a
           # spare the camera streaming tests feed themselves.
+          # The self-hosted runner provisions video8/9/10 persistently
+          # (v4l2loopback-dkms + modules-load.d + a udev rule granting group
+          # video); build-from-source only on a runner without them.
+          if [ ! -e /dev/video8 ]; then
           sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg libpam-wrapper pamtester
           git clone https://github.com/v4l2loopback/v4l2loopback /tmp/v4l2loopback
           git -C /tmp/v4l2loopback checkout 0f9ee86760b7f2bea174b7e3e7a1d38845da0ab4 # v0.15.4
@@ -167,6 +180,7 @@ jobs:
           # the node with EACCES ("permission denied"), an intermittent flake.
           sudo udevadm settle
           sudo chmod 666 /dev/video8 /dev/video9 /dev/video10
+          fi
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
           # Poll until the fed nodes are actually readable (a feeder opening the
@@ -201,7 +215,7 @@ jobs:
   # only, so new-stable lint churn never blocks a PR. Not a required check.
   stable:
     name: test (stable)
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, arch]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -220,9 +234,16 @@ jobs:
 
       - name: Install system build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
+          # Self-hosted Arch runner: the toolchain deps are preinstalled
+          # (base-devel, clang, pam, tpm2-tss); apt path kept for any future
+          # hosted fallback.
+          if command -v apt-get >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
+          else
+            for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
+          fi
 
       - name: Install stable Rust
         # @master (declares the `toolchain` input); the version tag branches
@@ -261,7 +282,7 @@ jobs:
   # Not a required check.
   coverage:
     name: coverage (line-coverage ratchet)
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, arch]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -280,9 +301,16 @@ jobs:
 
       - name: Install system build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
+          # Self-hosted Arch runner: the toolchain deps are preinstalled
+          # (base-devel, clang, pam, tpm2-tss); apt path kept for any future
+          # hosted fallback.
+          if command -v apt-get >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
+          else
+            for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
+          fi
 
       - name: Install stable Rust with llvm-tools
         # @master (declares the `toolchain` input); the version tag branches
@@ -312,7 +340,7 @@ jobs:
 
       - name: Start swtpm (software TPM)
         run: |
-          sudo apt-get install -y --no-install-recommends swtpm libtss2-tcti-swtpm0
+          command -v swtpm >/dev/null || sudo apt-get install -y --no-install-recommends swtpm libtss2-tcti-swtpm0
           mkdir -p /tmp/swtpm
           swtpm socket --tpm2 --tpmstate dir=/tmp/swtpm \
             --server type=tcp,port=2321,disconnect --ctrl type=tcp,port=2322 \
@@ -327,6 +355,10 @@ jobs:
           # 0.12.x won't load on the runner kernel) plus pam_wrapper/pamtester
           # for the PAM FFI tests. video8/9 are fed by ffmpeg; video10 is a
           # spare the camera streaming tests feed themselves.
+          # The self-hosted runner provisions video8/9/10 persistently
+          # (v4l2loopback-dkms + modules-load.d + a udev rule granting group
+          # video); build-from-source only on a runner without them.
+          if [ ! -e /dev/video8 ]; then
           sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg libpam-wrapper pamtester
           git clone https://github.com/v4l2loopback/v4l2loopback /tmp/v4l2loopback
           git -C /tmp/v4l2loopback checkout 0f9ee86760b7f2bea174b7e3e7a1d38845da0ab4 # v0.15.4
@@ -338,6 +370,7 @@ jobs:
           # the node with EACCES ("permission denied"), an intermittent flake.
           sudo udevadm settle
           sudo chmod 666 /dev/video8 /dev/video9 /dev/video10
+          fi
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
           # Poll until the fed nodes are actually readable (a feeder opening the
@@ -393,7 +426,7 @@ jobs:
 
   deny:
     name: cargo-deny (advisories · licenses · duplicate versions)
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, arch]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -405,7 +438,7 @@ jobs:
 
   units:
     name: systemd units (verify + exposure ratchet)
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, arch]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -431,8 +464,7 @@ jobs:
       - name: apparmor profiles parse
         run: |
           set -euo pipefail
-          sudo apt-get -qq update
-          sudo apt-get -qq install -y apparmor
+          command -v apparmor_parser >/dev/null || { sudo apt-get -qq update && sudo apt-get -qq install -y apparmor; }
           for f in packaging/apparmor/*; do
             echo "checking $f on the runner's parser"
             apparmor_parser -QK "$f"
@@ -478,8 +510,10 @@ jobs:
           # verify resolves ExecStart and fails on a binary that is not present,
           # which on a build runner it never is. Stub the two paths so the check
           # is about unit syntax, which is what we actually want tested.
-          sudo install -Dm755 /bin/true /usr/bin/irlumed
-          sudo install -Dm755 /bin/true /usr/bin/irlume
+          # Stub ONLY when absent: this runner has a real irlume install,
+          # and the hosted job's unconditional stub would overwrite it.
+          [ -e /usr/bin/irlumed ] || sudo install -Dm755 /bin/true /usr/bin/irlumed
+          [ -e /usr/bin/irlume ] || sudo install -Dm755 /bin/true /usr/bin/irlume
           for u in packaging/systemd/*.service packaging/systemd/*.timer packaging/systemd/*.path; do
             echo "::group::verify $(basename "$u")"
             systemd-analyze verify "$u"
@@ -503,6 +537,8 @@ jobs:
           # image (systemd 255); a runner image that moves to a systemd with new
           # checks may need a re-baseline, which is a deliberate act, not a
           # silent drift.
+          # Re-measured 2026-08-06 on the self-hosted runner's systemd 261:
+          # identical scores (3.7 / 9.4), so the thresholds carry over.
           #
           # irlume-reconcile.service is knowingly high: it is a root oneshot that
           # rewrites /etc/pam.d, so it holds broad access by design. Locking it
@@ -526,7 +562,7 @@ jobs:
 
   nix:
     name: nix flake check
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, arch]
     timeout-minutes: 60
     steps:
       # No model fetch here: flake check --no-build only evaluates the outputs
@@ -538,11 +574,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Nix with flakes
-        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
+      - name: Nix is provisioned on the runner (pacman nix, daemon, flakes)
+        run: nix --version
 
       # Evaluates packages.default, nixosModules.irlume, and the dev shell.
       # Catches eval and type errors in flake.nix and nix/*.nix before merge.
@@ -570,7 +603,7 @@ jobs:
 
   fuzz:
     name: fuzz (untrusted-input parsers)
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, arch]
     timeout-minutes: 20
     env:
       # Every cargo/rustc in this job (including the child rustc that

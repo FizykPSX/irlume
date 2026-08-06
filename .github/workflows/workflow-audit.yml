@@ -17,8 +17,10 @@
 # Deliberately hosted-runner only. Nothing here touches the self-hosted runner.
 name: Workflow audit
 
+# Push-trigger only (self-hosted runner; see ci.yml's security note).
 on:
-  pull_request:
+  push:
+    branches: ["**"]
     paths:
       - ".github/workflows/**"
       - ".github/actions/**"
@@ -43,7 +45,7 @@ permissions:
 jobs:
   zizmor:
     name: zizmor (workflow security)
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, arch]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -66,7 +68,7 @@ jobs:
 
   actionlint:
     name: actionlint (workflow correctness)
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, arch]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -26,7 +26,7 @@ permissions: read-all
 jobs:
   analysis:
     name: Scorecard analysis
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, arch]
     timeout-minutes: 15
     permissions:
       security-events: write # upload the SARIF result to code scanning
