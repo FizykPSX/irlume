@@ -65,6 +65,7 @@ package() {
   for m in glintr100 face_detection_yunet_2023mar face_landmark blaze_face_short_range; do
     install -Dm0644 "\$startdir/models/\$m.onnx" "\$pkgdir/usr/share/irlume/models/\$m.onnx"
   done
+  install -Dm0644 "\$startdir/models/face_landmarks_detector.tflite" "\$pkgdir/usr/share/irlume/models/face_landmarks_detector.tflite"
   install -Dm0644 "\$startdir/systemd/irlumed.service" "\$pkgdir/usr/lib/systemd/system/irlumed.service"
   # The PAM self-heal units. This package omitted them while shipping an
   # irlume.install that runs \`systemctl enable --now irlume-reconcile.*\`, and

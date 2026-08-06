@@ -68,7 +68,9 @@ profile irlumed /usr/local/bin/irlumed {
 
   # Models: packaged location or a hand-installed repo checkout.
   /usr/share/irlume/models/*.onnx r,
+  /usr/share/irlume/models/*.tflite r,
   /home/*/irlume/models/*.onnx r,
+  /home/*/irlume/models/*.tflite r,
 
   # Cameras: capture nodes + the sysfs identity walk of the anti-injection
   # camera pinning (canonicalized device path, USB ids, privacy switch).

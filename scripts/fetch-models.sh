@@ -47,4 +47,5 @@ verify_or_fetch glintr100.onnx                   a7933ea5330113b01c9b60351d8f4c3
 verify_or_fetch face_detection_yunet_2023mar.onnx 8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
 verify_or_fetch face_landmark.onnx               821683be088447839638f79d64268bd501bdb72e5d9e262ec981c7e252956caf
 verify_or_fetch blaze_face_short_range.onnx      c5453678015f6289c1d77bda88a8ba9c87574f01de1a05ba1909b9a7e08b237b
+verify_or_fetch face_landmarks_detector.tflite    c7d54204ce0448474c7f3fa9af494787c0965cbdd6f20fc72867e43046bd43d5
 echo "fetch-models: all model weights present in $DEST"

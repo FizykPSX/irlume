@@ -653,8 +653,27 @@ mod onnx {
     /// generation (468 legacy or 478), returning landmarks in the input space
     /// plus a face-probability flag. RGB-trained; IR-grey performance is
     /// validated empirically (that's the open question the diagnostic answers).
+    /// The mesh's inference backend. Both eat the same NHWC [0,1] tensor and
+    /// return the same landmark layout, proven equivalent by the mesh_parity
+    /// gate (mean NME 6.9e-7 over all 478 points, iris tail included).
+    enum MeshBackend {
+        Onnx(Session),
+        Tflite(crate::tflite::TfliteSession),
+    }
+
+    /// The published face_landmarker.task's mesh: the ONLY `.tflite` the
+    /// mesh loader accepts, pin-enforced BEFORE parsing. The landmarks stage
+    /// is closed to user-supplied models, so the native path exists solely
+    /// to run Google's own artifact unconverted (#315); an unpinned loader
+    /// here would quietly reopen the stage through the back door.
+    pub const LANDMARKER_MESH_TFLITE_SHA256: &str =
+        "c7d54204ce0448474c7f3fa9af494787c0965cbdd6f20fc72867e43046bd43d5";
+    /// Native-mesh thread count: the FullRangeBlaze precedent, and the knee
+    /// of the measured latency curve (5.79ms at 2 threads vs 8.28 at 1).
+    const TFLITE_MESH_THREADS: i32 = 2;
+
     pub struct FaceMesh {
-        session: Session,
+        backend: MeshBackend,
         /// Square input side, read from the model: 192 for the legacy
         /// face_landmark, 256 for the face_landmarker-generation mesh.
         input: u32,
@@ -672,6 +691,26 @@ mod onnx {
 
     impl FaceMesh {
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
+            // TFLite flatbuffers carry the "TFL3" identifier at offset 4;
+            // everything else goes to the ONNX loader, whose own parser
+            // rejects non-ONNX bytes.
+            if model.len() >= 8 && &model[4..8] == b"TFL3" {
+                let session = crate::tflite::TfliteSession::from_pinned_bytes(
+                    model,
+                    LANDMARKER_MESH_TFLITE_SHA256,
+                    TFLITE_MESH_THREADS,
+                )?;
+                let shape = session.input_shape()?;
+                if shape.len() != 4 || shape[1] != shape[2] || shape[3] != 3 {
+                    return Err(err(format!(
+                        "tflite mesh: unexpected input shape {shape:?}"
+                    )));
+                }
+                return Ok(Self {
+                    backend: MeshBackend::Tflite(session),
+                    input: shape[1] as u32,
+                });
+            }
             let session = build(model)?;
             // NHWC [1, side, side, 3]: take the declared H when static.
             let input = session
@@ -685,7 +724,10 @@ mod onnx {
                 })
                 .map(|d| d as u32)
                 .unwrap_or(MESH_INPUT);
-            Ok(Self { session, input })
+            Ok(Self {
+                backend: MeshBackend::Onnx(session),
+                input,
+            })
         }
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
@@ -733,20 +775,31 @@ mod onnx {
                     data[i + 2] = p[2] / 255.0;
                 }
             }
-            let s = self.input as i64;
-            let tensor = Tensor::from_array(([1i64, s, s, 3], data)).map_err(err)?;
-            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
             // Find the landmark tensor by length (order-agnostic): 468x3
-            // legacy or 478x3 iris-generation.
-            let mut lm_raw: Option<Vec<f32>> = None;
-            for i in 0..outputs.len() {
-                let (_shape, raw) = outputs[i].try_extract_tensor::<f32>().map_err(err)?;
-                if raw.len() == MESH_N * 3 || raw.len() == MESH_N_IRIS * 3 {
-                    lm_raw = Some(raw.to_vec());
+            // legacy or 478x3 iris-generation. Same rule on both backends.
+            let is_lm = |d: &[f32]| d.len() == MESH_N * 3 || d.len() == MESH_N_IRIS * 3;
+            let raw = match &mut self.backend {
+                MeshBackend::Onnx(session) => {
+                    let s = self.input as i64;
+                    let tensor = Tensor::from_array(([1i64, s, s, 3], data)).map_err(err)?;
+                    let outputs = session.run(ort::inputs![tensor]).map_err(err)?;
+                    let mut lm_raw: Option<Vec<f32>> = None;
+                    for i in 0..outputs.len() {
+                        let (_shape, raw) = outputs[i].try_extract_tensor::<f32>().map_err(err)?;
+                        if is_lm(raw) {
+                            lm_raw = Some(raw.to_vec());
+                        }
+                    }
+                    lm_raw
                 }
-            }
+                MeshBackend::Tflite(session) => session
+                    .run_f32(&data)?
+                    .into_iter()
+                    .map(|(_, d)| d)
+                    .find(|d| is_lm(d)),
+            };
             let raw =
-                lm_raw.ok_or_else(|| err(format!("no {MESH_N}/{MESH_N_IRIS}-landmark output")))?;
+                raw.ok_or_else(|| err(format!("no {MESH_N}/{MESH_N_IRIS}-landmark output")))?;
             map_checked_mesh_output(&raw, self.input as f32, x0, y0, side)
                 .map_err(|why| err(format!("mesh output refused: {why}")))
         }
@@ -1603,6 +1656,75 @@ mod short_range_decode_tests {
         assert!(decode_short_range_best(&reg, &cls[..100], &anchors, 0.5).is_none());
         assert!(decode_short_range_best(&reg, &cls, &anchors, f32::NAN).is_none());
         assert!(decode_short_range_best(&reg, &cls, &anchors, 0.5).is_some());
+    }
+}
+
+/// Mesh backend dispatch: the loader must route TFL3-magic bytes to the
+/// pinned TFLite path and everything else to the ONNX parser. The pin is
+/// checked before the runtime loads, so the wrong-bytes case runs on every
+/// machine, tflite runtime present or not.
+#[cfg(test)]
+#[cfg(feature = "onnx")]
+mod mesh_backend_tests {
+    use super::FaceMesh;
+
+    #[test]
+    fn tfl3_magic_routes_to_the_pinned_tflite_path() {
+        let mut bytes = vec![0u8; 64];
+        bytes[4..8].copy_from_slice(b"TFL3");
+        let Err(e) = FaceMesh::load_from_memory(&bytes) else {
+            panic!("wrong bytes must refuse");
+        };
+        // The sha mismatch proves the TFLite pin ran, not the ONNX parser.
+        assert!(
+            e.to_string().contains("sha256 mismatch"),
+            "expected the pin refusal, got: {e}"
+        );
+    }
+
+    #[test]
+    fn non_tflite_bytes_route_to_the_onnx_parser() {
+        let Err(e) = FaceMesh::load_from_memory(&[0u8; 64]) else {
+            panic!("garbage must refuse");
+        };
+        assert!(
+            !e.to_string().contains("sha256 mismatch"),
+            "ONNX-path bytes must not hit the tflite pin: {e}"
+        );
+    }
+
+    /// End-to-end over the REAL runtime and the REAL pinned mesh, the
+    /// tflite.rs smoke pattern: self-skips loudly unless
+    /// `IRLUME_TFLITE_MESH_TEST_MODEL` and `IRLUME_TFLITE_LIB` are set.
+    #[test]
+    fn pinned_landmarker_mesh_serves_landmarks_via_facemesh() {
+        let Ok(model_path) = std::env::var("IRLUME_TFLITE_MESH_TEST_MODEL") else {
+            eprintln!("skipping: IRLUME_TFLITE_MESH_TEST_MODEL not set");
+            return;
+        };
+        if std::env::var("IRLUME_TFLITE_LIB").is_err() {
+            eprintln!("skipping: IRLUME_TFLITE_LIB not set");
+            return;
+        }
+        let mut mesh = FaceMesh::load_from_file(&model_path).expect("load tflite mesh");
+        // A noise frame with a centered box: the backend must EXECUTE and
+        // either return a full landmark set or refuse on plausibility, the
+        // same two outcomes the ONNX backend has. Any other error means the
+        // native path broke somewhere before the shared checks.
+        let (w, h) = (320u32, 240u32);
+        let data: Vec<u8> = (0..(w * h * 3)).map(|i| (i * 37 % 251) as u8).collect();
+        let view = super::align::RgbView {
+            data: &data,
+            width: w,
+            height: h,
+        };
+        match mesh.landmarks(&view, &[80.0, 40.0, 240.0, 200.0], 0.25) {
+            Ok(lm) => assert_eq!(lm.len(), super::MESH_N_IRIS),
+            Err(e) => assert!(
+                e.to_string().contains("mesh output refused"),
+                "unexpected native-mesh failure: {e}"
+            ),
+        }
     }
 }
 

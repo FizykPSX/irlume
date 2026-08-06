@@ -37,8 +37,9 @@ Copyright: Shiqi Yu / OpenCV Zoo
 License: MIT
 Comment: YuNet face detection, https://github.com/opencv/opencv_zoo
 
-Files: models/face_landmark.onnx
-Copyright: Google (MediaPipe Face Mesh conversion)
+Files: models/face_landmark.onnx models/face_landmarks_detector.tflite
+Copyright: Google (MediaPipe Face Mesh; the .onnx is a conversion, the
+ .tflite is Google's published artifact from face_landmarker.task)
 License: Apache-2.0
 
 Files: ort-prebuilt/*
