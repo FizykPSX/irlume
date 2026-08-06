@@ -54,9 +54,8 @@ denominator, minimum IoU bound 0.9999, score-delta bound 5e-6.
 
 `2026-08-06-mesh-parity.md` already established the shipped ONNX mesh
 matches the .task's model at mean NME 6.9e-7 (worst 1.5e-6) over the same
-crop, compared over the 468 shared-topology points (both models emit 478;
-the iris tail is the unvalidated remainder, see the blendshapes section).
-What was missing was cost. Measured on one frontal frame, 100
+crop, now extended to all 478 points (worst iris-only NME 1.249e-6, see
+that doc's addendum). What was missing was cost. Measured on one frontal frame, 100
 iterations after 10 warmup (`2026-08-06-mp-latency-zenbook.csv`):
 
 | Stage call | Runtime | Threads | Mean ms | p50 | p95 |
@@ -94,9 +93,10 @@ coefficients. The 146-index subset ends with the 10 iris points (468-477).
 An earlier revision of this doc claimed the shipped ONNX mesh lacks them;
 that was wrong: the shipped `face_landmark.onnx` is the landmarker-generation
 conversion and emits all 478 points (measured on a corpus frame), so it can
-feed this model today. What HAS never been checked is iris parity: the #306
-gate compares the 468 shared-topology points only, so indices 468-477 are
-unvalidated between the two meshes.
+feed this model today. Iris parity, which the original #306 run skipped, is
+now measured too: the extended mesh_parity gate compares all 478 points and
+the iris-only worst NME is 1.249e-6, as faithful as the body (addendum in
+2026-08-06-mesh-parity.md).
 
 Over the 223 accepted corpus frames (`2026-08-06-blendshapes-probe.csv`),
 pooled per-frame `max(eyeBlinkLeft, eyeBlinkRight)` against irlume's
@@ -143,8 +143,7 @@ deletes a conversion step nobody can reproduce from the shipped artifact
 alone and replaces it with Google's published file, byte-pinned, on the
 runtime irlume already bundles and verifies. The iris points are NOT an argument
 for the switch (the shipped conversion also emits them, measured; an earlier
-revision claimed otherwise), but the switch work should extend the parity
-gate to all 478 points, which today stops at the 468 shared-topology cap.
+revision claimed otherwise), and the parity gate now covers all 478 points.
 Packaging cost:
 `face_landmarks_detector.tflite` (2.5MB) joins the model set on every lane,
 and the mesh loader grows a TFLite path behind the same pin discipline.
@@ -161,10 +160,9 @@ ONNX blaze and its conversion step retire naturally; switching it alone buys
 an affordable cost, and its open-eye baseline is now on record; no
 authentication conclusion follows from an all-open-eye corpus. Before it can
 even be evaluated as a consent-gesture or liveness signal it needs a
-labeled blink corpus with controlled eyelid closures (#316), plus an iris
-parity check between the meshes (#315), since the model consumes indices
-468-477 that the #306 gate never compared. Until then it is not a candidate
-for wiring.
+labeled blink corpus with controlled eyelid closures (#316); the iris
+parity question is settled (worst iris NME 1.249e-6). Until the corpus
+exists it is not a candidate for wiring.
 
 ## Not measured
 

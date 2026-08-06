@@ -19,10 +19,13 @@
 //! (#298: a dump that silently shrinks turns the comparison into a vacuous
 //! pass over whatever survived).
 //!
-//! Comparison is over the first 468 landmarks (the shared topology; the
-//! landmarker-generation model appends 10 iris points) and over x,y only,
-//! because x,y is what every irlume consumer reads. NME is normalized by the
-//! native mesh's outer-eye distance (canonical indices 33 and 263).
+//! Comparison covers all 478 landmarks, x,y only (x,y is what every irlume
+//! consumer reads). Both models emit 478 points; the original #306 run
+//! stopped at 468 on the mistaken belief the ONNX conversion lacked the
+//! iris tail, which left indices 468-477 (the blendshapes model's input
+//! tail) unvalidated. The iris-only worst NME is tracked separately in the
+//! summary. NME is normalized by the native mesh's outer-eye distance
+//! (canonical indices 33 and 263).
 //!
 //! Usage: cargo run --release -p irlume-auth --example mesh_parity -- \
 //!   <yunet.onnx> <face_landmark.onnx> <face_landmarks_detector.tflite> \
@@ -213,6 +216,7 @@ fn main() {
     let mut emitted = 0usize;
     let mut compared = 0usize;
     let (mut nme_sum, mut nme_max) = (0.0f64, 0.0f64);
+    let mut iris_nme_max = 0.0f64;
     let (mut total_identical, mut total_points) = (0usize, 0usize);
     println!("camera,segment,kind,frame,eye_px,nme,max_px");
     for root in roots {
@@ -277,7 +281,13 @@ fn main() {
                         println!("{cam},{seg_name},{kind},{name},,,");
                         continue;
                     };
-                    let n = a.len().min(b.len()).min(MESH_N);
+                    // Full 478-point comparison. The original #306 run
+                    // stopped at the 468 shared-topology points on the
+                    // belief the shipped ONNX lacked the iris tail; it does
+                    // not (measured 2026-08-06, both emit 478), and the
+                    // blendshapes model consumes 468-477, so the tail gets
+                    // its own tracked worst-NME alongside the whole-set one.
+                    let n = a.len().min(b.len()).min(MESH_N_IRIS);
                     let (ex, ey) = (
                         b[LEFT_EYE_OUTER].0 - b[RIGHT_EYE_OUTER].0,
                         b[LEFT_EYE_OUTER].1 - b[RIGHT_EYE_OUTER].1,
@@ -289,6 +299,7 @@ fn main() {
                     }
                     let mut sum = 0.0f64;
                     let mut worst = 0.0f64;
+                    let mut iris_sum = 0.0f64;
                     let mut identical = 0usize;
                     for k in 0..n {
                         let dx = (a[k].0 - b[k].0) as f64;
@@ -296,6 +307,9 @@ fn main() {
                         let d = (dx * dx + dy * dy).sqrt();
                         sum += d;
                         worst = worst.max(d);
+                        if k >= MESH_N {
+                            iris_sum += d;
+                        }
                         if a[k] == b[k] {
                             identical += 1;
                         }
@@ -306,6 +320,10 @@ fn main() {
                     compared += 1;
                     nme_sum += nme;
                     nme_max = nme_max.max(nme);
+                    if n > MESH_N {
+                        let iris_nme = iris_sum / (n - MESH_N) as f64 / eye as f64;
+                        iris_nme_max = iris_nme_max.max(iris_nme);
+                    }
                     println!("{cam},{seg_name},{kind},{name},{eye:.1},{nme:.3e},{worst:.4}");
                 }
             }
@@ -340,6 +358,7 @@ fn main() {
     }
     eprintln!(
         "emitted {emitted} rows; both-ran {compared}; mean NME {mean_nme:.3e}; \
-         worst NME {nme_max:.3e}; bit-identical points {total_identical}/{total_points}"
+         worst NME {nme_max:.3e}; worst iris NME {iris_nme_max:.3e}; \
+         bit-identical points {total_identical}/{total_points}"
     );
 }

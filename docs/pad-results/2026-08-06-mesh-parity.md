@@ -78,3 +78,18 @@ Two consequences:
   when parity or coverage regresses.
 
 Raw rows: `2026-08-06-mesh-parity.csv` beside this file.
+
+## Addendum, same day: comparison extended to all 478 points
+
+The run above compared the 468 shared-topology points on the mistaken belief
+the shipped ONNX lacks the iris tail. It does not: `FaceMesh::landmarks` on
+the shipped model returns 478 points (measured on a corpus frame), so the
+harness now compares all 478 and tracks the iris tail separately, since the
+blendshapes model consumes indices 468-477.
+
+Re-measured over the same 512-frame corpus, 223 compared: mean NME 6.868e-7,
+worst NME 1.496e-6, worst iris-only NME 1.249e-6, 8086/106594 points
+bit-identical. The iris tail is as faithful as the body; the existing 2e-6
+gate bound holds unchanged. Skew self-test at 2px: mean NME 5.206e-3, zero
+bit-identical points, so the extended instrument still moves. The committed
+CSV and summary are regenerated from the 478-point run.
