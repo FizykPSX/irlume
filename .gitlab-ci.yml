@@ -1,0 +1,37 @@
+# irlume's GitLab CI gate, running on the project's own archhost shell
+# runner (tag: archhost; shared runners are disabled for this project).
+# This lane is deliberately independent of GitHub: it keeps working when
+# github.com's action infrastructure does not, which is the incident that
+# motivated it. The job mirrors the self-hosted preflight gate: system
+# toolchain, persistent incremental target, models kept between jobs.
+
+stages:
+  - gate
+
+variables:
+  # The shell executor cleans untracked files between jobs; the fetched
+  # model weights are untracked and 266MB, so exempt them from the clean
+  # instead of re-downloading every pipeline.
+  GIT_CLEAN_FLAGS: -ffdx -e models/
+
+preflight:
+  stage: gate
+  tags: [archhost]
+  timeout: 40 minutes
+  before_script:
+    # The MSRV toolchain (1.88.0, matching the hosted gate's pin), NOT the
+    # runner's rolling pacman rust: rolling clippy drifts new lints under
+    # -D warnings, which is exactly what failed the first pipeline here.
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - cargo --version && cargo clippy --version
+  script:
+    - bash scripts/fetch-models.sh
+    - cargo fmt --all --check
+    - cargo clippy --all-targets -- -D warnings
+    - cargo build --release --locked
+    - ./scripts/run-tests-guarded.sh --min 650 -- cargo test --workspace --locked
+    - cargo-deny check
+    - ./scripts/check-packaging-parity.sh
+    - ./scripts/run-tests-guarded.sh --self-test
+    - python3 scripts/verify-ppa-publish.py --self-test
+    - for f in packaging/apparmor/*; do echo "parse $f"; apparmor_parser -QK "$f"; done
