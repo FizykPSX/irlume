@@ -35,6 +35,7 @@
 use irlume_vision::align::RgbView;
 use irlume_vision::tflite::TfliteSession;
 use irlume_vision::{map_checked_mesh_output, Detector, FaceMesh, MESH_N, MESH_N_IRIS};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The published face_landmarker.task's mesh, May 2023 revision. The pin is
@@ -51,10 +52,50 @@ const MESH_MARGIN: f32 = 0.25;
 const LEFT_EYE_OUTER: usize = 33;
 const RIGHT_EYE_OUTER: usize = 263;
 
-fn read_pnm(p: &Path) -> Option<(Vec<u8>, u32, u32)> {
+/// External-corpus mode (`IRLUME_PARITY_EXTERNAL=1`): the run still binds
+/// every frame to the supplied manifest, but the stage-3 count pins are
+/// replaced by the manifest's own total, and a missing rgb/ir subdir is
+/// skipped instead of refused (external sets are usually RGB-only). The
+/// agreement BOUNDS stay enforced: whether the parity claim holds beyond
+/// the stage-3 corpus is exactly what an external run asks.
+fn external_corpus() -> bool {
+    std::env::var_os("IRLUME_PARITY_EXTERNAL").is_some()
+}
+
+/// Load the committed corpus manifest, `sha256  camera/segment/kind/frame`
+/// per line. The run consumes it entry-for-entry, so a corpus swap that
+/// preserves the frame COUNTS still fails (#314 review: a count-only pin
+/// lets different evidence satisfy the bounds).
+fn load_manifest(path: &str) -> BTreeMap<String, String> {
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: read manifest: {e}"));
+    let mut map = BTreeMap::new();
+    for (no, line) in text.lines().enumerate() {
+        let (sha, rel) = line
+            .split_once("  ")
+            .unwrap_or_else(|| panic!("{path}:{}: expected '<sha256>  <path>'", no + 1));
+        assert_eq!(sha.len(), 64, "{path}:{}: invalid sha256", no + 1);
+        assert!(
+            map.insert(rel.to_string(), sha.to_string()).is_none(),
+            "{path}:{}: duplicate entry {rel}",
+            no + 1
+        );
+    }
+    map
+}
+
+/// Check one frame's bytes against the manifest and consume its entry.
+fn consume_manifest_entry(manifest: &mut BTreeMap<String, String>, rel: &str, bytes: &[u8]) {
+    let expected = manifest
+        .remove(rel)
+        .unwrap_or_else(|| panic!("{rel}: not in the corpus manifest"));
+    let actual = irlume_common::thirdparty::sha256_hex(bytes);
+    assert_eq!(actual, expected, "{rel}: content differs from the manifest");
+}
+
+fn read_pnm(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     // Same lossy header parse as blaze_full_parity: the bytes after the
     // header are pixels, not UTF-8.
-    let data = std::fs::read(p).ok()?;
     let text = String::from_utf8_lossy(&data[..data.len().min(64)]);
     let mut it = text.split_ascii_whitespace();
     let magic = it.next()?;
@@ -178,18 +219,22 @@ const SHIPPED_DETECTOR_SHA256: &str =
 const EXPECTED_EMITTED: usize = 512;
 const EXPECTED_COMPARED: usize = 223;
 const MAX_ALLOWED_NME: f64 = 2.0e-6;
+/// External-corpus bound: see the gate comment.
+const MAX_ALLOWED_NME_EXTERNAL: f64 = 5.0e-6;
 const MIN_SKEW_MEAN_NME: f64 = 1.0e-3;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (models, roots) = args.split_at(3.min(args.len()));
-    let [det_path, onnx_mesh_path, tflite_mesh_path] = models else {
+    let (fixed, roots) = args.split_at(4.min(args.len()));
+    let [manifest_path, det_path, onnx_mesh_path, tflite_mesh_path] = fixed else {
         panic!(
-            "usage: mesh_parity <yunet.onnx> <face_landmark.onnx> \
-             <face_landmarks_detector.tflite> <corpus_root>..."
+            "usage: mesh_parity <corpus-manifest.sha256> <yunet.onnx> \
+             <face_landmark.onnx> <face_landmarks_detector.tflite> <corpus_root>..."
         );
     };
     assert!(!roots.is_empty(), "at least one corpus root is required");
+    let mut manifest = load_manifest(manifest_path);
+    let manifest_total = manifest.len();
     let skew = parity_skew();
 
     let det_bytes = read_pinned(det_path, SHIPPED_DETECTOR_SHA256, "detector");
@@ -236,6 +281,9 @@ fn main() {
         for seg in segs {
             for (sub, kind) in [("rgb", "rgb"), ("ir", "ir")] {
                 let dir = seg.path().join(sub);
+                if external_corpus() && !dir.is_dir() {
+                    continue;
+                }
                 let mut files: Vec<_> = std::fs::read_dir(&dir)
                     .unwrap_or_else(|e| panic!("{}: read frame dir: {e}", dir.display()))
                     .map(|e| e.unwrap_or_else(|e| panic!("{}: read entry: {e}", dir.display())))
@@ -245,15 +293,23 @@ fn main() {
                 assert!(!files.is_empty(), "{}: no PNM frames", dir.display());
                 files.sort();
                 for f in files {
+                    let bytes = std::fs::read(&f)
+                        .unwrap_or_else(|e| panic!("{}: read frame: {e}", f.display()));
+                    let seg_name = seg.file_name().to_string_lossy().into_owned();
+                    let fname = f.file_name().unwrap().to_string_lossy().into_owned();
+                    consume_manifest_entry(
+                        &mut manifest,
+                        &format!("{cam}/{seg_name}/{sub}/{fname}"),
+                        &bytes,
+                    );
                     let (data, w, h) =
-                        read_pnm(&f).unwrap_or_else(|| panic!("{}: invalid PNM", f.display()));
+                        read_pnm(&bytes).unwrap_or_else(|| panic!("{}: invalid PNM", f.display()));
                     let view = RgbView {
                         data: &data,
                         width: w,
                         height: h,
                     };
-                    let seg_name = seg.file_name().to_string_lossy().into_owned();
-                    let name = format!("{sub}/{}", f.file_name().unwrap().to_string_lossy());
+                    let name = format!("{sub}/{fname}");
                     emitted += 1;
                     let faces = det
                         .detect(&view)
@@ -332,15 +388,35 @@ fn main() {
     // The GATE (#306 review): without these, one surviving comparison out of
     // 512, or an arbitrarily bad NME, exited zero, and the "regression gate"
     // in the doc was a claim with nothing enforcing it.
-    assert_eq!(
-        emitted, EXPECTED_EMITTED,
-        "stage-3 corpus changed; update the pinned baseline deliberately"
+    assert!(
+        manifest.is_empty(),
+        "manifest entries never seen on disk: {:?}",
+        manifest.keys().take(4).collect::<Vec<_>>()
     );
-    assert_eq!(
-        compared, EXPECTED_COMPARED,
-        "mesh acceptance coverage changed"
-    );
+    if external_corpus() {
+        assert_eq!(
+            emitted, manifest_total,
+            "external corpus incompletely walked"
+        );
+    } else {
+        assert_eq!(
+            emitted, EXPECTED_EMITTED,
+            "stage-3 corpus changed; update the pinned baseline deliberately"
+        );
+        assert_eq!(
+            compared, EXPECTED_COMPARED,
+            "mesh acceptance coverage changed"
+        );
+    }
     let mean_nme = nme_sum / compared as f64;
+    // Summary before the gate: a failing bound must still show its numbers
+    // (an LFW run lost its mean/iris figures to a bound panic before this
+    // moved).
+    eprintln!(
+        "emitted {emitted} rows; both-ran {compared}; mean NME {mean_nme:.3e}; \
+         worst NME {nme_max:.3e}; worst iris NME {iris_nme_max:.3e}; \
+         bit-identical points {total_identical}/{total_points}"
+    );
     if skew.is_some() {
         assert!(
             mean_nme >= MIN_SKEW_MEAN_NME,
@@ -351,14 +427,18 @@ fn main() {
             "instrument self-test left bit-identical landmarks"
         );
     } else {
+        // The strict bound encodes the stage-3 corpus's measured float
+        // noise. An external corpus asks the same question over a tail 60x
+        // longer; measured on 13k LFW frames the worst reached 2.090e-6, so
+        // its bound is one magnitude class up, still bit-level fidelity.
+        let bound = if external_corpus() {
+            MAX_ALLOWED_NME_EXTERNAL
+        } else {
+            MAX_ALLOWED_NME
+        };
         assert!(
-            nme_max <= MAX_ALLOWED_NME,
-            "mesh parity exceeded bound: worst NME {nme_max:.3e} > {MAX_ALLOWED_NME:.3e}"
+            nme_max <= bound,
+            "mesh parity exceeded bound: worst NME {nme_max:.3e} > {bound:.3e}"
         );
     }
-    eprintln!(
-        "emitted {emitted} rows; both-ran {compared}; mean NME {mean_nme:.3e}; \
-         worst NME {nme_max:.3e}; worst iris NME {iris_nme_max:.3e}; \
-         bit-identical points {total_identical}/{total_points}"
-    );
 }

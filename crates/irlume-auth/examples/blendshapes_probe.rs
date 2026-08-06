@@ -98,6 +98,16 @@ fn consume_manifest_entry(manifest: &mut BTreeMap<String, String>, rel: &str, by
     assert_eq!(actual, expected, "{rel}: content differs from the manifest");
 }
 
+/// External-corpus mode (`IRLUME_PARITY_EXTERNAL=1`): the run still binds
+/// every frame to the supplied manifest, but the stage-3 count pins are
+/// replaced by the manifest's own total, and a missing rgb/ir subdir is
+/// skipped instead of refused (external sets are usually RGB-only). The
+/// agreement BOUNDS stay enforced: whether the parity claim holds beyond
+/// the stage-3 corpus is exactly what an external run asks.
+fn external_corpus() -> bool {
+    std::env::var_os("IRLUME_PARITY_EXTERNAL").is_some()
+}
+
 fn read_pnm(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     // Same lossy header parse as mesh_parity: the bytes after the header are
     // pixels, not UTF-8. 8-bit only.
@@ -191,6 +201,7 @@ fn main() {
     };
     assert!(!roots.is_empty(), "at least one corpus root is required");
     let mut manifest = load_manifest(manifest_path);
+    let manifest_total = manifest.len();
 
     let det_bytes = read_pinned(det_path, SHIPPED_DETECTOR_SHA256, "detector");
     let mut det = Detector::load_from_memory(&det_bytes).expect("load detector");
@@ -238,6 +249,9 @@ fn main() {
         for seg in segs {
             for (sub, kind) in [("rgb", "rgb"), ("ir", "ir")] {
                 let dir = seg.path().join(sub);
+                if external_corpus() && !dir.is_dir() {
+                    continue;
+                }
                 let mut files: Vec<_> = std::fs::read_dir(&dir)
                     .unwrap_or_else(|e| panic!("{}: read frame dir: {e}", dir.display()))
                     .map(|e| e.unwrap_or_else(|e| panic!("{}: read entry: {e}", dir.display())))
@@ -339,9 +353,16 @@ fn main() {
         "manifest entries never seen on disk: {:?}",
         manifest.keys().take(4).collect::<Vec<_>>()
     );
-    assert_eq!(
-        emitted, EXPECTED_EMITTED,
-        "stage-3 corpus changed; update the pinned baseline deliberately"
-    );
-    assert_eq!(compared, EXPECTED_COMPARED, "probe coverage changed");
+    if external_corpus() {
+        assert_eq!(
+            emitted, manifest_total,
+            "external corpus incompletely walked"
+        );
+    } else {
+        assert_eq!(
+            emitted, EXPECTED_EMITTED,
+            "stage-3 corpus changed; update the pinned baseline deliberately"
+        );
+        assert_eq!(compared, EXPECTED_COMPARED, "probe coverage changed");
+    }
 }
