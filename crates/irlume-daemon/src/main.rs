@@ -188,7 +188,10 @@ fn main() {
     let det = env_or("IRLUME_DET_MODEL", "/etc/irlume/det.onnx");
     let model = env_or("IRLUME_MODEL", "/etc/irlume/face.onnx");
     let adapter = env_or("IRLUME_IR_ADAPTER", "/etc/irlume/ir_adapter.onnx");
-    let mesh = env_or("IRLUME_MESH_MODEL", "/etc/irlume/face_landmark.onnx");
+    let mesh = env_or(
+        "IRLUME_MESH_MODEL",
+        "/etc/irlume/face_landmarks_detector.tflite",
+    );
     let blaze = env_or(
         "IRLUME_BLAZE_MODEL",
         "/etc/irlume/blaze_face_short_range.onnx",
@@ -3434,7 +3437,7 @@ mod tests {
         let shipped = [
             "/etc/irlume/det.onnx",
             "/etc/irlume/face.onnx",
-            "/etc/irlume/face_landmark.onnx",
+            "/etc/irlume/face_landmarks_detector.tflite",
             "/etc/irlume/blaze_face_short_range.onnx",
         ];
         assert_eq!(

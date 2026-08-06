@@ -274,7 +274,7 @@ in
         ORT_DYLIB_PATH = "${onnxruntime-bin}/lib/libonnxruntime.so";
         IRLUME_DET_MODEL = "${models}/face_detection_yunet_2023mar.onnx";
         IRLUME_MODEL = "${models}/glintr100.onnx";
-        IRLUME_MESH_MODEL = "${models}/face_landmark.onnx";
+        IRLUME_MESH_MODEL = "${models}/face_landmarks_detector.tflite";
         IRLUME_BLAZE_MODEL = "${models}/blaze_face_short_range.onnx";
         IRLUME_SOCKET = "/run/irlume.sock";
         IRLUME_RGB_DEVICE = cfg.rgbDevice;

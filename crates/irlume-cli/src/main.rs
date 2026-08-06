@@ -1734,7 +1734,7 @@ pub(crate) fn engine(
     if e.has_ir_adapter() {
         eprintln!("[engine] IR adapter loaded ({adapter}); dark mode uses adapted recognition");
     }
-    let mesh = flag(args, "--mesh").unwrap_or("models/face_landmark.onnx");
+    let mesh = flag(args, "--mesh").unwrap_or("models/face_landmarks_detector.tflite");
     let e = e.with_mesh(mesh)?;
     if e.has_mesh() {
         eprintln!("[engine] FaceMesh loaded ({mesh}); passive EAR liveness available");
@@ -3329,7 +3329,7 @@ fn report_credential_release(
             report,
             "[doctor] ⚠ credential-release challenge is required but cannot run: FaceMesh \
              is not loaded\n     \
-             (face_landmark.onnx). Face login still works; your keyring will fall back to \
+             (face_landmarks_detector.tflite). Face login still works; your keyring will fall back to \
              the typed\n     password. Fix: set IRLUME_MESH_MODEL in the irlumed unit, or \
              reinstall the package."
         );

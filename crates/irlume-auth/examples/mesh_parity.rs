@@ -242,7 +242,10 @@ fn main() {
     let mut det = Detector::load_from_memory(&det_bytes).expect("load detector");
     let mut onnx_mesh = FaceMesh::load_from_memory(&mesh_bytes).expect("load onnx mesh");
     let tflite_bytes = std::fs::read(tflite_mesh_path).expect("read tflite mesh");
-    let mut native = TfliteSession::from_pinned_bytes(&tflite_bytes, LANDMARKER_MESH_SHA256, 1)
+    // 2 threads = the production FaceMesh backend's setting; the byte-identical
+    // CSV against the 1-thread committed baseline is the multi-thread
+    // determinism evidence the switch needed.
+    let mut native = TfliteSession::from_pinned_bytes(&tflite_bytes, LANDMARKER_MESH_SHA256, 2)
         .expect("load native mesh");
     eprintln!(
         "detector_sha256={SHIPPED_DETECTOR_SHA256} onnx_mesh_sha256={SHIPPED_MESH_SHA256} \

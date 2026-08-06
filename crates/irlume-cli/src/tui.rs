@@ -1556,7 +1556,7 @@ impl App {
                 "require-challenge is ON but FaceMesh isn't loaded; the challenge is skipped"
                     .into(),
                 Fix::Manual(
-                    "set IRLUME_MESH_MODEL=<models/face_landmark.onnx> in the irlumed unit".into(),
+                    "set IRLUME_MESH_MODEL=<models/face_landmarks_detector.tflite> in the irlumed unit".into(),
                 ),
             ));
         }

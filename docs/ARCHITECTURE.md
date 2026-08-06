@@ -90,7 +90,7 @@ nothing is downloaded at runtime.
 |---|---|---|---|
 | YuNet (`face_detection_yunet_2023mar.onnx`) | detection | finds the face in both the RGB and IR frames: bbox + 5 landmarks | MIT |
 | BlazeFace short-range (`blaze_face_short_range.onnx`) | detection rescue | cascade stage 2, runs only when YuNet finds nothing (saturated or backlit frames); its coarse box is refined by FaceMesh before use | Apache-2.0 |
-| MediaPipe FaceLandmarker mesh (`face_landmark.onnx`) | liveness + rescue alignment | 478 dense landmarks; drives the blink/EAR challenge gate and turns rescue boxes into alignment points. Never used for recognition | Apache-2.0 |
+| MediaPipe FaceLandmarker mesh (`face_landmarks_detector.tflite`, Google's published artifact run on the bundled TFLite runtime; `face_landmark.onnx` ships as the ONNX conversion fallback) | liveness + rescue alignment | 478 dense landmarks; drives the blink/EAR challenge gate and turns rescue boxes into alignment points. Never used for recognition | Apache-2.0 |
 | AuraFace (`glintr100.onnx`) | recognition | 512-D ArcFace-style embedding of the aligned 112×112 face; matching is cosine similarity against the enrolled templates | Apache-2.0 |
 
 ```mermaid

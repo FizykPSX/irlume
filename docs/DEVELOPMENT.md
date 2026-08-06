@@ -276,7 +276,7 @@ load-failure message re-enters the API lock being initialized.
 bash scripts/fetch-models.sh                                     # real model weights
 export ORT_DYLIB_PATH=/path/to/libonnxruntime.so # see above
 cargo run --release -p irlume-auth --example landmark_dump -- \
-  models/face_detection_yunet_2023mar.onnx models/face_landmark.onnx \
+  models/face_detection_yunet_2023mar.onnx models/face_landmarks_detector.tflite \
   out/ /dev/video2 36
 ```
 

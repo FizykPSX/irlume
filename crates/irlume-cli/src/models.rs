@@ -771,7 +771,7 @@ pub(crate) fn stage_statuses() -> Vec<StageStatus> {
         ),
         (
             Stage::Landmarks,
-            "face_landmark.onnx",
+            "face_landmarks_detector.tflite",
             "IRLUME_MESH_MODEL",
             false,
         ),
