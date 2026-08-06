@@ -115,6 +115,50 @@ that degrade EAR. Any authentication use needs paired open/closed captures
 per camera, illumination, and glasses condition, with the threshold chosen
 on frames the evaluation never saw.
 
+## External corpus: 13,233 LFW frames on a second machine
+
+Per the session's direction, the whole benchmark re-ran on archhost (AMD
+Ryzen 7 5700G, CachyOS-adjacent rolling Arch, same bundled runtime build)
+over the Kaggle LFW dataset (`jessicali9530/lfw-dataset`, deep-funneled
+250px portraits), converted to PPM and content-pinned by
+`2026-08-06-lfw-corpus.sha256`. The harnesses ran in their external-corpus
+mode: every frame still verified against the manifest, agreement bounds
+still enforced, only the stage-3 count pins replaced by the manifest total.
+Per-frame evidence in the three `2026-08-06-lfw-*.csv` files.
+
+- **Short-range parity got stronger, not weaker**: 13,233/13,233 frames,
+  mean IoU 1.000000, minimum 0.999999, max score delta 5.364e-7, zero
+  one-sided detections, 8,023 frames bit-identical across runtimes.
+- **Mesh parity holds at the same magnitude**: mean NME 7.384e-7 (stage-3:
+  6.868e-7), worst 2.090e-6. The stage-3-derived 2.0e-6 bound was pinned to
+  that corpus's noise and a 26x longer tail poked past it, so the external
+  mode carries its own 5e-6 bound; the run also caught that YuNet accepts a
+  face on every single LFW frame. The iris tail is the loosest region:
+  worst iris-only NME 1.634e-5, an order above the body but still under a
+  thousandth of a pixel at LFW eye distances.
+- **The blendshape/EAR relationship reproduces on a 60x larger, fully
+  independent corpus**: pooled Pearson r = -0.916 (stage-3: -0.938), all
+  outputs finite. Still observational; LFW is also an open-eye set.
+- **Latency on the Ryzen** (`2026-08-06-lfw-mp-latency-archhost.csv`):
+  the machine is far steadier than the Zenbook (p50-to-p95 bands of a few
+  hundredths of a ms), and here ort wins the SHORT-RANGE row outright
+  (1.01ms vs 2.02/1.22/0.82ms native at 1/2/4 threads), a reversal of the
+  Zenbook ordering worth knowing before quoting either machine as "the"
+  number. The mesh ordering, the one that feeds the switch decision, holds
+  on both machines: native 4.58ms at 2 threads vs 7.36ms ONNX, and
+  blendshapes costs 1.41ms.
+
+| Stage call (archhost) | Runtime | Threads | Mean ms | p50 | p95 |
+|---|---|---|---|---|---|
+| YuNet detect | ort | default | 10.09 | 9.89 | 11.08 |
+| Short-range Blaze | ort | default | 1.01 | 0.98 | 1.29 |
+| Short-range Blaze | tflite | 4 | 0.82 | 0.82 | 0.83 |
+| Full-range Blaze | tflite | 2 | 3.28 | 3.22 | 4.13 |
+| Mesh 468 (shipped) | ort | default | 7.36 | 7.36 | 7.40 |
+| Mesh 478 (native) | tflite | 2 | 4.58 | 4.58 | 4.62 |
+| Mesh 478 (native) | tflite | 4 | 3.08 | 3.07 | 3.12 |
+| Blendshapes | tflite | 1 | 1.41 | 1.41 | 1.42 |
+
 ## Verdict, per pipeline stage
 
 **Primary detection: YuNet stays.** No MediaPipe detector was benchmarked as
@@ -135,10 +179,10 @@ the exact mistake the #299 review caught.
 **Landmarks: switch to the native 478-pt .tflite.** The evidence is now
 complete on all three axes the decision needed. Fidelity: the two models
 agree to mean NME 6.9e-7, and both parity harnesses run as enforcing
-regression gates. Latency: native at 2 threads beat the shipped ONNX mesh in
-both bench runs (5.79 vs 10.34ms mean in the committed run; the ort mean
-moved between runs, the tflite mean did not) and holds a tighter tail; 2
-threads matches the precedent `FullRangeBlaze` set. Supply chain: the switch
+regression gates. Latency: native at 2 threads beat the shipped ONNX mesh on
+BOTH measured machines (Zenbook 5.79 vs 10.34ms; archhost Ryzen 4.58 vs
+7.36ms) with tighter tails; 2 threads matches the precedent
+`FullRangeBlaze` set. Supply chain: the switch
 deletes a conversion step nobody can reproduce from the shipped artifact
 alone and replaces it with Google's published file, byte-pinned, on the
 runtime irlume already bundles and verifies. The iris points are NOT an argument
@@ -166,7 +210,9 @@ exists it is not a candidate for wiring.
 
 ## Not measured
 
-- Latency on one machine only (the Zenbook); the mini PC and archhost differ.
+- Mini PC (N100) latency; the Zenbook and archhost are both measured and
+  disagree on the short-range ordering, so a third machine would not be
+  redundant.
 - Open/closed blendshape separation (no closed-eye frames in the corpus).
 - Multi-thread determinism of the native runtime: the parity gates all ran
   single-threaded, and a 2-thread production mesh should re-run the
