@@ -25,12 +25,6 @@ on:
       - ".github/workflows/**"
       - ".github/actions/**"
       - ".github/zizmor.yml"
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/**"
-      - ".github/actions/**"
-      - ".github/zizmor.yml"
   # Weekly, because the online audits (archived or deleted actions, known-bad
   # refs) can start failing on a workflow nobody has edited.
   schedule:

@@ -33,12 +33,6 @@ on:
       - "Cargo.lock"
       - ".github/workflows/asan.yml"
       - ".github/lsan-suppressions.txt"
-  push:
-    branches: [main]
-    paths:
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
   schedule:
     - cron: "40 4 * * 3" # Wednesdays 04:40 UTC, clear of the other scheduled jobs
   workflow_dispatch:
