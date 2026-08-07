@@ -127,7 +127,7 @@ jobs:
         run: |
           command -v apt-get >/dev/null && sudo apt-get install -y --no-install-recommends python3-jsonschema || python3 -c "import jsonschema"
           python3 scripts/machine-api-conformance.py \
-            --irlume target/release/irlume --strict
+            --irlume "${CARGO_TARGET_DIR:-target}/release/irlume" --strict
 
       # The TPM-gated tests run against a software TPM: same TSS stack, no
       # hardware. IRLUME_TCTI is the production env override; swtpm state is
@@ -329,7 +329,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+        # Idempotent on a persistent runner: `cargo install` refuses when the
+        # binary already exists, so only (re)install on a version mismatch.
+        run: |
+          if ! cargo llvm-cov --version 2>/dev/null | grep -q '0\.8\.7'; then
+            cargo install cargo-llvm-cov --version 0.8.7 --locked --force
+          fi
 
       - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
         run: |
@@ -617,9 +622,15 @@ jobs:
 
       - name: Install system build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config clang libclang-dev libtss2-dev
+          # Self-hosted Arch runner has these preinstalled; apt path kept
+          # for a hosted fallback.
+          if command -v apt-get >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              build-essential pkg-config clang libclang-dev libtss2-dev
+          else
+            for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
+          fi
 
       # Nightly is date-pinned so a rustc regression can't fail PRs that
       # changed nothing and masquerade as a fuzz finding. Bump the date (and
