@@ -1979,6 +1979,221 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
     })
 }
 
+/// Probe rounds when nobody sized the run explicitly. Enough that one unlucky
+/// capture cannot decide the answer, few enough that a user waits seconds
+/// rather than minutes: the measured spread was sd ~1.3 on a mean of ~117, so
+/// 6 is ample.
+const TUNE_DEFAULT_ROUNDS: usize = 6;
+/// Upper bound on requested probe rounds.
+const TUNE_MAX_ROUNDS: usize = 30;
+
+/// Whether a capture-mode probe may persist its verdict to cameras.conf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeStore {
+    /// `camera-tune`: the user asked for a measurement, so the verdict is
+    /// stored even when the scene was too dim to trust it, and the summary
+    /// carries the re-run caveat.
+    Always,
+    /// Enrollment's one-time probe (#340): automatic, so it must not persist
+    /// what the scene cannot support. A clean concurrent reading in a dim
+    /// room proves nothing (the NexiGo parks near mean 60 in any light, so a
+    /// legitimately dim scene hides the loss completely), and storing it
+    /// would re-create durably the exact trap the sequential default closes.
+    ConclusiveOnly,
+}
+
+/// Whether the probe delivered every round it was asked for (#340 review):
+/// `accumulate` drops errored rounds from the means, and `conclusive()` tests
+/// brightness, not evidence volume, so without this check one lucky round per
+/// arm and five errors each could persist durable policy. The all-error
+/// concurrent arm is the one exception, backed differently: every attempt
+/// must have errored (partial arms do not qualify) and
+/// `measure_contention_impl`'s trailing sequential control has already proven
+/// the camera still answers.
+fn probe_rounds_complete(report: &irlume_auth::ContentionReport, requested: usize) -> bool {
+    if report.concurrent_impossible() {
+        return report.concurrent.failed == requested;
+    }
+    report.sequential.rounds == requested
+        && report.sequential.failed == 0
+        && report.concurrent.rounds == requested
+        && report.concurrent.failed == 0
+}
+
+/// The persistence decision, pure so a mode-flipping mutant is caught without
+/// cameras: an explicit tune always stores; the automatic probe stores only a
+/// result backed by every requested round AND a scene that can carry it.
+fn probe_verdict_storable(
+    policy: ProbeStore,
+    report: &irlume_auth::ContentionReport,
+    requested_rounds: usize,
+) -> bool {
+    match policy {
+        ProbeStore::Always => true,
+        ProbeStore::ConclusiveOnly => {
+            probe_rounds_complete(report, requested_rounds) && report.conclusive()
+        }
+    }
+}
+
+/// Run the contention probe on the engine's camera pair, persist the verdict
+/// per `policy`, and summarize what was measured.
+///
+/// One path for both callers (`camera-tune` and the enrollment probe), so the
+/// watchdog contract holds everywhere: the probe reports progress between
+/// captures, without which a long but healthy run reads as a wedged driver
+/// and systemd kills a working daemon (#141).
+fn run_capture_mode_probe(
+    rgb_dev: &str,
+    ir_dev: &str,
+    rounds: usize,
+    policy: ProbeStore,
+) -> Result<String, String> {
+    // Reports between captures so a long but healthy tune is not read as a
+    // wedged driver by the watchdog (#141), and per silent warm-up window
+    // inside each capture (#336).
+    let progress: irlume_auth::Progress = std::sync::Arc::new(note_worker_progress);
+    let report = irlume_auth::measure_contention_with_progress(rgb_dev, ir_dev, rounds, &progress)
+        .map_err(|e| e.to_string())?;
+    let mode = report.recommended_mode();
+    if !probe_verdict_storable(policy, &report, rounds) {
+        // Not an error: the pair stays unmeasured, which the sequential
+        // default already makes safe, and the caller's work proceeds. Name
+        // the reason that actually blocked storing: thin evidence and dim
+        // light are different problems with different fixes.
+        let why = if probe_rounds_complete(&report, rounds) {
+            format!(
+                "the probe ran in a dim scene (RGB mean {:.0}), where a clean \
+                 concurrent reading proves nothing",
+                report.sequential.rgb_mean
+            )
+        } else {
+            format!("the probe did not complete {rounds} clean rounds in both capture modes")
+        };
+        return Ok(format!(
+            "capture mode left unmeasured: {why}; captures stay one at a time (the safe \
+             default). Run `sudo irlume camera-tune` with the room lit to store a \
+             measured verdict"
+        ));
+    }
+    match policy {
+        // The explicit tune is an instruction to re-measure: it overwrites.
+        ProbeStore::Always => {
+            irlume_auth::store_capture_mode(rgb_dev, ir_dev, mode).map_err(|e| e.to_string())?
+        }
+        // The automatic probe re-checks emptiness under the cameras.conf
+        // writer lock: its first check and this write are separated by the
+        // whole probe, and a verdict another process landed in that window
+        // outranks the automatic result (#340 review).
+        ProbeStore::ConclusiveOnly => {
+            match irlume_auth::store_capture_mode_if_absent(rgb_dev, ir_dev, mode)
+                .map_err(|e| e.to_string())?
+            {
+                irlume_auth::StoreIfAbsent::Stored => {}
+                irlume_auth::StoreIfAbsent::AlreadyPresent(existing) => {
+                    return Ok(format!(
+                        "capture mode {} was stored by someone else while the probe ran; \
+                         keeping it (the probe's own result, {}, was discarded)",
+                        existing.as_str(),
+                        mode.as_str()
+                    ));
+                }
+            }
+        }
+    }
+    // An arm that never streamed has no retention to report; percentages
+    // from its empty samples would read as dimming when the finding is
+    // "cannot run at all" (#192, the BRIO's EINVAL on concurrent RGB open).
+    let mut msg = if report.concurrent_impossible() {
+        // Observed counts, not the requested round count: a sequential arm
+        // can complete fewer rounds than were asked for, and "measured fine"
+        // must not overstate its evidence.
+        format!(
+            "capture mode {} for this camera: it cannot stream RGB and IR \
+             at once (all {} concurrent attempts errored; {} sequential \
+             round(s) completed, {} errored; a trailing one-at-a-time \
+             control confirmed the camera still answers)",
+            mode.as_str(),
+            report.concurrent.failed,
+            report.sequential.rounds,
+            report.sequential.failed,
+        )
+    } else {
+        format!(
+            "capture mode {} for this camera: concurrent capture keeps {:.0}% of RGB \
+             and {:.0}% of IR brightness and saves {:.0}ms ({rounds} rounds)",
+            mode.as_str(),
+            report.retained_rgb() * 100.0,
+            report.retained_ir() * 100.0,
+            report.saved_ms(),
+        )
+    };
+    // Say so rather than letting a dark room read as a clean bill of health.
+    if !report.conclusive() {
+        msg.push_str(&format!(
+            "\n     measured in a dim scene (RGB mean {:.0}); this loss only \
+             shows in normal light, so re-run camera-tune with the room lit \
+             to confirm",
+            report.sequential.rgb_mean
+        ));
+    }
+    Ok(msg)
+}
+
+/// Whether enrollment must measure the capture mode first: exactly when the
+/// pair is unmeasured AND the verdict could persist (#340). A stored verdict
+/// of EITHER value is authoritative; enrollment never re-measures or
+/// overwrites one, so nothing about a measured camera changes by enrolling on
+/// it again. A camera with no stable identity (no USB descriptor, e.g. a
+/// v4l2loopback node) is excluded outright: cameras.conf keys verdicts by
+/// identity, so its probe result could never be stored and every enrollment
+/// would spend a minute re-measuring to no effect.
+fn enrollment_needs_capture_probe(
+    identifiable: bool,
+    stored: Option<irlume_auth::CaptureMode>,
+) -> bool {
+    identifiable && stored.is_none()
+}
+
+/// The enrollment probe's journal note, over an injected prober so the
+/// trigger rule is testable without cameras: `None` when a stored verdict
+/// made the probe unnecessary. A failed probe reports instead of failing the
+/// enrollment, because an unmeasured pair enrolls under the sequential
+/// default, which is the shape every camera manages.
+fn enroll_capture_probe_note(
+    identifiable: bool,
+    stored: Option<irlume_auth::CaptureMode>,
+    probe: impl FnOnce() -> Result<String, String>,
+) -> Option<String> {
+    if !enrollment_needs_capture_probe(identifiable, stored) {
+        return None;
+    }
+    Some(match probe() {
+        Ok(msg) => msg,
+        Err(e) => format!(
+            "capture-mode probe failed ({e}); enrolling with one-at-a-time capture, \
+             the unmeasured default"
+        ),
+    })
+}
+
+/// The Enroll arm's probe-then-capture order, over injected probe and enroll
+/// closures so the wiring is testable without cameras (#340 review round: the
+/// helper tests alone could not catch dispatch dropping the probe, running it
+/// after the capture, or a probe outcome blocking enrollment). The probe note
+/// goes to the journal; enrollment ALWAYS runs, whatever the probe said.
+fn enroll_with_capture_probe(
+    identifiable: bool,
+    stored: Option<irlume_auth::CaptureMode>,
+    probe: impl FnOnce() -> Result<String, String>,
+    enroll: impl FnOnce() -> Response,
+) -> Response {
+    if let Some(note) = enroll_capture_probe_note(identifiable, stored, probe) {
+        eprintln!("irlumed: {note}");
+    }
+    enroll()
+}
+
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
     // BEFORE the mutation runs, not after: a summary dropped early leaves
     // the cache empty (a concurrent status read queues here behind us),
@@ -2285,10 +2500,45 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 ),
                 Err(e) => eprintln!("irlumed: IR emitter check skipped: {e}"),
             }
-            match engine.enroll_profile(&user, profile, want) {
-                Ok(outcome) => enroll_response(outcome),
-                Err(e) => Response::Error(e.to_string()),
-            }
+            // One-time capture-mode measurement (#340): an unmeasured pair
+            // defaults to sequential capture, and enrollment is the reliable
+            // moment to measure the real answer: the user is present, waiting
+            // is expected, and the room is usually lit well enough for a
+            // concurrent reading to mean something (a lock screen in the
+            // dark, the other candidate moment, is none of those). Not
+            // root-gated like camera-tune: enrolling already authorizes
+            // holding the camera and firing the emitter, and this write can
+            // only fill an EMPTY verdict, never flip a measured one.
+            let (rgb_dev, ir_dev) = (
+                engine.rgb_device().to_string(),
+                engine.ir_device().to_string(),
+            );
+            // Both nodes must identify: the verdict is keyed by the PAIR, so
+            // an unidentifiable IR (a loopback feeder beside a real RGB
+            // module) has nowhere to store a result either (#340 review).
+            let identifiable = irlume_auth::device_identity(&rgb_dev).is_some()
+                && irlume_auth::device_identity(&ir_dev).is_some();
+            enroll_with_capture_probe(
+                identifiable,
+                irlume_auth::stored_capture_mode(&rgb_dev, &ir_dev),
+                || {
+                    eprintln!(
+                        "irlumed: enroll: no measured capture mode for this camera pair; \
+                         running the one-time contention probe before the scans (up to a \
+                         minute; the IR emitter fires)"
+                    );
+                    run_capture_mode_probe(
+                        &rgb_dev,
+                        &ir_dev,
+                        TUNE_DEFAULT_ROUNDS,
+                        ProbeStore::ConclusiveOnly,
+                    )
+                },
+                || match engine.enroll_profile(&user, profile, want) {
+                    Ok(outcome) => enroll_response(outcome),
+                    Err(e) => Response::Error(e.to_string()),
+                },
+            )
         }
         Request::TuneCaptureMode { rounds } => {
             // Holds the camera for tens of seconds and rewrites capture policy in
@@ -2300,74 +2550,19 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     peer.uid
                 ));
             }
-            // Enough rounds that one unlucky capture cannot decide the answer,
-            // few enough that a user waits seconds rather than minutes: the
-            // measured spread was sd ~1.3 on a mean of ~117, so 6 is ample.
-            const DEFAULT_ROUNDS: usize = 6;
-            const MAX_ROUNDS: usize = 30;
-            let rounds = rounds.unwrap_or(DEFAULT_ROUNDS).clamp(1, MAX_ROUNDS);
+            let rounds = rounds
+                .unwrap_or(TUNE_DEFAULT_ROUNDS)
+                .clamp(1, TUNE_MAX_ROUNDS);
             let (rgb_dev, ir_dev) = (
                 engine.rgb_device().to_string(),
                 engine.ir_device().to_string(),
             );
-            // Reports between captures so a long but healthy tune is not read
-            // as a wedged driver by the watchdog (#141), and per silent
-            // warm-up window inside each capture (#336).
-            let progress: irlume_auth::Progress = std::sync::Arc::new(note_worker_progress);
-            match irlume_auth::measure_contention_with_progress(
-                &rgb_dev, &ir_dev, rounds, &progress,
-            ) {
-                Ok(report) => {
-                    let mode = report.recommended_mode();
-                    match irlume_auth::store_capture_mode(&rgb_dev, mode) {
-                        Ok(()) => {
-                            // An arm that never streamed has no retention to
-                            // report; percentages from its empty samples would
-                            // read as dimming when the finding is "cannot run
-                            // at all" (#192, the BRIO's EINVAL on concurrent
-                            // RGB open).
-                            let mut msg = if report.concurrent_impossible() {
-                                // Observed counts, not the requested round
-                                // count: a sequential arm can complete fewer
-                                // rounds than were asked for, and "measured
-                                // fine" must not overstate its evidence.
-                                format!(
-                                    "capture mode {} for this camera: it cannot stream RGB and IR \
-                                     at once (all {} concurrent attempts errored; {} sequential \
-                                     round(s) completed, {} errored; a trailing one-at-a-time \
-                                     control confirmed the camera still answers)",
-                                    mode.as_str(),
-                                    report.concurrent.failed,
-                                    report.sequential.rounds,
-                                    report.sequential.failed,
-                                )
-                            } else {
-                                format!(
-                                    "capture mode {} for this camera: concurrent capture keeps {:.0}% of RGB \
-                                     and {:.0}% of IR brightness and saves {:.0}ms ({rounds} rounds)",
-                                    mode.as_str(),
-                                    report.retained_rgb() * 100.0,
-                                    report.retained_ir() * 100.0,
-                                    report.saved_ms(),
-                                )
-                            };
-                            // Say so rather than letting a dark room read as a
-                            // clean bill of health.
-                            if !report.conclusive() {
-                                msg.push_str(&format!(
-                                    "\n     measured in a dim scene (RGB mean {:.0}); this loss only \
-                                     shows in normal light, so re-run camera-tune with the room lit \
-                                     to confirm",
-                                    report.sequential.rgb_mean
-                                ));
-                            }
-                            eprintln!("irlumed: {msg}");
-                            Response::Ok(msg)
-                        }
-                        Err(e) => Response::Error(e.to_string()),
-                    }
+            match run_capture_mode_probe(&rgb_dev, &ir_dev, rounds, ProbeStore::Always) {
+                Ok(msg) => {
+                    eprintln!("irlumed: {msg}");
+                    Response::Ok(msg)
                 }
-                Err(e) => Response::Error(e.to_string()),
+                Err(e) => Response::Error(e),
             }
         }
         Request::SetupIrEmitter { dry_run } => {
@@ -3325,6 +3520,177 @@ fn set_mode(path: &str, mode: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The #340 trigger rule: enrollment probes exactly the unmeasured pair.
+    /// A stored verdict of either value suppresses the probe entirely, which
+    /// is also the fail-closed half: enrolling again can never re-measure or
+    /// overwrite a measured camera.
+    #[test]
+    fn enrollment_probes_exactly_when_no_verdict_is_stored() {
+        use std::cell::Cell;
+        let ran = Cell::new(false);
+        let note = enroll_capture_probe_note(true, None, || {
+            ran.set(true);
+            Ok("capture mode sequential for this camera: probed".into())
+        });
+        assert!(ran.get(), "an unmeasured pair must be probed");
+        assert_eq!(
+            note.as_deref(),
+            Some("capture mode sequential for this camera: probed")
+        );
+        for stored in [
+            irlume_auth::CaptureMode::Concurrent,
+            irlume_auth::CaptureMode::Sequential,
+        ] {
+            let ran = Cell::new(false);
+            let note = enroll_capture_probe_note(true, Some(stored), || {
+                ran.set(true);
+                Ok("must not run".into())
+            });
+            assert!(
+                !ran.get(),
+                "a stored {stored:?} verdict must suppress the probe"
+            );
+            assert_eq!(note, None, "{stored:?}");
+        }
+    }
+
+    /// A camera without a stable identity (a v4l2loopback node, the CI
+    /// feeder) is never probed: its verdict cannot be keyed into
+    /// cameras.conf, so the probe would re-run on every enrollment and store
+    /// nothing.
+    #[test]
+    fn an_unidentifiable_camera_is_never_probed_at_enrollment() {
+        use std::cell::Cell;
+        let ran = Cell::new(false);
+        let note = enroll_capture_probe_note(false, None, || {
+            ran.set(true);
+            Ok("must not run".into())
+        });
+        assert!(!ran.get());
+        assert_eq!(note, None);
+    }
+
+    /// A failed probe reports and lets the enrollment proceed under the
+    /// sequential default; it must not surface as an enrollment error.
+    #[test]
+    fn a_failed_enrollment_probe_reports_instead_of_blocking() {
+        let note =
+            enroll_capture_probe_note(true, None, || Err("the camera stopped answering".into()))
+                .expect("a probe that ran always leaves a note");
+        assert!(note.contains("the camera stopped answering"), "{note}");
+        assert!(note.contains("one-at-a-time capture"), "{note}");
+    }
+
+    /// A ContentionReport whose arms carry exactly these observations.
+    fn contention_report(
+        seq: (usize, usize, f32, f32),
+        conc: (usize, usize, f32, f32),
+    ) -> irlume_auth::ContentionReport {
+        let sample = |(rounds, failed, rgb_mean, ir_mean): (usize, usize, f32, f32)| {
+            irlume_auth::PairSample {
+                rgb_mean,
+                ir_mean,
+                total_ms: 100.0,
+                rounds,
+                failed,
+            }
+        };
+        irlume_auth::ContentionReport {
+            sequential: sample(seq),
+            concurrent: sample(conc),
+        }
+    }
+
+    /// Store policy (#340 plus its review round): an explicit `camera-tune`
+    /// persists any verdict (its summary carries the caveats), while the
+    /// automatic enrollment probe persists only a verdict backed by every
+    /// requested round in both arms AND a conclusive scene. One lucky round
+    /// per arm with five errors each is the review's exact scenario: bright
+    /// enough to read conclusive, far too thin to become durable policy.
+    #[test]
+    fn only_a_conclusive_fully_backed_verdict_is_storable_from_the_enrollment_probe() {
+        use ProbeStore::{Always, ConclusiveOnly};
+        // Every requested round completed, lit scene: storable everywhere.
+        let full = contention_report((6, 0, 120.0, 100.0), (6, 0, 118.0, 98.0));
+        assert!(probe_verdict_storable(ConclusiveOnly, &full, 6));
+        assert!(probe_verdict_storable(Always, &full, 6));
+        // One good round and five errors per arm, same brightness:
+        // conclusive() says yes, the evidence bar says no.
+        let thin = contention_report((1, 5, 120.0, 100.0), (1, 5, 118.0, 98.0));
+        assert!(thin.conclusive(), "precondition: brightness alone passes");
+        assert!(!probe_verdict_storable(ConclusiveOnly, &thin, 6));
+        assert!(probe_verdict_storable(Always, &thin, 6));
+        // Complete rounds in a dim room: inconclusive, not storable.
+        let dim = contention_report((6, 0, 50.0, 100.0), (6, 0, 49.0, 98.0));
+        assert!(!probe_verdict_storable(ConclusiveOnly, &dim, 6));
+        assert!(probe_verdict_storable(Always, &dim, 6));
+        // Concurrent impossible with EVERY attempt errored: the trailing
+        // control already vouched, storable.
+        let impossible = contention_report((6, 0, 120.0, 100.0), (0, 6, 0.0, 0.0));
+        assert!(impossible.concurrent_impossible(), "precondition");
+        assert!(probe_verdict_storable(ConclusiveOnly, &impossible, 6));
+        // Concurrent impossible but only half the attempts on record: thin
+        // evidence again, not storable automatically.
+        let partial_impossible = contention_report((6, 0, 120.0, 100.0), (0, 3, 0.0, 0.0));
+        assert!(!probe_verdict_storable(
+            ConclusiveOnly,
+            &partial_impossible,
+            6
+        ));
+        assert!(probe_verdict_storable(Always, &partial_impossible, 6));
+    }
+
+    /// The Enroll arm's wiring (#340 review): on an unmeasured pair the probe
+    /// runs BEFORE the capture, and enrollment runs whatever the probe said;
+    /// on a measured pair only the capture runs.
+    #[test]
+    fn enroll_orchestration_probes_before_capture_and_always_enrolls() {
+        let events = std::sync::Mutex::new(Vec::new());
+        let resp = enroll_with_capture_probe(
+            true,
+            None,
+            || {
+                events.lock().unwrap().push("probe");
+                Ok("probed".into())
+            },
+            || {
+                events.lock().unwrap().push("enroll");
+                Response::Ok("enrolled".into())
+            },
+        );
+        assert!(matches!(resp, Response::Ok(ref m) if m == "enrolled"));
+        assert_eq!(*events.lock().unwrap(), ["probe", "enroll"]);
+        // A failing probe still enrolls.
+        let events = std::sync::Mutex::new(Vec::new());
+        let resp = enroll_with_capture_probe(
+            true,
+            None,
+            || Err("probe broke".into()),
+            || {
+                events.lock().unwrap().push("enroll");
+                Response::Ok("enrolled".into())
+            },
+        );
+        assert!(matches!(resp, Response::Ok(_)));
+        assert_eq!(*events.lock().unwrap(), ["enroll"]);
+        // A measured pair goes straight to capture.
+        let events = std::sync::Mutex::new(Vec::new());
+        let resp = enroll_with_capture_probe(
+            true,
+            Some(irlume_auth::CaptureMode::Concurrent),
+            || {
+                events.lock().unwrap().push("probe");
+                Ok("must not run".into())
+            },
+            || {
+                events.lock().unwrap().push("enroll");
+                Response::Ok("enrolled".into())
+            },
+        );
+        assert!(matches!(resp, Response::Ok(_)));
+        assert_eq!(*events.lock().unwrap(), ["enroll"]);
+    }
 
     #[test]
     fn verifiable_shadow_hash_extracts_and_skips_unverifiable() {
