@@ -404,6 +404,10 @@
             },
             "passphrase_set": {
               "type": "boolean"
+            },
+            "key_present": {
+              "description": "Whether a sealed template key currently exists. false with templates=encrypted means the templates cannot currently be opened. If passphrase_set is true, irlume recovery restore can recreate the sealed key from the recovery envelope; otherwise re-enrollment is required. Documented in MACHINE-API.md; added within contract 1 (additive field).",
+              "type": "boolean"
             }
           }
         },
