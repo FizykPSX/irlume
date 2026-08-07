@@ -22,6 +22,34 @@ for m in face_detection_yunet_2023mar.onnx glintr100.onnx face_landmark.onnx bla
     [[ -f "$REPO/models/$m" ]] || { echo "missing $REPO/models/$m" >&2; exit 1; }
 done
 
+# Mesh default: the production default is the native face_landmarks_detector
+# .tflite (#315), which needs a TFLite C runtime on this host. Probe the same
+# candidate paths the daemon's resolver uses, and probe them THROUGH that
+# resolver (a truncated or wrong-architecture .so is still a regular file,
+# so -f alone would write a unit whose daemon cannot start); without a
+# loadable runtime, fall back to the ONNX conversion.
+TFLITE_PROBE="$REPO/target/release/examples/tflite_runtime_probe"
+[[ -x "$TFLITE_PROBE" ]] || {
+    echo "missing $TFLITE_PROBE; build with: cargo build --release -p irlume-vision --example tflite_runtime_probe" >&2
+    exit 1
+}
+MESH="$REPO/models/face_landmark.onnx"
+for lib in /usr/share/irlume/tflite/libtensorflowlite_c.so \
+           /usr/lib64/libtensorflowlite_c.so \
+           /usr/lib/libtensorflowlite_c.so \
+           /usr/lib/x86_64-linux-gnu/libtensorflowlite_c.so; do
+    [[ -f "$lib" ]] || continue
+    if "$TFLITE_PROBE" "$lib"; then
+        MESH="$REPO/models/face_landmarks_detector.tflite"
+        [[ -f "$MESH" ]] || { echo "missing $MESH (run scripts/fetch-models.sh)" >&2; exit 1; }
+        break
+    fi
+    echo "TFLite runtime exists but is not loadable, skipping: $lib" >&2
+done
+if [[ "$MESH" == *.onnx ]]; then
+    echo "no loadable TFLite runtime found; mesh stays on the ONNX conversion (production default is the .tflite, see scripts/build-tflite-runtime.sh)"
+fi
+
 # State lives under the invoking user's home (single-admin install for now).
 STATE_HOME="$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)"
 
@@ -38,7 +66,7 @@ ExecStart=/usr/local/bin/irlumed
 Environment="ORT_DYLIB_PATH=$ORT"
 Environment="IRLUME_DET_MODEL=$REPO/models/face_detection_yunet_2023mar.onnx"
 Environment="IRLUME_MODEL=$REPO/models/glintr100.onnx"
-Environment="IRLUME_MESH_MODEL=$REPO/models/face_landmark.onnx"
+Environment="IRLUME_MESH_MODEL=$MESH"
 Environment="IRLUME_BLAZE_MODEL=$REPO/models/blaze_face_short_range.onnx"
 Environment="IRLUME_SOCKET=/run/irlume.sock"
 Environment="IRLUME_STATE_DIR=$STATE_HOME/.local/share/irlume"
