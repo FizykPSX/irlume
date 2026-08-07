@@ -395,7 +395,11 @@ enum WMsg {
     Stall(String),
     Count(u8),
     Captured(usize, usize),
-    Done,
+    Done {
+        /// Scans whose IR burst the room mostly lit; above zero the UI says
+        /// dark-room login is unverified (#312).
+        ambient_lit: usize,
+    },
     Err(String),
     /// Scan 1 of a "new profile" enroll matched an existing identity, so the
     /// daemon merged it into `profile` instead. The worker ends here and hands
@@ -403,6 +407,9 @@ enum WMsg {
     /// `added_scans` are the scan(s) already appended (undo target on decline).
     MergePrompt {
         profile: String,
+        /// Ambient-lit count of the scan(s) the merge already added, so the
+        /// continuation's completion note covers them too (#312).
+        ambient_lit: Option<usize>,
         /// Scans the daemon will still accept for this profile in the LOADED
         /// recognizer's space (#290 made the limit per recognizer). `None`
         /// when the daemon did not say, which is any daemon older than 0.9.0.
@@ -418,6 +425,9 @@ struct MergeConfirm {
     profile: String,
     added_scans: Vec<String>,
     remaining: usize,
+    /// Ambient-lit count of the already-added scan(s), seeded into the
+    /// continuation's total (#312).
+    ambient_lit: usize,
 }
 
 struct EnrollUi {
@@ -438,6 +448,9 @@ struct EnrollUi {
     /// stays continuous across the merge-confirm continuation instead of
     /// restarting at 0.
     base: usize,
+    /// Ambient-lit count of scans added BEFORE this worker started (the
+    /// merged scan(s)), folded into the completion note's total (#312).
+    ambient_base: usize,
 }
 
 struct Op {
@@ -2088,6 +2101,7 @@ impl App {
             captured: 0,
             target,
             base: 0,
+            ambient_base: 0,
         });
     }
 
@@ -2110,6 +2124,7 @@ impl App {
         let (st, pn) = (stop.clone(), mc.profile.clone());
         let add = Some(mc.profile.clone());
         let base = mc.added_scans.len(); // the merged scan(s), for a continuous count
+        let ambient_base = mc.ambient_lit;
         std::thread::spawn(move || enroll_worker(user, pn, add, mc.remaining, st, tx));
         self.enroll = Some(EnrollUi {
             rx,
@@ -2121,6 +2136,7 @@ impl App {
             captured: 0,
             target: mc.remaining,
             base,
+            ambient_base,
         });
     }
 
@@ -2259,8 +2275,20 @@ impl App {
                         }
                         self.log('✓', format!("captured scan {}/{}", n + base, t + base));
                     }
-                    WMsg::Done => {
+                    WMsg::Done { ambient_lit } => {
                         self.log('✓', "enrollment complete");
+                        let ambient_lit =
+                            ambient_lit + self.enroll.as_ref().map(|e| e.ambient_base).unwrap_or(0);
+                        if ambient_lit > 0 {
+                            self.log(
+                                '!',
+                                format!(
+                                    "{ambient_lit} scan(s) were lit mainly by the room, not \
+                                     provably by the IR emitter; dark-room login is unverified. \
+                                     Check it with the lights off: irlume identify"
+                                ),
+                            );
+                        }
                         finished = true;
                     }
                     WMsg::Err(e) => {
@@ -2272,6 +2300,7 @@ impl App {
                         profile,
                         room,
                         added_scans,
+                        ambient_lit,
                     } => {
                         // The rest of the requested scans, capped at the room
                         // the DAEMON reports for the loaded recognizer. It was
@@ -2298,6 +2327,7 @@ impl App {
                             profile,
                             added_scans,
                             remaining,
+                            ambient_lit: ambient_lit.unwrap_or(0),
                         });
                         finished = true; // the worker has ended; the modal takes over
                     }
@@ -3682,6 +3712,7 @@ impl App {
             captured: 0,
             target: ENROLL_SCANS,
             base: 0,
+            ambient_base: 0,
         });
     }
 
@@ -6199,6 +6230,9 @@ fn enroll_worker(
     tx: mpsc::Sender<WMsg>,
 ) {
     let send = |m: WMsg| tx.send(m).is_ok();
+    // Scans this worker added whose IR burst the room mostly lit (#312);
+    // summed across captures and reported once at Done.
+    let mut ambient_lit_total = 0usize;
     for i in 0..target {
         // Consecutive guide misses for THIS scan, framing and countdown
         // together; only a successful sample resets it.
@@ -6233,6 +6267,10 @@ fn enroll_worker(
                     user: user.clone(),
                     profile: profile.clone(),
                     scans: None,
+                    // Every scan after the first arrives via AddScan, so
+                    // without the structured reply the #312 ambient-lit
+                    // count would cover only scan 1 (Codex round).
+                    report_enrollment: true,
                 }
             };
             match crate::daemon_request(&req) {
@@ -6245,17 +6283,26 @@ fn enroll_worker(
                     profile: resolved,
                     room,
                     added_scans,
+                    ambient_lit,
                     ..
                 }) => {
                     let _ = send(WMsg::MergePrompt {
                         profile: resolved,
                         room,
                         added_scans,
+                        ambient_lit,
                     });
                     return;
                 }
                 // A brand-new profile (created) or an AddScan success.
-                Ok(Response::Enrolled { .. }) | Ok(Response::Ok(_)) => {
+                Ok(Response::Enrolled { ambient_lit, .. }) => {
+                    ambient_lit_total += ambient_lit.unwrap_or(0);
+                    if !send(WMsg::Captured(i + 1, target)) {
+                        return;
+                    }
+                    break 'scan;
+                }
+                Ok(Response::Ok(_)) => {
                     if !send(WMsg::Captured(i + 1, target)) {
                         return;
                     }
@@ -6276,7 +6323,9 @@ fn enroll_worker(
             }
         }
     }
-    let _ = send(WMsg::Done);
+    let _ = send(WMsg::Done {
+        ambient_lit: ambient_lit_total,
+    });
 }
 
 #[cfg(test)]
@@ -6406,6 +6455,7 @@ mod tests {
                 captured: 0,
                 target,
                 base,
+                ambient_base: 0,
             },
         )
     }
@@ -8246,6 +8296,7 @@ mod tests {
             profile: "Alice".into(),
             room: Some(2),
             added_scans: vec!["scan28".into()],
+            ambient_lit: Some(1),
         })
         .unwrap();
         app.poll();
@@ -8261,6 +8312,7 @@ mod tests {
             profile: "Alice".into(),
             room: Some(25),
             added_scans: vec!["scan5".into()],
+            ambient_lit: None,
         })
         .unwrap();
         app.poll();
@@ -8287,6 +8339,7 @@ mod tests {
             profile: "Alice".into(),
             room: None,
             added_scans: vec!["scan1".into()],
+            ambient_lit: None,
         })
         .unwrap();
         app.poll();
@@ -8304,6 +8357,7 @@ mod tests {
             profile: "Alice".into(),
             room: Some(0),
             added_scans: vec!["scan1".into()],
+            ambient_lit: None,
         })
         .unwrap();
         app.poll();
@@ -8332,6 +8386,7 @@ mod tests {
             // recognizers, yet the loaded one still has most of its own budget.
             room: Some(25),
             added_scans: vec!["scan1".into()],
+            ambient_lit: None,
         })
         .unwrap();
         app.poll();
@@ -8349,6 +8404,7 @@ mod tests {
             profile: "Alice".into(),
             added_scans: vec!["s".into()],
             remaining: 4,
+            ambient_lit: 0,
         });
         let text = draw_text(&app);
         assert!(text.contains("Already enrolled"), "modal title missing");
@@ -8364,6 +8420,7 @@ mod tests {
             profile: "Alice".into(),
             added_scans: vec!["s1".into()],
             remaining: 3,
+            ambient_lit: 0,
         });
         app.on_key(KeyCode::Char('y'));
         assert!(app.enroll_merge.is_none());
@@ -8384,6 +8441,7 @@ mod tests {
             profile: "Alice".into(),
             added_scans: vec!["s1".into()],
             remaining: 0,
+            ambient_lit: 0,
         });
         app.on_key(KeyCode::Char('y'));
         assert!(app.enroll.is_none(), "nothing left to capture");
@@ -8403,6 +8461,7 @@ mod tests {
             profile: "Alice".into(),
             added_scans: vec!["scanZ".into()],
             remaining: 3,
+            ambient_lit: 0,
         });
         app.on_key(KeyCode::Char('x'));
         app.on_key(KeyCode::Enter);
@@ -8429,6 +8488,7 @@ mod tests {
             profile: "Alice".into(),
             added_scans: Vec::new(),
             remaining: 3,
+            ambient_lit: 0,
         });
         app.on_key(KeyCode::Esc);
         assert!(app.enroll_merge.is_none(), "Esc declines");
@@ -8471,7 +8531,7 @@ mod tests {
         let mut app = test_app();
         let (tx, enroll) = fake_enroll(0, 4);
         app.enroll = Some(enroll);
-        tx.send(WMsg::Done).unwrap();
+        tx.send(WMsg::Done { ambient_lit: 0 }).unwrap();
         app.poll();
         assert!(app.enroll.is_none());
         assert!(
