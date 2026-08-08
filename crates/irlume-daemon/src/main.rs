@@ -463,7 +463,7 @@ fn main() {
             };
             // Bits are published before the socket binds (bind happens after the
             // models load), so no connection can observe the default EngineBits.
-            let mut engine = match build_engine(verified_recognizer.as_ref()) {
+            let engine = match build_engine(verified_recognizer.as_ref()) {
                 Ok(e) => {
                     eprintln!(
                         "irlumed: IR adapter {}",
@@ -670,16 +670,11 @@ fn main() {
                     .spawn(move || {
                         // The engine asks this between whole captures, so a long
                         // enrolment yields the camera to an authentication instead of
-                        // making it wait for ten scans.
-                        let token = arbiter.cancel_token();
-                        // The engine polls this between whole captures, which makes it
-                        // the one place that distinguishes a long-but-healthy job from a
-                        // capture stuck inside a driver call. The watchdog (#141) reads
-                        // the same signal, so both agree on what "still working" means.
-                        engine.set_stop_signal(std::sync::Arc::new(move || {
-                            note_worker_progress();
-                            token.stop_requested()
-                        }));
+                        // making it wait for ten scans, and the watchdog (#141) reads
+                        // the same signal so both agree on what "still working" means.
+                        // Attaching it is part of becoming the worker's engine, not a
+                        // startup step: see WorkerEngine (#359).
+                        let mut engine = WorkerEngine::attach(engine, &arbiter);
                         while let Some(job) = arbiter.take() {
                             note_worker_progress();
                             let Queued { req, peer, reply } = job.payload;
@@ -719,7 +714,10 @@ fn main() {
                                     // recognizer from disk (#346).
                                     match build_engine(None) {
                                         Ok(fresh) => {
-                                            engine = fresh;
+                                            // Back through `attach`, because a bare
+                                            // Engine has no stop signal and assigning
+                                            // one here is exactly what #359 was.
+                                            engine = WorkerEngine::attach(fresh, &arbiter);
                                             publish_engine_bits(&engine);
                                             eprintln!("irlumed: engine rebuilt after panic");
                                         }
@@ -1241,6 +1239,147 @@ fn worker_progress() -> &'static std::sync::Mutex<Option<std::time::Instant>> {
         std::sync::OnceLock::new();
     P.get_or_init(Default::default)
 }
+
+/// The camera worker's engine, and the only place its stop signal is attached.
+///
+/// A module rather than a bare struct on purpose. Rust privacy is module
+/// scoped, so a private field declared beside the worker would still let the
+/// worker write `WorkerEngine(fresh)` and skip the attachment entirely, which
+/// is the whole defect. Here the field is reachable only from inside, so
+/// [`WorkerEngine::attach`] really is the only way to get one.
+mod worker_engine {
+    use super::{arbiter, note_worker_progress, Queued};
+
+    /// Anything that can be handed the worker's stop signal.
+    ///
+    /// This exists for testability, and it is the difference between a guard
+    /// that is claimed and one that is checked: a real `Engine` needs the model
+    /// files on disk, so without a seam here nothing could assert that
+    /// attaching actually attaches.
+    pub(super) trait StopSignalSink {
+        fn accept_stop_signal(&mut self, signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
+    }
+
+    impl StopSignalSink for irlume_auth::Engine {
+        fn accept_stop_signal(&mut self, signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
+            self.set_stop_signal(signal);
+        }
+    }
+
+    /// The signal the worker's engine polls while a job runs.
+    ///
+    /// It carries two jobs that are easy to mistake for one. `stop_requested`
+    /// is cooperative cancellation: an authentication has arrived and the
+    /// running job should yield at its next safe boundary. `note_worker_progress`
+    /// is the watchdog heartbeat (#141). Both ride the same closure, so losing
+    /// it loses both, which is what made #359 costly out of proportion to its
+    /// size.
+    pub(super) fn stop_signal(
+        token: arbiter::CancelToken,
+    ) -> std::sync::Arc<dyn Fn() -> bool + Send + Sync> {
+        std::sync::Arc::new(move || {
+            note_worker_progress();
+            token.stop_requested()
+        })
+    }
+
+    /// An engine that has been wired to cancellation and the heartbeat.
+    ///
+    /// What this prevents: assigning a freshly built `Engine` over the worker's
+    /// engine, which is what the post-panic rebuild did. `Engine::load` starts
+    /// with no signal and the builder chain does not restore one, so a single
+    /// panic left the daemon unable to cancel a capture and unable to report
+    /// progress, for the life of the process (#359).
+    ///
+    /// What it does NOT prevent, stated plainly rather than left to be
+    /// discovered: `DerefMut` hands out `&mut Engine`, which `dispatch` needs,
+    /// so `*engine = fresh` would still replace the inner engine and drop the
+    /// signal. Closing that would mean not exposing the engine at all, which
+    /// this daemon cannot do. The guard is against the accident that happened,
+    /// not against a determined rewrite.
+    pub(super) struct WorkerEngine<E: StopSignalSink = irlume_auth::Engine>(E);
+
+    impl<E: StopSignalSink> WorkerEngine<E> {
+        /// The only constructor. Takes the token fresh, so a rebuilt engine
+        /// observes the same signal the arbiter is already setting.
+        pub(super) fn attach(mut engine: E, arbiter: &arbiter::Arbiter<Queued>) -> Self {
+            engine.accept_stop_signal(stop_signal(arbiter.cancel_token()));
+            Self(engine)
+        }
+    }
+
+    impl<E: StopSignalSink> std::ops::Deref for WorkerEngine<E> {
+        type Target = E;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl<E: StopSignalSink> std::ops::DerefMut for WorkerEngine<E> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{StopSignalSink, WorkerEngine};
+
+        /// Stands in for an `Engine`, which a test cannot build without the
+        /// model files.
+        #[derive(Default)]
+        struct Sink(Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>);
+
+        impl StopSignalSink for Sink {
+            fn accept_stop_signal(
+                &mut self,
+                signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+            ) {
+                self.0 = Some(signal);
+            }
+        }
+
+        /// Constructing a `WorkerEngine` must hand the engine a working signal.
+        ///
+        /// Pinning the type alone would not catch an `attach` that forgot to
+        /// install, which is the same shape as the original defect one level up.
+        #[test]
+        fn attaching_installs_a_signal_that_cancels_and_marks_progress() {
+            let _clock = super::super::tests::worker_clock_lock();
+            let arb = super::arbiter::Arbiter::<super::Queued>::default();
+            let engine = WorkerEngine::attach(Sink::default(), &arb);
+            // `.0` is the WorkerEngine's engine, `.0.0` is the signal the Sink
+            // was handed.
+            let signal = engine
+                .0
+                 .0
+                .clone()
+                .expect("attach must hand the engine a stop signal");
+
+            super::super::note_worker_idle();
+            assert!(!signal(), "nothing has asked the worker to stop yet");
+            // Inspect the clock directly rather than through an elapsed-time
+            // comparison: two adjacent Instant reads are not promised to differ.
+            assert!(
+                super::super::worker_progress()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some(),
+                "polling the signal must mark worker progress, or a long capture \
+                 reports nothing and the watchdog kills a healthy daemon"
+            );
+
+            arb.cancel_token().request_stop();
+            assert!(
+                signal(),
+                "a requested stop must be visible through the signal"
+            );
+            super::super::note_worker_idle();
+        }
+    }
+}
+
+use worker_engine::WorkerEngine;
 
 /// Mark forward progress: a job was picked up, or a capture boundary was
 /// reached. Called from the same points cooperative cancellation is polled at,
@@ -4353,6 +4492,15 @@ mod tests {
 
     /// Tests that mutate process env vars serialize here (setenv/getenv are
     /// process-global and the harness runs tests concurrently).
+    /// Serializes the tests that drive the process-global worker-progress
+    /// clock. libtest runs tests in parallel, so without this one test's
+    /// `note_worker_idle` lands between another's `note_worker_progress` and
+    /// its `worker_wedged` assertion.
+    static WORKER_CLOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) fn worker_clock_lock() -> std::sync::MutexGuard<'static, ()> {
+        WORKER_CLOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -5419,6 +5567,7 @@ mod tests {
     /// this backwards either restarts a busy daemon or never restarts a hung one.
     #[test]
     fn worker_is_wedged_only_when_a_job_stops_reporting_progress() {
+        let _clock = worker_clock_lock();
         let short = std::time::Duration::from_millis(40);
 
         // Idle: nothing in flight, so nothing to be wedged about. A bare timer
