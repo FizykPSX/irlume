@@ -644,7 +644,7 @@ mod tests {
     /// downgrades the envelope to `LoginPassword` and the next login hands 56
     /// bytes of raw key to `pam_gnome_keyring` as an `AUTHTOK`.
     #[test]
-    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI. NOT run by CI: measured failing against a bare swtpm, the tier climb reports Unchanged (#361)"]
     fn resealing_preserves_the_secret_kind() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         let dir = crate::test_tmp_dir("kr-kind");
@@ -862,7 +862,7 @@ mod tests {
     /// token into `PAM_AUTHTOK` on the next login. This is #253's
     /// `resealing_preserves_the_secret_kind` trap, one field wider.
     #[test]
-    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI. NOT run by CI: measured failing against a bare swtpm, the tier climb reports Unchanged (#361)"]
     fn a_tier_climb_keeps_both_the_kind_and_the_recovery_wrap() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         let dir = crate::test_tmp_dir("kr-token-climb");
