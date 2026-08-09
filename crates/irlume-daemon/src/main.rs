@@ -2965,10 +2965,13 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // clears a stale id when the current node has no USB descriptor.
             let rgb_id = irlume_auth::device_identity(&rgb).unwrap_or_default();
             let ir_id = irlume_auth::device_identity(&ir).unwrap_or_default();
-            // One operation under the file's own lock: the four writes were
-            // individually atomic and collectively not, so a reader could see a
-            // half-updated pair, and an unlocked rewrite could erase a locked
-            // writer's keys (#365).
+            // One publication, under the file's own lock. The four writes were
+            // individually atomic and collectively not: a reader racing the
+            // sequence could see one camera's RGB path beside another's IR path,
+            // a write failing partway left the earlier keys published, and an
+            // unlocked rewrite could erase a locked writer's keys (#365, #374).
+            // `write_camera_pin` now takes the lock AND builds the whole file
+            // once, so the pin lands whole or not at all.
             if let Err(e) = irlume_common::config::write_camera_pin(&rgb, &ir, &rgb_id, &ir_id) {
                 msg = format!("{msg} (live only; could not persist: {e})");
             }
