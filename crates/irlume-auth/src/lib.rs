@@ -155,6 +155,13 @@ pub struct Assessment {
     /// the scene did, and such scans have never proven they work without
     /// that scene light.
     pub ir_ambient_share: Option<f32>,
+    /// Mean of every byte in the RGB frame, whole-frame rather than the face
+    /// region: the enrolment starvation probe needs a reading from a frame where
+    /// no face was found, which is exactly when `signals.rgb_face_brightness` is
+    /// 0.0 by construction. Computed with `irlume_camera::frame_mean`, the same
+    /// statistic `CONCLUSIVE_SCENE_BRIGHTNESS` and `CONCURRENT_SIGNAL_FLOOR` were
+    /// measured against (#389).
+    pub rgb_frame_mean: f32,
     /// Both eyes read open (IR corneal-glint heuristic). Used only when a profile
     /// opts into the require-eyes-open gate. `false` if eyes couldn't be verified.
     pub eyes_open: bool,
@@ -1411,6 +1418,7 @@ impl Engine {
             verdict,
             reason,
             embedding,
+            rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
             ir_embedding: None,
             signals,
             ir_center_edge_ratio: 0.0,
@@ -1731,6 +1739,7 @@ impl Engine {
             // captures again, which is exactly the fix.
             return Ok(Assessment {
                 verdict: Verdict::Uncertain,
+                rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
                 reason: format!(
                     "RGB and IR frames are {}ms apart (limit {}ms); they may not show the same moment",
                     skew.as_millis(),
@@ -1929,6 +1938,7 @@ impl Engine {
             verdict,
             reason,
             embedding,
+            rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
             ir_embedding,
             signals,
             ir_center_edge_ratio,
@@ -3236,7 +3246,12 @@ impl Engine {
                 Some((rs, is)) => self.assess_full_with(Some((rs, is)), capture_mode)?,
                 None => self.assess()?,
             };
-            observe_attempt(&mut shape, a.embedding.as_ref(), a.ir_embedding.as_ref());
+            observe_attempt(
+                &mut shape,
+                a.embedding.as_ref(),
+                a.ir_embedding.as_ref(),
+                a.rgb_frame_mean,
+            );
             // Authoritative capture gate: LIVE *and* squarely frontal. The guided
             // TUI only decides when to START the 3-2-1; this is what actually
             // decides whether the frame is kept, so a turned/tilted (but live)
@@ -3257,6 +3272,53 @@ impl Engine {
         }
         observed.include(shape);
         Ok(out)
+    }
+
+    /// One solo RGB frame after the held sessions were released, to say whether
+    /// concurrent streaming was starving this camera (#389).
+    ///
+    /// `None` when it did not run: either the observation does not have the
+    /// shape worth spending a capture on, or the capture itself failed. A
+    /// failed probe must never turn a failed enrolment into a different error,
+    /// so every error path here answers `None` and the caller keeps the message
+    /// it would have written anyway.
+    ///
+    /// Safe where the cross-spectrum self-heal is not. That recapture is
+    /// forbidden while sessions are held, because reopening a node this process
+    /// streams answers EBUSY on some modules (#187, #381). By the time this
+    /// runs, `capture_scans` has returned and both sessions are dropped.
+    ///
+    /// Costs one RGB open, measured at 146ms to 173ms on the NexiGo, and only
+    /// on a capture loop that has already failed.
+    fn solo_rgb_starvation_probe(&mut self, shape: CaptureShape) -> Option<bool> {
+        // Only where the ambiguity exists: the held path, every attempt IR-only.
+        concurrent_starvation_hint(shape)?;
+        if shape.attempts == 0 {
+            return None;
+        }
+        let held_mean = shape.rgb_mean_sum / shape.attempts as f32;
+        let frame = irlume_camera::capture_rgb(&self.rgb_dev).ok()?;
+        let solo_mean = irlume_camera::frame_mean(&frame.data);
+        let view = align::RgbView {
+            data: &frame.data,
+            width: frame.width,
+            height: frame.height,
+        };
+        // A detector ERROR is not an observation that no face was there, and
+        // collapsing the two would let a broken detector read as a refutation.
+        // Nothing is confirmed without a detection that actually ran.
+        let found = match self.det.detect(&view) {
+            Ok(faces) => faces.iter().any(irlume_vision::detection_is_finite),
+            Err(e) => {
+                irlume_common::dlog!("enroll: solo RGB probe: detector failed ({e}); no verdict");
+                return None;
+            }
+        };
+        irlume_common::dlog!(
+            "enroll: solo RGB probe after release: held mean {held_mean:.1}, solo mean \
+             {solo_mean:.1}, face {found}"
+        );
+        Some(solo_probe_confirms_starvation(held_mean, solo_mean, found))
     }
 
     /// Enroll `want` scans (capped at MAX_SCANS_PER_PROFILE). If the captured
@@ -3305,8 +3367,13 @@ impl Engine {
         // about a subset of them.
         let mut observed = CaptureShape::default();
         let probe_scans = self.capture_scans(1, enr.pitch_neutral(), &mut observed)?;
+        let solo_probe = if probe_scans.is_empty() {
+            self.solo_rgb_starvation_probe(observed)
+        } else {
+            None
+        };
         let probe = probe_scans.into_iter().next().ok_or_else(|| {
-            let advice = capture_advice(observed);
+            let advice = capture_advice(observed, solo_probe);
             irlume_common::Error::Protocol(format!("no live scan captured; {advice}"))
         })?;
         let goal = match enroll_merge_target(
@@ -3339,7 +3406,8 @@ impl Engine {
             captured.extend(self.capture_scans(goal - 1, enr.pitch_neutral(), &mut observed)?);
         }
         if captured.len() < goal {
-            let advice = capture_advice(observed);
+            let solo_probe = self.solo_rgb_starvation_probe(observed);
+            let advice = capture_advice(observed, solo_probe);
             return Err(irlume_common::Error::Protocol(format!(
                 "only {} live scans (need {goal}); {advice}",
                 captured.len()
@@ -3512,7 +3580,12 @@ impl Engine {
         let want = count.clamp(1, room);
         let mut observed = CaptureShape::default();
         let captured = self.capture_scans(want, enr.pitch_neutral(), &mut observed)?;
-        if let Some(why) = short_capture_refusal(captured.len(), want, observed) {
+        let solo_probe = if captured.len() < want {
+            self.solo_rgb_starvation_probe(observed)
+        } else {
+            None
+        };
+        if let Some(why) = short_capture_refusal(captured.len(), want, observed, solo_probe) {
             return Err(irlume_common::Error::Protocol(why));
         }
         // Anti-mixing: reject scans whose face belongs to a different profile.
@@ -3863,7 +3936,10 @@ fn enroll_merge_target(
 /// camera, so this is the only shape a test can observe.
 /// What an enrolment capture loop OBSERVED, kept so a loop that captures
 /// nothing can say why without guessing (#389).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+// No `Eq`: the brightness sum is an f32. `PartialEq` is what the tests compare
+// with, and an exact comparison is right for them because every value they use
+// is constructed literally rather than accumulated.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct CaptureShape {
     /// The loop ran over held streams, which is the clause that suppresses the
     /// cross-spectrum self-heal in [`self_heal_may_recapture`]. It matters to
@@ -3875,6 +3951,10 @@ struct CaptureShape {
     /// Attempts made. Distinguishes "every attempt looked like this" from
     /// "one did", and a zero here means the loop never ran.
     attempts: usize,
+    /// Whole-frame RGB brightness summed over the attempts, so a mean can be
+    /// taken without keeping every reading. Only meaningful alongside
+    /// `attempts`, and only used when every attempt had the IR-only shape.
+    rgb_mean_sum: f32,
     /// Attempts holding an IR embedding and no RGB one. This is the
     /// dark-login shape [`uncertain_short_circuits`] is named for, and on the
     /// held path it is ALSO the shape a camera makes when streaming both
@@ -3906,6 +3986,7 @@ impl CaptureShape {
         self.held_sessions &= other.held_sessions;
         self.attempts += other.attempts;
         self.ir_only_attempts += other.ir_only_attempts;
+        self.rgb_mean_sum += other.rgb_mean_sum;
     }
 }
 
@@ -3920,13 +4001,54 @@ fn observe_attempt(
     shape: &mut CaptureShape,
     rgb_embedding: Option<&[f32; EMBED_DIM]>,
     ir_embedding: Option<&Vec<f32>>,
+    rgb_frame_mean: f32,
 ) {
     shape.attempts += 1;
+    shape.rgb_mean_sum += rgb_frame_mean;
     // The dark-login shape. An attempt with NEITHER embedding saw no face at
     // all, which is the ordinary framing failure and not this.
     if ir_embedding.is_some() && rgb_embedding.is_none() {
         shape.ir_only_attempts += 1;
     }
+}
+
+/// Did a solo RGB frame, taken after the held sessions were released, come back
+/// bright with a face where the held attempts came back dark without one (#389)?
+///
+/// ⛔ This does NOT establish that concurrency caused the difference, and the
+/// message it feeds must not say so. Nothing here records that the light, the
+/// framing or the person stayed the same between the two observations: a lamp
+/// switching on, or the subject stepping back into frame, produces this reading
+/// with no camera fault at all. What it establishes is that two captures
+/// seconds apart, one overlapped and one not, disagreed.
+///
+/// That is still worth having, because it is the shape a camera that cannot
+/// sustain both streams makes, and because `camera-tune` measures the thing
+/// directly. It is not worth asserting a cause over.
+///
+/// While both streams run, an unlit room and a starved RGB interface are the
+/// same reading: no RGB face, IR face present. They differ after the release,
+/// and the three clauses below are `irlume_camera`'s own contention rule,
+/// reused rather than reinvented.
+///
+/// Measured on a NexiGo HelloCam N930W, 2026-08-10, ten runs across three
+/// conditions, `frame_mean` throughout so these constants are compared against
+/// the statistic they were fitted to:
+///
+/// | condition | held mean | solo | verdict |
+/// |---|---|---|---|
+/// | lit room, starved | 51.7, 51.1 | face at 0.95, mean 146.9 | confirms |
+/// | dark room | 46.5 to 47.2 | no face, mean 18.0 | refuses |
+/// | healthy module (ASUS), lit | 160 to 163, face in 6 of 6 | face, mean 157 | refuses |
+///
+/// The dark room is refused twice over, which is why this does not rest on the
+/// brightness floor alone: with the emitter firing during the held phase its
+/// light leaks into the RGB sensor, so the held frames read BRIGHTER than the
+/// solo one (46.6 against 18.0) and the dimming clause fails on its own.
+fn solo_probe_confirms_starvation(held_mean: f32, solo_mean: f32, solo_found_face: bool) -> bool {
+    solo_found_face
+        && solo_mean >= irlume_camera::CONCLUSIVE_SCENE_BRIGHTNESS
+        && held_mean < solo_mean * irlume_camera::CONCURRENT_SIGNAL_FLOOR
 }
 
 /// The second reading to offer when an enrolment captured nothing, or `None`
@@ -3967,19 +4089,58 @@ fn concurrent_starvation_hint(shape: CaptureShape) -> Option<&'static str> {
 /// apart is how one of them keeps blaming the room after the others learn not
 /// to. The lighting clause is unconditional; [`concurrent_starvation_hint`]
 /// only ever appends.
-fn capture_advice(shape: CaptureShape) -> String {
-    let mut advice = String::from("check lighting and framing");
-    if let Some(hint) = concurrent_starvation_hint(shape) {
-        advice.push_str(". ");
-        advice.push_str(hint);
+fn capture_advice(shape: CaptureShape, solo_probe: Option<bool>) -> String {
+    // A refutation is deliberately treated as no probe at all. It would
+    // otherwise DELETE a correct hint on the strength of an observation that
+    // may have tested a different scene: a user who turned away before the solo
+    // frame refutes a camera that really is starving. Only the confirming
+    // direction changes anything, and even that names an observation rather
+    // than a cause.
+    match solo_probe.filter(|confirmed| *confirmed) {
+        // The probe ran and confirmed it. The lighting clause is DROPPED here,
+        // which #414 forbade for good reason at the time: darkness and
+        // contention were the same reading, so naming one asserted a cause the
+        // code could not establish. A confirmation now includes
+        // `solo_mean >= CONCLUSIVE_SCENE_BRIGHTNESS`, so the room being lit is
+        // measured rather than assumed, and telling this user to check their
+        // lighting would send them after the wrong thing.
+        // The light comes FIRST, and that ordering is measured rather than
+        // stylistic. On a healthy camera in a dark room with a lamp coming on
+        // between the two captures, this branch fires wrongly: 4 runs of 4 on
+        // 2026-08-10, held 28.9 to 31.8 with no face, solo 163 with one. Naming
+        // the camera first would put the wrong cause at the front of the
+        // sentence in every one of them. The second held phase that WOULD
+        // separate the two is what #379's config write needs; a message does
+        // not earn a second pair of session opens on a failed enrolment.
+        Some(_) => String::from(
+            "the colour frame was dark on every attempt while both sensors were streaming, and \
+             a capture taken straight afterwards with only the colour sensor running found a \
+             face. If the light changed between those two moments, that is the explanation. If \
+             it did not, this is the shape of a camera that cannot sustain both streams, and \
+             `sudo irlume camera-tune` in a lit room measures that directly",
+        ),
+        // Not confirmed, whether the probe refuted it or never ran. Unchanged
+        // from #414: offer both readings, assert neither.
+        None => {
+            let mut advice = String::from("check lighting and framing");
+            if let Some(hint) = concurrent_starvation_hint(shape) {
+                advice.push_str(". ");
+                advice.push_str(hint);
+            }
+            advice
+        }
     }
-    advice
 }
 
-fn short_capture_refusal(got: usize, want: usize, shape: CaptureShape) -> Option<String> {
+fn short_capture_refusal(
+    got: usize,
+    want: usize,
+    shape: CaptureShape,
+    solo_probe: Option<bool>,
+) -> Option<String> {
     (got < want).then(|| {
         let scans = if got == 1 { "scan" } else { "scans" };
-        let advice = capture_advice(shape);
+        let advice = capture_advice(shape, solo_probe);
         format!("only {got} live {scans} captured (need {want}); nothing was saved, {advice}")
     })
 }
@@ -5190,13 +5351,16 @@ mod tests {
         let rgb = [0.0f32; EMBED_DIM];
         let ir = vec![0.0f32; 8];
         let mut shape = CaptureShape::default();
-        observe_attempt(&mut shape, None, Some(&ir)); // the shape #389 is about
+        observe_attempt(&mut shape, None, Some(&ir), 50.0); // the shape #389 is about
         assert_eq!((shape.attempts, shape.ir_only_attempts), (1, 1));
-        observe_attempt(&mut shape, Some(&rgb), Some(&ir)); // both saw a face
+        observe_attempt(&mut shape, Some(&rgb), Some(&ir), 50.0); // both saw a face
         assert_eq!((shape.attempts, shape.ir_only_attempts), (2, 1));
-        observe_attempt(&mut shape, Some(&rgb), None); // RGB only: not this shape
+        observe_attempt(&mut shape, Some(&rgb), None, 50.0); // RGB only: not this shape
         assert_eq!((shape.attempts, shape.ir_only_attempts), (3, 1));
-        observe_attempt(&mut shape, None, None); // no face at all: framing
+        // The brightness accumulates over every attempt, not only the IR-only
+        // ones, because the mean it feeds describes what the held loop saw.
+        assert_eq!(shape.rgb_mean_sum, 150.0);
+        observe_attempt(&mut shape, None, None, 50.0); // no face at all: framing
         assert_eq!(
             (shape.attempts, shape.ir_only_attempts),
             (4, 1),
@@ -5215,11 +5379,13 @@ mod tests {
             held_sessions: true,
             attempts: 1,
             ir_only_attempts: 0, // the attempt that produced the scan
+            ..CaptureShape::default()
         };
         let top_up = CaptureShape {
             held_sessions: true,
             attempts: 90,
             ir_only_attempts: 90,
+            ..CaptureShape::default()
         };
         let mut folded = probe;
         folded.include(top_up);
@@ -5265,6 +5431,7 @@ mod tests {
             held_sessions: true,
             attempts: 10,
             ir_only_attempts: 10,
+            ..CaptureShape::default()
         };
         assert!(concurrent_starvation_hint(held_all).is_some());
 
@@ -5299,6 +5466,114 @@ mod tests {
     }
 
     #[test]
+    fn the_solo_probe_reproduces_all_three_measured_cells() {
+        // The numbers are the 2026-08-10 NexiGo and ASUS runs, not invented
+        // fixtures: ten runs across three conditions, `frame_mean` throughout.
+        // The point of pinning them is that a future edit to the rule has to
+        // explain itself against hardware rather than against taste.
+
+        // Lit room, starved module: the fault this exists for.
+        assert!(solo_probe_confirms_starvation(51.7, 146.9, true));
+        assert!(solo_probe_confirms_starvation(51.1, 146.6, true));
+
+        // Dark room, same module. Refused TWICE over, which is why the rule
+        // does not lean on the brightness floor alone: the emitter fires during
+        // the held phase and leaks into the RGB sensor, so the held frames read
+        // BRIGHTER than the solo one and the dimming clause fails by itself.
+        assert!(!solo_probe_confirms_starvation(46.6, 18.0, false));
+        assert!(
+            !solo_probe_confirms_starvation(46.6, 18.0, true),
+            "even if a face were found, 18.0 is not a lit scene"
+        );
+        // The inversion stated in the rule's own arithmetic: with solo at 18.0
+        // the dimming bar is 14.4, and the held frames at 46.6 sit far above
+        // it, so that clause refuses on its own before the light is consulted.
+        // (the arithmetic: 18.0 * 0.80 = 14.4, and the held frames read 46.6)
+        // The cell that isolates the brightness floor. A dim room where the solo
+        // frame IS brighter than the held ones, so the dimming clause passes and
+        // only `lit` refuses. Without this the floor could be deleted and every
+        // test here would still pass, because the measured dark cell is refused
+        // twice over by the inversion above.
+        // (the arithmetic: 30.0 * 0.80 = 24.0, and 5.0 is under it, so the
+        // dimming clause passes and only the floor can refuse)
+        assert!(
+            !solo_probe_confirms_starvation(5.0, 30.0, true),
+            "a scene under the brightness floor cannot confirm, however it dims"
+        );
+
+        // A lit scene where nothing is being starved: held above the bar.
+        assert!(
+            !solo_probe_confirms_starvation(130.0, 150.0, true),
+            "held above 0.80 of solo is not dimming"
+        );
+
+        // Healthy module, lit room: the solo frame is no brighter, because
+        // nothing was being starved.
+        assert!(!solo_probe_confirms_starvation(161.0, 157.7, true));
+        assert!(!solo_probe_confirms_starvation(163.0, 156.0, true));
+
+        // A solo frame that finds nothing confirms nothing, whatever the means.
+        assert!(!solo_probe_confirms_starvation(51.7, 146.9, false));
+    }
+
+    #[test]
+    fn a_confirmed_probe_reports_an_observation_and_a_refutation_changes_nothing() {
+        let held_all = CaptureShape {
+            held_sessions: true,
+            attempts: 10,
+            ir_only_attempts: 10,
+            ..CaptureShape::default()
+        };
+
+        // Confirmed: the message reports what was OBSERVED and names the
+        // remedy. It must NOT assert a cause. Nothing recorded that the light,
+        // the framing or the person held still between the held attempts and
+        // the solo frame, so a lamp switching on produces this same reading
+        // with no camera fault at all, and the message has to say so.
+        let confirmed = capture_advice(held_all, Some(true));
+        assert!(
+            confirmed.contains("cannot sustain both streams"),
+            "{confirmed}"
+        );
+        assert!(confirmed.contains("camera-tune"), "{confirmed}");
+        // The confound is named FIRST, because on a healthy camera in a dark
+        // room with a lamp switching on this branch fires wrongly in 4 runs of
+        // 4. Leading with the camera would put the wrong cause at the front of
+        // the sentence every one of those times.
+        let light = confirmed
+            .find("If the light changed")
+            .expect("names the light");
+        let camera = confirmed
+            .find("cannot sustain both streams")
+            .expect("names the camera");
+        assert!(
+            light < camera,
+            "the explanation that cannot be ruled out must come first: {confirmed}"
+        );
+        assert!(
+            !confirmed.contains("so it is dimming"),
+            "the message must not assert a mechanism it did not establish: {confirmed}"
+        );
+
+        // Refuted: treated as no probe at all. It must NOT delete the hint,
+        // because a user who turned away before the solo frame refutes a camera
+        // that really is starving.
+        let refuted = capture_advice(held_all, Some(false));
+        let unprobed = capture_advice(held_all, None);
+        assert_eq!(
+            refuted, unprobed,
+            "a refutation may not suppress a hint it did not disprove"
+        );
+
+        // No probe: unchanged from #414, both readings, neither asserted.
+        assert!(
+            unprobed.contains("check lighting and framing"),
+            "{unprobed}"
+        );
+        assert!(unprobed.contains("dimming its colour stream"), "{unprobed}");
+    }
+
+    #[test]
     fn the_capture_advice_always_keeps_the_lighting_clause() {
         // The two causes are indistinguishable from here. An unlit room
         // produces the identical shape, and this repository records it observed
@@ -5312,8 +5587,9 @@ mod tests {
             held_sessions: true,
             attempts: 10,
             ir_only_attempts: 10,
+            ..CaptureShape::default()
         };
-        let with_hint = capture_advice(held_all);
+        let with_hint = capture_advice(held_all, None);
         assert!(
             with_hint.contains("check lighting and framing"),
             "the room advice must survive the hint: {with_hint}"
@@ -5336,7 +5612,7 @@ mod tests {
             "doubled space in a user-facing string: {with_hint}"
         );
 
-        let plain = capture_advice(CaptureShape::default());
+        let plain = capture_advice(CaptureShape::default(), None);
         assert_eq!(
             plain, "check lighting and framing",
             "without the evidence the message is unchanged"
@@ -5352,9 +5628,9 @@ mod tests {
         // A default shape adds nothing: this test is about the count, and the
         // starvation hint has its own.
         let plain = CaptureShape::default();
-        assert!(short_capture_refusal(3, 3, plain).is_none());
-        assert!(short_capture_refusal(1, 1, plain).is_none());
-        let why = short_capture_refusal(1, 10, plain).expect("a short capture must refuse");
+        assert!(short_capture_refusal(3, 3, plain, None).is_none());
+        assert!(short_capture_refusal(1, 1, plain, None).is_none());
+        let why = short_capture_refusal(1, 10, plain, None).expect("a short capture must refuse");
         assert!(why.contains("only 1 live scan captured (need 10)"), "{why}");
         assert!(
             why.contains("nothing was saved"),
@@ -5366,10 +5642,11 @@ mod tests {
             !why.contains("  "),
             "doubled space in a user-facing string: {why}"
         );
-        let plural = short_capture_refusal(2, 10, plain).expect("a short capture must refuse");
+        let plural =
+            short_capture_refusal(2, 10, plain, None).expect("a short capture must refuse");
         assert!(plural.contains("only 2 live scans captured"), "{plural}");
         // Zero is short too, which is the case that always refused.
-        assert!(short_capture_refusal(0, 1, plain).is_some());
+        assert!(short_capture_refusal(0, 1, plain, None).is_some());
     }
 
     #[test]
