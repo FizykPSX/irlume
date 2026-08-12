@@ -159,6 +159,71 @@ remains closed, so it cannot be enabled.
   Apache-2.0 and states consented first-party training data, in-scope to
   5 meters.
 
+### The InsightFace stack, stage by stage
+
+InsightFace leads the public face-recognition benchmarks, so it is a
+reasonable place to look for a hardened stack. Its models license as
+**non-commercial research only**, so none can ship; the question is which
+irlume can support as opt-in, and the answer differs per stage.
+
+**Recognition: already supported.** The `buffalo` entry above IS
+InsightFace ArcFace with an R50 backbone (`w600k_r50.onnx` from the
+official buffalo_l pack, sha256 `4c06341c...`). A user wanting the
+InsightFace recognizer enables it today. Other backbones (R100, the ViT
+variants) are addable, but each needs its own split-source protocol run
+under [ADR-0006](adr/0006-third-party-model-stage-policy.md): a publisher
+default is never adopted, and a heavier backbone also has to clear the
+login latency budget.
+
+Worth knowing before assuming a bigger recognizer buys security: measured
+through irlume's own pipeline, buffalo_l beat the shipped AuraFace only
+marginally (LFW EER 3.9% against 4.2%), was WORSE on one demographic
+group (Middle Eastern FAR 5.63e-4 against 4.50e-4), and the single
+threshold bounding every FairFace group at FMR 1e-4 came out no better
+(0.700 against 0.685). Benchmark leadership did not become a security
+improvement here. The attack that defeats irlume today is a print of the
+enrolled face, which a better recognizer matches better, not worse; the
+ceiling is set by presentation-attack detection.
+
+**Detection: SCRFD-10G measured, not enableable.** `det_10g.onnx` from
+the same pack (sha256 `5838f7fe...`) was measured against the shipped
+YuNet on the 512-frame stage-3 corpus
+([bench](pad-results/2026-08-12-scrfd-vs-yunet.md)): where both fire they
+agree closely (median IoU 0.904), and at a matched 0.6 threshold their
+genuine detection rates are within one frame of each other. It recovers
+four saturated lit-strobe IR frames YuNet loses; at its own default 0.5
+threshold it also produces four false boxes on background clutter, and at
+0.6 it drops two dim RGB faces YuNet holds. Availability is a wash and
+the failure modes merely differ. The two score scales are not
+commensurable, so 0.6 is a reference point observed on this corpus, not a
+calibrated equivalence: the same corpus that shows the background boxes
+falling below 0.6 is the only evidence that they do.
+
+It is not enableable for the same reason full-range BlazeFace is not: the
+rescue slot feeds the grant path, and no corpus yet covers prints,
+screens or other faces on the frames where a rescue fires. That corpus is
+issue #440.
+
+**Landmarks: not directly swappable, and the migration is narrower than
+it first looks.** The InsightFace 106-point model (`2d106det.onnx`,
+sha256 `f001b856...`) emits a single `fc1[1,212]` tensor: 106
+two-dimensional points. irlume's eye-aspect-ratio and deliberate-closure
+cues index the MediaPipe mesh topology by number (`EAR_LEFT` and
+`EAR_RIGHT`), so adopting a 106-point model means defining a new eye
+mapping and re-measuring those gates against the calibration corpora.
+
+Head pose and the nod and head-shake consent gestures are NOT part of
+that migration: they read the detector's five landmarks
+(`head_pose(&Landmarks5)`), not the mesh, so a mesh swap leaves them
+untouched. The review round on this PR corrected an earlier draft here
+that claimed otherwise; the iris points are likewise not implicated,
+since every EAR index is below 468. What remains is real but bounded:
+an eye-landmark mapping and a re-measured closure gate.
+
+The stage stays closed regardless, because a mesh feeds cues that
+produce confident numbers from wrong pixels rather than erroring, and
+nothing has measured what this model's landmarks do to those cues.
+
 Whether a given licence permits **your** use of a model is your determination.
 irlume prints the licence before enabling anything and distributes no weights.
 
