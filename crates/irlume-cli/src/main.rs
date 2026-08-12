@@ -39,10 +39,31 @@ mod tui;
 mod uninstall;
 
 pub(crate) fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    // BOTH standard spellings. `--name=value` used to be invisible here, and the
+    // silence was the danger: `profiles delete --user=alice` parsed as no --user
+    // at all, so the fallback named the INVOKING user and the command deleted
+    // their enrollment instead of alice's. Every guard that asks "was --user
+    // given" reads `flag_present`, which knows the same two spellings.
+    for (i, a) in args.iter().enumerate() {
+        if a == name {
+            return args.get(i + 1).map(String::as_str);
+        }
+        // `--username=x` must NOT satisfy `--user`: the '=' has to come directly
+        // after the flag name.
+        if let Some(rest) = a.strip_prefix(name).and_then(|r| r.strip_prefix('=')) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Was `name` given at all, in either spelling (`--name v` or `--name=v`)?
+///
+/// Separate from [`flag`] because a dangling flag has no value but is still
+/// PRESENT, and that difference is what the `--user` guards act on.
+pub(crate) fn flag_present(args: &[String], name: &str) -> bool {
     args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str)
+        .any(|a| a == name || a.strip_prefix(name).is_some_and(|r| r.starts_with('=')))
 }
 
 /// Developer / benchmark / research subcommands: hidden from `help` and gated
@@ -77,6 +98,26 @@ fn main() -> std::process::ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // A TYPED `--user` that names nobody is a typo, and every per-user command
+    // answers a typo with the same empty state a real but unenrolled user
+    // produces ("none enrolled", "not armed"), so the operator cannot tell which
+    // they are looking at.
+    //
+    // A NOTE, deliberately, not a refusal. Refusing would contradict the machine
+    // API's own rule that a consumer calls the command and reads the daemon's
+    // error rather than pre-checking existence, and it would preempt the tested
+    // `--user requires a username` guard when the value is itself a flag
+    // (`--user --json`). The daemon keeps accepting unresolvable names for its
+    // own reason: PAM authenticates as root and must survive an NSS outage. So
+    // this only supplies the fact the operator is otherwise missing, on stderr,
+    // where it cannot disturb a consumer parsing stdout.
+    if let Some(named) = flag(&args, "--user").filter(|s| !s.is_empty()) {
+        if !irlume_common::platform::user_exists(named) {
+            eprintln!(
+                "irlume: note: no user '{named}' on this system, so its per-user state reads as empty"
+            );
+        }
+    }
     // Gate the developer tools unless IRLUME_DEV is set. Exception:
     // `selftest liveness` goes THROUGH the daemon (no direct camera open), so
     // it's a normal diagnostic the TUI's [l] uses, not a dev tool.
@@ -227,6 +268,13 @@ fn main() -> std::process::ExitCode {
 /// at the default count. `Ok(None)` means the flag was absent.
 fn scans_flag(args: &[String], tool: &str) -> Result<Option<usize>, std::process::ExitCode> {
     match flag(args, "--scans") {
+        // PRESENT with nothing after it is an omission, not an absence. `flag`
+        // answers None for both, so `enroll --scans` fired a real capture at the
+        // default count while the user had asked for a number and lost it.
+        None if flag_present(args, "--scans") => {
+            eprintln!("[{tool}] --scans requires a count");
+            Err(std::process::ExitCode::from(2))
+        }
         None => Ok(None),
         Some(raw) => match raw.parse::<usize>() {
             Ok(n) if n > 0 => Ok(Some(n)),
@@ -286,7 +334,6 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
             }
             if created {
                 println!("[enroll] enrolled '{profile}' with {total} scans");
-                offer_blink_challenge(&user);
             } else {
                 println!(
                     "[enroll] this face is already enrolled as '{profile}'; added {added} scans \
@@ -308,52 +355,6 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
             eprintln!("enroll: {e}");
             std::process::ExitCode::FAILURE
         }
-    }
-}
-
-/// After a fresh enrollment on IR hardware, make the opt-in anti-spoof blink
-/// challenge an informed choice rather than a hidden flag. It stays OFF by
-/// default (every mainstream face authenticator, Windows Hello / Face ID /
-/// Android, ships passive PAD, not an active challenge; the default IR gate is
-/// the passive analogue). This offers the extra print/replay defense to those
-/// who want it, being honest about the latency and glasses cost.
-fn offer_blink_challenge(user: &str) {
-    use std::io::{BufRead, IsTerminal, Write};
-    // Only meaningful on IR-capable (Secure-tier) hardware.
-    if !crate::caps().ir_pair {
-        return;
-    }
-    let tip =
-        "Tip: the opt-in anti-spoof blink challenge blocks printed/screen-replay spoofs.\n      \
-               Enable it any time with: irlume profiles challenge on";
-    if !std::io::stdin().is_terminal() {
-        println!("{tip}");
-        return;
-    }
-    print!(
-        "\nEnable the anti-spoof blink challenge now? It blocks printed-photo and\n\
-         screen-replay spoofs, but adds a few seconds per login and can be finicky\n\
-         with glasses. The default IR gate already blocks screens and matte prints.\n\
-         Enable blink challenge? [y/N] "
-    );
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    if std::io::stdin().lock().read_line(&mut line).is_err() {
-        println!("{tip}");
-        return;
-    }
-    if matches!(line.trim(), "y" | "Y" | "yes" | "Yes") {
-        match daemon_request(&irlume_common::Request::SetRequireChallenge {
-            user: user.to_string(),
-            on: true,
-        }) {
-            Ok(irlume_common::Response::Enrollment { .. }) | Ok(irlume_common::Response::Ok(_)) => {
-                println!("[enroll] anti-spoof blink challenge enabled. Disable with `irlume profiles challenge off`.")
-            }
-            _ => println!("[enroll] could not enable the challenge now; run `irlume profiles challenge on` later."),
-        }
-    } else {
-        println!("[enroll] keeping the default (fast) IR gate. {tip}");
     }
 }
 
@@ -379,7 +380,7 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
     // a destructive subcommand (forget-model, delete) at the invoking user's
     // own enrollment. Checked here, not in `user_arg`: the fallback semantics
     // of an absent flag belong to every caller, this omission does not.
-    if args.iter().any(|a| a == "--user")
+    if flag_present(args, "--user")
         && !matches!(flag(args, "--user"), Some(u) if !u.is_empty() && !u.starts_with("--"))
     {
         eprintln!("[profiles] --user requires a username");
@@ -486,26 +487,20 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
             Some(on) => Request::SetRequireEyesOpen { user, on },
             None => return std::process::ExitCode::from(2),
         },
-        Some("challenge") => match toggle_value(args, "challenge") {
-            Some(on) => Request::SetRequireChallenge { user, on },
-            None => return std::process::ExitCode::from(2),
-        },
         _ => return usage_profiles(),
     };
     match daemon_request(&req) {
         Ok(Response::Enrollment {
             profiles,
             require_eyes_open,
-            require_challenge,
             ..
         }) => {
             if profiles.is_empty() {
                 println!("[profiles] none enrolled");
             } else {
                 println!(
-                    "[profiles] require-eyes-open: {}  ·  require-challenge (blink): {}",
-                    if require_eyes_open { "ON" } else { "off" },
-                    if require_challenge { "ON" } else { "off" }
+                    "[profiles] require-eyes-open: {}",
+                    if require_eyes_open { "ON" } else { "off" }
                 );
                 for p in &profiles {
                     println!("  {} ({} scans)", p.name, p.scans.len());
@@ -821,6 +816,12 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     let rounds = match flag(args, "--rounds") {
+        // A dangling `--rounds` is an omission: silently using the default runs
+        // the camera a different number of times than the operator asked for.
+        None if flag_present(args, "--rounds") => {
+            eprintln!("[calibrate] --rounds requires a number from 1 to 10");
+            return std::process::ExitCode::from(2);
+        }
         None => CALIBRATION_ROUNDS_DEFAULT,
         Some(v) => match v.parse::<usize>() {
             Ok(n) if (1..=10).contains(&n) => n,
@@ -1100,6 +1101,10 @@ fn camera_tune(args: &[String]) -> std::process::ExitCode {
     // a minute, so an unparseable count is a usage error rather than a silent
     // substitution of the default round count.
     let rounds = match flag(args, "--rounds") {
+        None if flag_present(args, "--rounds") => {
+            eprintln!("[camera-tune] --rounds requires a positive integer");
+            return std::process::ExitCode::from(2);
+        }
         None => None,
         Some(raw) => match raw.parse::<usize>() {
             Ok(n) if n > 0 => Some(n),
@@ -1130,8 +1135,7 @@ fn usage_profiles() -> std::process::ExitCode {
         forget-model <model>                    remove one recognizer's scans from every\n  \
                                                 profile (shipped | a catalog name | embed:<sha256>)\n  \
         eyes-open off                           turn OFF the eyes-open check\n  \
-        \x20                                       (it cannot be turned on; see issue #386)\n  \
-        challenge <on|off>                      opt-in passive blink liveness"
+        \x20                                       (it cannot be turned on; see issue #386)"
     );
     std::process::ExitCode::from(2)
 }
@@ -1619,8 +1623,8 @@ pub(crate) fn daemon_sample(
         .map_err(|e| e.to_string())
 }
 
-/// The `on`/`off` word for `profiles eyes-open|challenge`, read as the argument
-/// AFTER the subcommand rather than found anywhere in argv.
+/// The `on`/`off` word for `profiles eyes-open`, read as the argument AFTER the
+/// subcommand rather than found anywhere in argv.
 ///
 /// Scanning the whole command line meant a flag VALUE could be mistaken for the
 /// setting: `irlume profiles eyes-open --user on` turned the feature on for an
@@ -1665,7 +1669,12 @@ pub(crate) fn user_arg(args: &[String]) -> String {
     // and the one thing a resolver must not do is quietly resolve to the wrong
     // subject. Exiting rather than returning an error keeps every caller's
     // signature, and there is no sensible way to continue.
-    if args.iter().any(|a| a == "--user") && flag(args, "--user").is_none() {
+    if flag_present(args, "--user") && flag(args, "--user").is_none() {
+        // A DANGLING flag only. An empty value (`--user ""`, and now `--user=`)
+        // keeps its documented meaning, which
+        // `user_arg_falls_back_to_env_user_when_flag_is_empty_or_absent` pins:
+        // it falls back like an absent flag. The subcommands that must not
+        // tolerate that, `profiles` above all, carry their own stricter guard.
         eprintln!("irlume: --user requires a username");
         std::process::exit(2);
     }
@@ -3520,8 +3529,9 @@ fn report_credential_release(
     report.check(
         "credential-release-challenge",
         match irlume_common::config::credential_release_challenge_visible() {
-            Some(true) => State::Pass,
-            Some(false) => State::Warn,
+            // Off is the DEFAULT (the keyring releases with no nod); on is an
+            // opt-in extra. Neither is a problem, so neither warns.
+            Some(_) => State::Pass,
             None => State::Unknown,
         },
     );
@@ -3535,14 +3545,14 @@ fn report_credential_release(
         return;
     }
     match irlume_common::config::credential_release_challenge_visible() {
+        // The opt-in gate is on: fall through and check it can actually run.
         Some(true) => {}
         Some(false) => {
             dout!(
                 report,
-                "[doctor] ⚠ credential-release challenge: DISABLED\n     \
-                 {risk}.\n     \
-                 Re-enable: sudo irlume credential-release-challenge on",
-                risk = commands::CREDENTIAL_RELEASE_RISK
+                "[doctor] credential-release challenge: off (default); the keyring \
+                 releases after the face match with no nod. Enable the extra step \
+                 with: sudo irlume credential-release-challenge on"
             );
             return;
         }
@@ -3590,7 +3600,13 @@ fn report_credential_release(
          password)",
         if gesture_is_closure {
             "close your eyes ~1s then open"
-        } else if closure_calibrated {
+        } else if closure_calibrated
+            && irlume_common::config::consent_gesture_mode()
+                == irlume_common::config::ConsentGesture::Either
+        {
+            // A stored calibration is not the same as an accepted gesture: under
+            // `consent_gesture=nod` the closure is refused however well calibrated
+            // it is, and offering it there costs the user the release window.
             "keep nodding, or close your eyes ~1s then open"
         } else {
             "keep nodding your head"
@@ -4397,9 +4413,14 @@ fn doctor_run(
         ),
     };
     dout!(report, "[doctor] fingerprint reader: {fp}");
+    // The same predicate the text line above uses, and the machine `status`
+    // field beside it. `device_name()` answers "fprintd could NAME a device",
+    // which is a narrower thing than "a reader was found": a present reader that
+    // fprintd will not name printed "present ✓" in the text and "not found" in
+    // the check on the same screen, and the machine field agreed with neither.
     report.check(
         "fingerprint-reader",
-        if irlume_fingerprint::device_name().is_some() {
+        if irlume_fingerprint::available() {
             State::Pass
         } else {
             State::Info
@@ -4565,11 +4586,32 @@ fn doctor_run(
         // "KEEP nodding", matching the prompt the user will actually see: a
         // single nod released 0 times out of 3 on hardware, because the detector
         // needs a run of frames showing the motion.
+        // The gesture can be turned off for polkit alone, and then no gesture is
+        // asked for at all; saying "KEEP NODDING" there describes a prompt the
+        // user will never see.
+        Some(true) if !irlume_common::config::service_gesture_required("polkit-1") => dout!(report,
+            "[doctor] polkit app prompts: wired ✓ (face alone approves Bitwarden unlock, pkexec, …;\n     \
+             the consent gesture is OFF for polkit: sudo irlume credential-release-challenge polkit-1 on)"
+        ),
+        // A misconfigured `consent_gesture` accepts NEITHER gesture, so the
+        // dedicated warning above is the whole story; repeating "keep nodding"
+        // here would contradict it on the same screen.
+        Some(true)
+            if gesture_mode == irlume_common::config::ConsentGesture::Misconfigured =>
+        {
+            dout!(report,
+                "[doctor] polkit app prompts: wired ✓ but NO gesture is accepted while \n     \
+                 `consent_gesture` is unreadable (see above), so these prompts fall back to the password")
+        }
         Some(true) if !gesture_is_closure => dout!(report,
             "[doctor] polkit app prompts: wired ✓ (KEEP NODDING to approve Bitwarden unlock,\n     \
-             pkexec, …; no calibration needed{})",
-            if closure_calibrated {
+             pkexec, …; shake your head to decline; no calibration needed{})",
+            if closure_calibrated
+                && gesture_mode == irlume_common::config::ConsentGesture::Either
+            {
                 "; closing your eyes ~1s also works"
+            } else if closure_calibrated {
+                "" // calibrated but not accepted in this mode: do not offer it
             } else {
                 ", or run calibrate-closure to also allow the eye-closure gesture"
             }
@@ -4667,9 +4709,16 @@ fn doctor_run(
              Re-enroll to activate it: the TUI Profiles tab, or `sudo irlume enroll`."
         );
     }
+    // The greeter the ACTIVE display manager consults, not any-of. `login_wired`
+    // is true when ANY greeter, the lock screen, or the fingerprint-keyring
+    // service carries the line, and this file's own sibling documents where that
+    // misleads: a distro update that strips the active greeter while a stale
+    // inactive greeter file keeps the line leaves it true and the real login
+    // broken. Doctor exists to catch exactly that, and was passing it.
+    let login_ok = crate::pamwire::active_login_wired();
     report.check(
         "login-wiring",
-        if crate::pamwire::login_wired() {
+        if login_ok {
             State::Pass
         } else if enrolled {
             State::Warn
@@ -4677,7 +4726,7 @@ fn doctor_run(
             State::Info
         },
     );
-    if enrolled && !crate::pamwire::login_wired() {
+    if enrolled && !login_ok {
         dout!(
             report,
             "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \
@@ -5095,6 +5144,67 @@ mod tests {
         assert_eq!(flag(&a, "--reset"), None);
     }
 
+    /// A value-taking flag given with no value is an omission, not an absence.
+    ///
+    /// `enroll --scans` fired a real camera capture at the DEFAULT count while
+    /// the operator had asked for a number and lost it to the shell or a typo.
+    /// The same shape reached `calibrate-closure --rounds` and `camera-tune
+    /// --rounds`, both of which run the IR emitter.
+    #[test]
+    fn a_value_flag_with_no_value_is_a_usage_error_not_the_default() {
+        let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        // Absent: the caller's default applies.
+        assert!(matches!(scans_flag(&argv(&["enroll"]), "enroll"), Ok(None)));
+        // Given properly: that count.
+        assert!(matches!(
+            scans_flag(&argv(&["enroll", "--scans", "7"]), "enroll"),
+            Ok(Some(7))
+        ));
+        assert!(matches!(
+            scans_flag(&argv(&["enroll", "--scans=7"]), "enroll"),
+            Ok(Some(7))
+        ));
+        // Dangling, in both spellings: refused, never the default.
+        assert!(scans_flag(&argv(&["enroll", "--scans"]), "enroll").is_err());
+        assert!(scans_flag(&argv(&["enroll", "--scans="]), "enroll").is_err());
+        // Unparseable or zero stays a usage error, as before.
+        assert!(scans_flag(&argv(&["enroll", "--scans", "abc"]), "enroll").is_err());
+        assert!(scans_flag(&argv(&["enroll", "--scans", "0"]), "enroll").is_err());
+    }
+
+    /// `--name=value` is as standard a spelling as `--name value`, and it used to
+    /// parse as ABSENT. That silence is what made it dangerous: `--user=alice`
+    /// left the flag looking unset, so the fallback named the invoking user and a
+    /// destructive per-user command acted on the wrong enrollment without a word.
+    #[test]
+    fn flag_reads_the_equals_spelling_and_only_for_an_exact_name() {
+        let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        assert_eq!(flag(&argv(&["--user=alice"]), "--user"), Some("alice"));
+        assert_eq!(flag(&argv(&["--user", "alice"]), "--user"), Some("alice"));
+        // A value that itself contains '=' survives intact.
+        assert_eq!(flag(&argv(&["--user=a=b"]), "--user"), Some("a=b"));
+        // Empty after the '=' is a value that is present and empty, which the
+        // caller's guard turns into a usage error rather than a silent fallback.
+        assert_eq!(flag(&argv(&["--user="]), "--user"), Some(""));
+        // A longer flag that merely STARTS with the name must not satisfy it.
+        assert_eq!(flag(&argv(&["--username=alice"]), "--user"), None);
+        assert_eq!(flag(&argv(&["--users=alice"]), "--user"), None);
+        // Whichever spelling comes first wins, as with the repeated-flag rule.
+        assert_eq!(
+            flag(&argv(&["--user=first", "--user", "second"]), "--user"),
+            Some("first")
+        );
+
+        // `flag_present` answers the question the guards ask: given at all?
+        assert!(flag_present(&argv(&["--user=alice"]), "--user"));
+        assert!(flag_present(&argv(&["--user="]), "--user"));
+        assert!(flag_present(&argv(&["--user"]), "--user"));
+        assert!(!flag_present(&argv(&["--username=alice"]), "--user"));
+        assert!(!flag_present(&argv(&["list"]), "--user"));
+    }
+
     #[test]
     fn flag_takes_the_first_occurrence() {
         let a = argv(&["--user", "a", "--user", "b"]);
@@ -5329,7 +5439,7 @@ mod tests {
             "a --user VALUE must never be read as the setting"
         );
         assert_eq!(
-            toggle_value(&argv(&["challenge", "--user", "off"]), "challenge"),
+            toggle_value(&argv(&["eyes-open", "--user", "off"]), "eyes-open"),
             None
         );
         // Contradictory input stays a usage error rather than first-wins.
@@ -5342,9 +5452,9 @@ mod tests {
             None
         );
         // Missing value, and a value that is neither word.
-        assert_eq!(toggle_value(&argv(&["challenge"]), "challenge"), None);
+        assert_eq!(toggle_value(&argv(&["eyes-open"]), "eyes-open"), None);
         assert_eq!(
-            toggle_value(&argv(&["challenge", "yes"]), "challenge"),
+            toggle_value(&argv(&["eyes-open", "yes"]), "eyes-open"),
             None
         );
     }

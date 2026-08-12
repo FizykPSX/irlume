@@ -107,6 +107,12 @@ const SC_SETTINGS: usize = 9;
 const SC_MODELS: usize = 10;
 const SC_DONE: usize = 11;
 const ACT_H: usize = 5; // visible rows in the Activity panel (height 7 minus borders)
+
+/// The services the Settings tab lets the user toggle the consent gesture for,
+/// with arrow keys + `c`. All four are high-privilege (elevation or app-consent),
+/// so disabling any of them asks for confirmation first. The keyring-release path
+/// has its own `g` toggle, so it is not repeated here.
+const SETTINGS_GESTURE_SERVICES: &[&str] = &["sudo", "su", "doas", "polkit-1"];
 const MAX_PROFILES: usize = 3;
 const ENROLL_SCANS: usize = irlume_core::storage::DEFAULT_ENROLL_SCANS;
 /// Scans captured per improve-recognition round (add to an existing profile).
@@ -251,6 +257,14 @@ enum Suspend {
     /// credential release, so the TUI confirms first and the CLI still prints its
     /// own warning in the cooked terminal.
     CredentialReleaseChallenge(bool),
+    /// Toggle the consent gesture for one PAM service (the bool is the target
+    /// state). Root op; runs `sudo irlume credential-release-challenge <service>
+    /// on|off --yes`. Disabling a high-privilege service is confirmed by the TUI
+    /// first (the `--yes` then skips the CLI's own prompt).
+    ServiceGesture {
+        service: String,
+        on: bool,
+    },
     /// IR liveness self-test via `sudo irlume selftest liveness` (the daemon
     /// root-gates it; the raw measurements are a spoof-tuning oracle).
     SelfTestLiveness,
@@ -474,7 +488,6 @@ struct App {
     sel: usize,
     profiles: Vec<ProfileSummary>,
     eyes_open: bool,
-    challenge: bool,
     keyring_armed: Option<bool>,
     /// Seal-tier label from `KeyringInfo` (e.g. "pcrlock NV 0x… (Tier 2)");
     /// `None` when not armed or the daemon predates the request.
@@ -527,6 +540,22 @@ struct App {
     repair_sel: usize,
     /// Cameras-tab pair selection.
     cam_sel: usize,
+    /// Settings-tab per-service consent-gesture selection (index into
+    /// [`SETTINGS_GESTURE_SERVICES`]).
+    settings_svc_sel: usize,
+    /// Cached third-party-model and Bitwarden state for the DRAW path, with the
+    /// moment they were taken.
+    ///
+    /// Both were computed per frame. `models::tui_state` reads and SHA-256s every
+    /// enabled weight file (1.3 MiB for the shipped PAD cue here), and
+    /// `bitwarden::tui_state` forks `getent` to resolve the invoking user's home,
+    /// measured at ~37ms a call and called twice in one draw of the login-wiring
+    /// tab. A redraw happens on every keypress and every tick, so the interface
+    /// was hashing megabytes and forking processes to paint two rows. The key
+    /// HANDLERS still read fresh: an action must act on the current state, and it
+    /// runs once per press rather than once per frame.
+    heavy: (crate::models::TuiState, Option<crate::bitwarden::TuiState>),
+    heavy_at: std::time::Instant,
     /// A prominent, dismissible error banner (e.g. "camera busy") so failures
     /// are never silently buried in the Activity log.
     error: Option<String>,
@@ -601,7 +630,6 @@ enum ProfilesOutcome {
     Loaded {
         profiles: Vec<ProfileSummary>,
         eyes_open: bool,
-        challenge: bool,
     },
     /// The daemon answered with an error (corrupt enrollment, missing
     /// template key): real state, shown on Repair like the sync path did.
@@ -963,7 +991,6 @@ impl App {
             sel: 0,
             profiles: Vec::new(),
             eyes_open: false,
-            challenge: false,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -992,6 +1019,9 @@ impl App {
             repair: Vec::new(),
             repair_sel: 0,
             cam_sel: 0,
+            settings_svc_sel: 0,
+            heavy: (crate::models::tui_state(), crate::bitwarden::tui_state()),
+            heavy_at: std::time::Instant::now(),
             error: None,
             daemon_up: false,
             enroll_error: None,
@@ -1045,7 +1075,8 @@ impl App {
                 SC_PROFILES | SC_RECOVERY => caps.rgb,
                 // Diagnostics/tuning: advanced view only.
                 SC_CAMERAS | SC_IDENTIFY => advanced && caps.rgb,
-                // Settings holds user preferences (eyes-open, blink, biopolicy,
+                // Settings holds user preferences (eyes-open, per-service consent
+                // gesture, keyring gesture, biopolicy,
                 // third-party models), not diagnostics, so it is always
                 // reachable; hiding config behind "advanced" both buries it and
                 // creates dead-end pointers (a Repair fix references Settings).
@@ -1069,6 +1100,12 @@ impl App {
     /// Re-derive tab visibility from live state; keeps the current screen when
     /// it survives, else snaps to the nearest visible step.
     fn recompute_visible(&mut self) {
+        // The hub lists the VISIBLE screens, so this is where its list can
+        // shrink ([v] leaves advanced view, a probe lands, the daemon goes
+        // away). `move_sel` wraps modulo the current length, so a stale index
+        // fixes itself on the next arrow, but until then no row is highlighted
+        // and Enter silently opens nothing: an advertised key doing nothing,
+        // which is the shape this pass keeps finding.
         self.visible = Self::compute_visible(
             &self.caps,
             VisibilityInputs {
@@ -1086,6 +1123,11 @@ impl App {
                 .copied()
                 .min_by_key(|&s| s.abs_diff(cur))
                 .unwrap_or(0);
+        }
+        // Clamp the hub selection into the list it now has.
+        let rows = self.hub_rows().len();
+        if rows > 0 && self.hub_sel >= rows {
+            self.hub_sel = rows - 1;
         }
     }
 
@@ -1282,12 +1324,10 @@ impl App {
                 Ok(Response::Enrollment {
                     profiles,
                     require_eyes_open,
-                    require_challenge,
                     ..
                 }) => ProfilesOutcome::Loaded {
                     profiles,
                     eyes_open: require_eyes_open,
-                    challenge: require_challenge,
                 },
                 // A corrupt/unreadable enrollment (or a missing template key
                 // for an encrypted file) surfaces as an Error, not empty;
@@ -1500,7 +1540,24 @@ impl App {
                 .iter()
                 .any(|(_, r)| matches!(r, irlume_camera::Role::Ir));
             let priv_on = self.pairs.iter().any(|p| p.privacy);
-            let (csev, cdetail, cfix) = if !rgb && !ir {
+            let (csev, cdetail, cfix) = if self.nodes.is_empty() {
+                // NOTHING was probed, which is not the same as nothing being
+                // there. `nodes` is only ever filled by a classifying scan, and
+                // this screen deliberately does not run one: classifying opens
+                // every node, which is the device contention #187 is about, so
+                // the daemon's Health is where camera facts normally come from
+                // and the daemon is what is down in this branch. The old text
+                // read the empty list as proof and told everyone with a working
+                // camera that face auth was unavailable, on the one screen they
+                // opened to find out what was wrong.
+                (
+                    Sev::Warn,
+                    "cannot check the cameras while the daemon is down (start it with: \
+                     sudo systemctl start irlumed)"
+                        .to_string(),
+                    Fix::Manual("sudo systemctl start irlumed".into()),
+                )
+            } else if !rgb && !ir {
                 (
                     Sev::Warn,
                     "no camera: face auth unavailable (password/fingerprint only)".to_string(),
@@ -1629,19 +1686,6 @@ impl App {
                     Fix::Root(RootFix::RestartDaemon),
                 ));
             }
-        }
-        // Blink challenge configured but the FaceMesh model isn't loaded: the
-        // challenge silently skips; surface it instead.
-        if self.challenge && self.health.as_ref().is_some_and(|h| !h.mesh) {
-            v.push(mk(
-                "Blink challenge",
-                Sev::Fail,
-                "require-challenge is ON but FaceMesh isn't loaded; the challenge is skipped"
-                    .into(),
-                Fix::Manual(
-                    "set IRLUME_MESH_MODEL=<models/face_landmarks_detector.tflite> in the irlumed unit".into(),
-                ),
-            ));
         }
         // Fingerprint reader health: a crashed/aborted enrollment leaves the
         // device CLAIMED and pam_fprintd fails silently (no finger prompt).
@@ -1912,7 +1956,7 @@ impl App {
         // daemon will not start with it selected. Only flag a stage the
         // daemon did not actually load (Health proves loaded weights fine).
         if self.daemon_up {
-            if let crate::models::TuiState::Enabled { entries } = crate::models::tui_state() {
+            if let crate::models::TuiState::Enabled { entries } = &self.heavy.0 {
                 use irlume_common::thirdparty::{Stage, WeightState};
                 for entry in entries {
                     if entry.weight_state != WeightState::ChecksumMismatch {
@@ -1962,6 +2006,19 @@ impl App {
                     Sev::Warn,
                     "templates encrypted but no recovery passphrase".into(),
                     Fix::Manual("Recovery tab → [s] set a recovery passphrase".into()),
+                ));
+            } else if r.encrypted && !r.key_present {
+                // Encrypted with the key gone: no passphrase and no reseal opens
+                // it, so this is not a backstop question at all. The Cameras-side
+                // row already says this loudly; the check said "encrypted +
+                // recovery set" and passed.
+                v.push(mk(
+                    "Recovery backstop",
+                    Sev::Fail,
+                    "templates encrypted but the template key is MISSING: nothing can \
+                     open them"
+                        .into(),
+                    Fix::Manual("re-enroll: Profiles tab → [e]".into()),
                 ));
             } else {
                 v.push(mk(
@@ -2013,7 +2070,13 @@ impl App {
     fn apply_fix(&mut self, idx: usize) {
         let fix = match self.repair.get(idx) {
             Some(c) => c.fix.clone(),
-            None => return,
+            // Empty list, or a selection left behind by a list that shrank. The
+            // footer advertises [f], so pressing it has to answer: a silent
+            // return reads as a broken key.
+            None => {
+                self.log('·', "no check is selected to fix");
+                return;
+            }
         };
         match fix {
             Fix::None => self.log('·', "nothing to fix on this row"),
@@ -2225,7 +2288,24 @@ impl App {
         }
     }
 
+    /// How long the cached model/Bitwarden state may be reused before the poll
+    /// takes it again. Long enough that a redraw storm costs nothing, short
+    /// enough that a change made outside the TUI shows up while the user is
+    /// still looking at the screen.
+    const HEAVY_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Re-read the state the draw path caches. Called on the poll's TTL, and
+    /// immediately after any step that can change it, so a model the user just
+    /// enabled does not sit invisible for up to the TTL.
+    fn refresh_heavy(&mut self) {
+        self.heavy = (crate::models::tui_state(), crate::bitwarden::tui_state());
+        self.heavy_at = std::time::Instant::now();
+    }
+
     fn poll(&mut self) {
+        if self.heavy_at.elapsed() >= Self::HEAVY_TTL {
+            self.refresh_heavy();
+        }
         if let Some(rx) = &self.light_load {
             if let Ok(l) = rx.try_recv() {
                 self.light_load = None;
@@ -2251,11 +2331,9 @@ impl App {
                     ProfilesOutcome::Loaded {
                         profiles,
                         eyes_open,
-                        challenge,
                     } => {
                         self.profiles = profiles;
                         self.eyes_open = eyes_open;
-                        self.challenge = challenge;
                         self.enroll_error = None;
                         self.profiles_loaded = true;
                     }
@@ -2563,6 +2641,32 @@ impl App {
             .unwrap_or_else(|| "irlume".to_string())
     }
 
+    /// The command a privileged step runs: `sudo <args>` normally, but `<args>`
+    /// alone when the TUI is ALREADY root.
+    ///
+    /// A second `sudo` from a root process resets `SUDO_USER` to `root`, because
+    /// root is then the invoking user. Every per-user command resolves its target
+    /// from `SUDO_USER` (see `user_arg`), so `sudo irlume tui` -> `[c]` ->
+    /// `sudo irlume calibrate-closure` taught the consent gesture and stored it
+    /// for **root**, while the daemon reads the calibration from the real user's
+    /// enrollment: the user calibrated, saw it succeed, and their own prompts
+    /// never used it. Found by walking the TUI as root on 2026-08-12. The same
+    /// reset silently retargeted every other per-user step (enrol, keyring).
+    ///
+    /// Running the command directly when root keeps the OUTER sudo's
+    /// `SUDO_USER`, which names the person who started the TUI.
+    fn privileged_cmd(args: &[&str], already_root: bool) -> std::process::Command {
+        if already_root {
+            let mut cmd = std::process::Command::new(args[0]);
+            cmd.args(&args[1..]);
+            cmd
+        } else {
+            let mut cmd = std::process::Command::new("sudo");
+            cmd.args(args);
+            cmd
+        }
+    }
+
     fn sudo_step(&mut self, what: &str, args: &[&str]) {
         // Invoke OUR OWN binary as root, not whatever `irlume` PATH resolves
         // to. Resolve the first "irlume" arg to the current exe; leave
@@ -2577,7 +2681,13 @@ impl App {
             })
             .collect();
         let args: Vec<&str> = resolved.iter().map(String::as_str).collect();
-        eprintln!("\n{what}; running: sudo {}…", args.join(" "));
+        // SAFETY: geteuid() reads the caller's own credentials and cannot fail.
+        let already_root = unsafe { libc::geteuid() } == 0;
+        eprintln!(
+            "\n{what}; running: {}{}…",
+            if already_root { "" } else { "sudo " },
+            args.join(" ")
+        );
         // In the cooked terminal, Ctrl-C goes to the whole foreground group:
         // a user aborting the CHILD (a sudo prompt, the models license flow)
         // must not also kill the TUI. Ignore SIGINT here while the child runs;
@@ -2585,8 +2695,7 @@ impl App {
         // cancels IT. (Found live: Ctrl-C in the license prompt took the whole
         // TUI down.)
         use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new("sudo");
-        cmd.args(args);
+        let mut cmd = Self::privileged_cmd(&args, already_root);
         // SAFETY: signal() is async-signal-safe; this runs in the forked child
         // just before exec.
         unsafe {
@@ -2603,7 +2712,13 @@ impl App {
             libc::signal(libc::SIGINT, old_int)
         };
         match status {
-            Ok(st) if st.success() => self.log('✓', format!("{what}: done")),
+            Ok(st) if st.success() => {
+                // A step can enable a model or install the Bitwarden policy, and
+                // the draw path reads a cache: take it again now rather than let
+                // the screen show the pre-action state until the TTL expires.
+                self.refresh_heavy();
+                self.log('✓', format!("{what}: done"));
+            }
             Ok(st) => {
                 // A failed/cancelled sudo can't have started the daemon; drop
                 // any parked enrollment so the resume path doesn't sit through
@@ -2629,9 +2744,20 @@ impl App {
     /// (no-echo passphrase / fprintd prompts), then wait for the user to return.
     fn run_suspended(&mut self, s: Suspend) {
         let none: [String; 0] = [];
+        // The account this TUI is managing, for the steps that act on ONE user.
+        // `irlume tui --user bob` shows bob everywhere and sends bob in every
+        // daemon request, but a step that shells out re-resolves its own subject
+        // from SUDO_USER/$USER, which names whoever launched the TUI: an admin
+        // setting bob up calibrated the gesture onto their own enrollment, and
+        // "delete ALL enrolled fingerprints" deleted their own. Built here so
+        // every per-user arm passes the same thing.
+        let for_user: [String; 2] = ["--user".to_string(), self.user.clone()];
+        // A local copy for the shell-out slices: `sudo_step` takes `&mut self`,
+        // so they cannot hold a borrow of `self.user` across the call.
+        let target = self.user.clone();
         match s {
             Suspend::FingerprintAdd => {
-                crate::fingerprint::run(Some("add"), &none);
+                crate::fingerprint::run(Some("add"), &for_user);
             }
             Suspend::LoginStatus => {
                 crate::pamwire::run(Some("status"), &none);
@@ -2673,7 +2799,7 @@ impl App {
             ),
             Suspend::CalibrateClosure => self.sudo_step(
                 "calibrate the eye-closure gesture",
-                &["irlume", "calibrate-closure"],
+                &["irlume", "calibrate-closure", "--user", &target],
             ),
             Suspend::LogsDebug(on) => self.sudo_step(
                 if on {
@@ -2684,19 +2810,19 @@ impl App {
                 &["irlume", "logs", "debug", if on { "on" } else { "off" }],
             ),
             Suspend::FingerprintVerify => {
-                crate::fingerprint::run(Some("verify"), &none);
+                crate::fingerprint::run(Some("verify"), &for_user);
             }
             Suspend::FingerprintEnable => self.sudo_step(
                 "enable fingerprint (face OR finger)",
-                &["irlume", "fingerprint", "enable"],
+                &["irlume", "fingerprint", "enable", "--user", &target],
             ),
             Suspend::FingerprintDisable => self.sudo_step(
                 "disable fingerprint for login",
-                &["irlume", "fingerprint", "disable"],
+                &["irlume", "fingerprint", "disable", "--user", &target],
             ),
             Suspend::FingerprintReset => self.sudo_step(
                 "delete ALL enrolled fingerprints",
-                &["irlume", "fingerprint", "reset"],
+                &["irlume", "fingerprint", "reset", "--user", &target],
             ),
             Suspend::ModelsEnable(name) => self.sudo_step(
                 "enable a third-party model (license confirm follows)",
@@ -2738,6 +2864,20 @@ impl App {
                 &[
                     "irlume",
                     "credential-release-challenge",
+                    if on { "on" } else { "off" },
+                    "--yes",
+                ],
+            ),
+            Suspend::ServiceGesture { service, on } => self.sudo_step(
+                &if on {
+                    format!("require a consent gesture for '{service}'")
+                } else {
+                    format!("stop requiring a consent gesture for '{service}'")
+                },
+                &[
+                    "irlume",
+                    "credential-release-challenge",
+                    service.as_str(),
                     if on { "on" } else { "off" },
                     "--yes",
                 ],
@@ -2830,6 +2970,13 @@ impl App {
                 e.stop.store(true, Ordering::Relaxed);
                 self.enroll = None;
                 self.log('·', "enrollment cancelled");
+                // The daemon may already hold what the cancelled run created:
+                // scan 1 creates the profile before any of the later scans, so
+                // stopping after it leaves a real profile the cached list has
+                // never seen. Without this the screen shows no profile at all,
+                // and the user's reasonable next move is to enroll again on top
+                // of it. Async, so the cancel stays instant.
+                self.refresh_profiles();
             }
             return;
         }
@@ -2974,7 +3121,12 @@ impl App {
         // Fast diagnostics on entering Repair/Fingerprint (no slow profile
         // poll, so the switch is instant); a fresh profile poll only when
         // landing on Profiles, where an external `irlume enroll` should show.
-        if self.screen == SC_CAMERAS {
+        // Repair too, not just Cameras. Its camera verdicts read the same
+        // listing, and Cameras is hidden unless advanced view is on, so on a
+        // default session the list was always empty and the "a privacy switch is
+        // ON" warning could never fire: the one hardware state that silently
+        // stops face auth was unreportable on the screen built to find it.
+        if self.screen == SC_CAMERAS || self.screen == SC_REPAIR {
             self.refresh_camera_listing();
         }
         if self.screen == SC_REPAIR || self.screen == SC_FINGERPRINT {
@@ -3007,6 +3159,13 @@ impl App {
             };
             return;
         }
+        // The Settings tab has no profile/scan list; ↑/↓ pick the per-service
+        // consent-gesture row that [c] toggles.
+        if self.screen == SC_SETTINGS {
+            let n = SETTINGS_GESTURE_SERVICES.len() as i32;
+            self.settings_svc_sel = (((self.settings_svc_sel as i32 + d) % n + n) % n) as usize;
+            return;
+        }
         let len = match self.screen {
             SC_REPAIR => self.repair.len(),
             SC_CAMERAS => self.pairs.len(),
@@ -3032,7 +3191,7 @@ impl App {
                     self.sel = 0;
                     // Same fast paths as a Tab switch: diagnostics for
                     // Repair/Fingerprint, a fresh profile poll for Profiles.
-                    if target == SC_CAMERAS {
+                    if target == SC_CAMERAS || target == SC_REPAIR {
                         self.refresh_camera_listing();
                     }
                     if target == SC_REPAIR || target == SC_FINGERPRINT {
@@ -3388,26 +3547,19 @@ impl App {
                     map_settings,
                 );
             }
-            // Blink challenge is a per-user opt-in gate, togglable exactly like
-            // eyes-open; [c] flips it so the anti-spoof stage no longer needs a
-            // drop to the shell (`irlume profiles challenge on|off`).
-            (SC_SETTINGS, KeyCode::Char('c')) => {
-                let on = !self.challenge;
-                self.start_async(
-                    "toggle require-challenge",
-                    OpTag::Generic,
-                    Request::SetRequireChallenge {
-                        user: self.user.clone(),
-                        on,
-                    },
-                    map_settings,
-                );
-            }
             // Biopolicy gate: enabling changes the security posture (restricts
             // which services a face may satisfy), so it is confirmed; disabling
             // just relaxes back to default and goes straight through.
             (SC_SETTINGS, KeyCode::Char('b')) => {
-                if biopolicy_on() {
+                let Some(on) = irlume_common::config::enforce_biopolicy_visible() else {
+                    self.log(
+                        '·',
+                        "the biopolicy gate is a root-only setting; run the TUI with sudo, \
+                         or check it with: irlume biopolicy status",
+                    );
+                    return;
+                };
+                if on {
                     self.log('→', "sudo irlume biopolicy off: relax back to the default (all services may verify)");
                     self.suspend = Some(Suspend::Biopolicy(false));
                 } else {
@@ -3420,39 +3572,85 @@ impl App {
                     ));
                 }
             }
-            // Credential-release gesture gate. Default ON, and the direction that
-            // needs friction is OFF: it drops the only check that separates a
-            // present person from a photograph of one, for the one operation that
-            // hands out a reusable secret. Enabling goes straight through (it only
-            // restores the default). settings.conf is root-only, so an unprivileged
-            // TUI cannot read the current state; then offer the safe direction (on)
-            // rather than guess.
+            // Per-service consent gesture: ↑/↓ pick the service, [c] toggles it.
+            // settings.conf is root-only, so this shells out to the CLI, the one
+            // place the write and its high-privilege confirmation live. Every
+            // service in the list is elevation or app-consent, so disabling the
+            // gesture (a face match alone would then approve it) asks first;
+            // enabling only adds friction and goes straight through.
+            (SC_SETTINGS, KeyCode::Char('c')) => {
+                // Same clamp as the draw: a key must not panic on a stale index.
+                let svc = SETTINGS_GESTURE_SERVICES
+                    .get(self.settings_svc_sel)
+                    .copied()
+                    .unwrap_or(SETTINGS_GESTURE_SERVICES[0]);
+                // Same effective read as the badge, so [c] flips what the user
+                // sees. Reading the elevation-only default here meant the first
+                // press on polkit wrote `on` (already the behaviour) and skipped
+                // the confirmation that disabling is supposed to require.
+                //
+                // And it must be the read that can say "I do not know".
+                // settings.conf is 0600 root-owned, so an unprivileged TUI cannot
+                // see an override at all and every service defaulted to ON: the
+                // key could then only ever DISABLE, and pressing it again after a
+                // disable wrote `off` a second time while the row still claimed
+                // the gesture was required. Say so instead of guessing.
+                let Some(current) = irlume_common::config::service_gesture_required_visible(svc)
+                else {
+                    self.log(
+                        '·',
+                        format!(
+                            "the consent gesture for '{svc}' is a root-only setting;                              run the TUI with sudo, or check it with:                              sudo irlume credential-release-challenge {svc} status"
+                        ),
+                    );
+                    return;
+                };
+                let target = !current;
+                let sus = Suspend::ServiceGesture {
+                    service: svc.to_string(),
+                    on: target,
+                };
+                if target {
+                    self.log(
+                        '→',
+                        format!(
+                            "sudo irlume credential-release-challenge {svc} on: \
+                             require a consent gesture for '{svc}'"
+                        ),
+                    );
+                    self.suspend = Some(sus);
+                } else {
+                    self.confirm = Some((
+                        format!(
+                            "Disable the consent gesture for '{svc}'? A face match alone would \
+                             then approve it: a print of your face held to the camera could use \
+                             '{svc}'. Your typed password still works."
+                        ),
+                        "Disable",
+                        ConfirmAct::Sus(sus),
+                    ));
+                }
+            }
+            // Credential-release gesture gate. DEFAULT OFF: the keyring releases
+            // after the face match with no nod. 'g' toggles the opt-in extra
+            // step; neither direction needs a confirm (off is the default, on only
+            // adds friction). settings.conf is root-only, so an unprivileged TUI
+            // cannot read the state; then offer to enable the opt-in.
             (SC_SETTINGS, KeyCode::Char('g')) => {
                 match irlume_common::config::credential_release_challenge_visible() {
                     Some(true) => {
-                        self.confirm = Some((
-                            format!(
-                                "Stop requiring a gesture before your keyring password is \
-                                 released? {}. Your typed password keeps working either way.",
-                                crate::commands::CREDENTIAL_RELEASE_RISK
-                            ),
-                            "Disable",
-                            ConfirmAct::Sus(Suspend::CredentialReleaseChallenge(false)),
-                        ));
-                    }
-                    Some(false) => {
                         self.log(
                             '→',
-                            "sudo irlume credential-release-challenge on: restore the gesture \
-                             gate on keyring release",
+                            "sudo irlume credential-release-challenge off: back to the default \
+                             (the keyring releases with no nod)",
                         );
-                        self.suspend = Some(Suspend::CredentialReleaseChallenge(true));
+                        self.suspend = Some(Suspend::CredentialReleaseChallenge(false));
                     }
-                    None => {
+                    Some(false) | None => {
                         self.log(
                             '→',
-                            "the gate's state is root-only; running `credential-release-challenge \
-                             on` to restore the default",
+                            "sudo irlume credential-release-challenge on: add a gesture before \
+                             keyring release",
                         );
                         self.suspend = Some(Suspend::CredentialReleaseChallenge(true));
                     }
@@ -3613,7 +3811,9 @@ impl App {
                     Pending::RenameScan(p, s),
                 ));
             }
-            None => {}
+            // Nothing selected (an empty profile list, or a selection left by
+            // a list that shrank). [r] is advertised, so say why it did nothing.
+            None => self.log('·', "select a profile or scan to rename"),
         }
     }
 
@@ -3645,7 +3845,8 @@ impl App {
                     }),
                 ));
             }
-            None => {}
+            // Same as the rename above: an advertised key must answer.
+            None => self.log('·', "select a profile or scan to delete"),
         }
     }
 
@@ -3871,8 +4072,15 @@ impl App {
     /// A red, dismissible error banner centred on screen.
     fn error_modal(&self, f: &mut Frame, msg: &str) {
         let area = f.area();
-        let w = area.width.saturating_sub(8).clamp(30, 78);
-        let h = 7u16;
+        // Both dimensions are capped by the frame: the 30-column floor and the
+        // fixed 7 rows are bigger than a small terminal, and a rect that reaches
+        // past the buffer is not something a draw may produce.
+        let w = area
+            .width
+            .saturating_sub(8)
+            .clamp(30, 78)
+            .min(area.width.max(1));
+        let h = 7u16.min(area.height.max(1));
         let rect = Rect {
             x: area.width.saturating_sub(w) / 2,
             y: area.height.saturating_sub(h) / 2,
@@ -3999,7 +4207,7 @@ impl App {
                     None => "Wires face login into your greeter, lock screen and sudo.",
                 },
                 SC_SETTINGS => {
-                    "[enter] turns the eyes-open check OFF (it cannot be turned on, see #386), [c] the blink challenge; other settings are root or read-only."
+                    "[enter] turns the eyes-open check OFF (it cannot be turned on, see #386); other settings are root or read-only."
                 }
                 SC_MODELS => {
                     "Measured model options; switching the recognizer means re-enrolling."
@@ -4264,10 +4472,65 @@ impl App {
         );
     }
 
+    /// The Settings tab's per-service consent-gesture section: a header carrying
+    /// the keys, then one row of service names with the picked one
+    /// (`settings_svc_sel`) highlighted and its EFFECTIVE state. Arrow keys pick,
+    /// `c` toggles the picked one. Compact (three lines) because the Settings
+    /// panel does not scroll. settings.conf is root-only, so an unreadable value
+    /// falls
+    /// back to the per-service default (all four default on) rather than guessing
+    /// off on a security setting.
+    fn service_gesture_lines(&self) -> Vec<Line<'static>> {
+        // Clamped, not indexed. The arrow handler wraps this selection modulo the
+        // list length, so it is in range today, but a DRAW must never be able to
+        // panic: an index that survives a list shrinking (or any future writer
+        // that forgets the wrap) would take the whole interface down mid-setup
+        // instead of mis-highlighting one row.
+        let picked = SETTINGS_GESTURE_SERVICES
+            .get(self.settings_svc_sel)
+            .copied()
+            .unwrap_or(SETTINGS_GESTURE_SERVICES[0]);
+        // The EFFECTIVE state the engine enforces, not the elevation-only default:
+        // polkit is AppConsent and defaults ON, so the old computation rendered
+        // `polkit-1: no` on a default install while the daemon required a gesture.
+        // Tri-state, like the two panels below it: an unprivileged TUI cannot read
+        // the root-only settings.conf, and a definite badge there is a guess
+        // dressed as a fact.
+        let required = irlume_common::config::service_gesture_required_visible(picked);
+        let mut row: Vec<Span> = vec![Span::raw("  ")];
+        for (i, &svc) in SETTINGS_GESTURE_SERVICES.iter().enumerate() {
+            let style = if i == self.settings_svc_sel {
+                Style::new().fg(th().accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().dim()
+            };
+            row.push(Span::styled(format!("{svc}   "), style));
+        }
+        row.push(Span::raw(format!("   {picked}: ")));
+        row.push(onoff_opt(required));
+        vec![
+            section("Per-service consent gesture   ([↑/↓] pick  [c] toggle; disabling asks first)"),
+            Line::from(row),
+            // The decline half, stated once where the gesture is configured. A
+            // user told only how to approve does not know a shake is a
+            // deliberate "no" the daemon acts on.
+            Line::from(Span::styled(
+                "  Keep nodding to approve; shake your head to decline.",
+                Style::new().dim(),
+            )),
+            Line::raw(""),
+        ]
+    }
+
     fn draw_settings(&self, f: &mut Frame, area: Rect) {
-        let bio = biopolicy_on();
+        // The shared reader, which agrees with the daemon's truthy set (`yes` and
+        // `on` count too) and admits when the root-only file cannot be read. The
+        // local `biopolicy_on` accepted only `1`/`true`, so `enforce_biopolicy=yes`
+        // drew "turn it on" while the daemon was already enforcing.
+        let bio = irlume_common::config::enforce_biopolicy_visible();
         f.render_widget(
-            Paragraph::new(vec![
+            Paragraph::new({
+                let mut v = vec![
                 section("Require eyes open"),
                 Line::from(vec![Span::raw("  state  "), onoff(self.eyes_open)]),
                 Line::from(Span::styled(
@@ -4279,24 +4542,26 @@ impl App {
                     Span::styled(" toggle", Style::new().dim()),
                 ]),
                 Line::raw(""),
+                ];
+                v.extend(self.service_gesture_lines());
+                v.extend(vec![
                 section("Gesture before keyring release"),
                 {
                     // Tri-state, not a bool: settings.conf is root-only, so an
-                    // unprivileged TUI genuinely cannot read this. Showing ○ off
-                    // there would be a false all-clear on a security default, and
-                    // showing ● on would be an unearned one.
+                    // unprivileged TUI genuinely cannot read this. Off is the
+                    // DEFAULT (no nod on a cold login), so it shows neutrally, not
+                    // as a warning; on is the opt-in extra step.
                     let (icon, icon_style, label) =
                         match irlume_common::config::credential_release_challenge_visible() {
                             Some(true) => (
                                 "●",
                                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                                "required (default)".to_string(),
+                                "required (opt-in)".to_string(),
                             ),
                             Some(false) => (
                                 "○",
-                                Style::new().fg(th().warn).add_modifier(Modifier::BOLD),
-                                "DISABLED  (an IR print passing the face checks could release it)"
-                                    .to_string(),
+                                Style::new().dim(),
+                                "off (default): the keyring releases with no nod".to_string(),
                             ),
                             None => (
                                 "◐",
@@ -4310,36 +4575,18 @@ impl App {
                         Span::styled(label, Style::new().dim()),
                     ])
                 },
-                // Says what this gate was MEASURED to do, not what it was hoped
-                // to do. It read "so a photo or a screen cannot pull the password
-                // out" until 2026-07-27, when the detector was measured firing on
-                // a hand-held print 2 times in 24; liveness and the PAD cue
-                // refused every one of those, so the claim belonged to them and
-                // never to the gesture. THREAT_MODEL.md carries the numbers.
-                // Kept to FOUR lines: this panel does not scroll, so a fifth line
-                // pushes the bottom section off a short terminal.
+                // The gesture proves INTENT, not liveness (it fired on a hand-held
+                // print 2 times in 24 on 2026-07-27), which is why it defaults OFF
+                // for the greeter cold login and logout; the IR gate stops a print.
+                // ONE line: this panel does not scroll and the per-service section
+                // above needs the room. THREAT_MODEL.md carries the numbers.
                 Line::from(Span::styled(
-                    "  Releasing your TPM-sealed keyring password needs CONTINUOUS NODDING (or an",
-                    Style::new().dim(),
-                )),
-                Line::from(Span::styled(
-                    "  eye closure). It proves INTENT, not liveness: a hand-held print can satisfy",
-                    Style::new().dim(),
-                )),
-                Line::from(Span::styled(
-                    "  it, and the IR liveness check is what stops the print. Login, lock screen",
-                    Style::new().dim(),
-                )),
-                Line::from(Span::styled(
-                    "  and sudo are unaffected; a missed gesture falls back to typing the password.",
+                    "  Off by default (a cold login releases with no nod). On adds a nod (or an eye closure).",
                     Style::new().dim(),
                 )),
                 Line::from(vec![
                     Span::styled("  [g]", Style::new().fg(th().accent)),
-                    Span::styled(
-                        " turn it on or off (sudo; off asks first)",
-                        Style::new().dim(),
-                    ),
+                    Span::styled(" turn it on or off (sudo)", Style::new().dim()),
                 ]),
                 Line::raw(""),
                 section("Biopolicy operation-class gate"),
@@ -4384,10 +4631,10 @@ impl App {
                 Line::from(vec![
                     Span::styled("  [b]", Style::new().fg(th().accent)),
                     Span::styled(
-                        if bio {
-                            " turn it off (sudo)"
-                        } else {
-                            " turn it on (sudo; asks first)"
+                        match bio {
+                            Some(true) => " turn it off (sudo)",
+                            Some(false) => " turn it on (sudo; asks first)",
+                            None => " on/off is root-only; run the TUI with sudo",
                         },
                         Style::new().dim(),
                     ),
@@ -4433,7 +4680,7 @@ impl App {
                         // trust the filesystem probe rather than claim "off":
                         // an older daemon with flir loaded must not read as
                         // ○ none.
-                        match crate::models::tui_state() {
+                        match &self.heavy.0 {
                             crate::models::TuiState::Enabled { entries } => (
                                 "●",
                                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
@@ -4499,7 +4746,9 @@ impl App {
                     "  Calibrated per modality (RGB/IR), auto-scaled by enrolled scan count.",
                     Style::new().dim(),
                 )),
-            ])
+                ]);
+                v
+            })
             .wrap(Wrap { trim: false }),
             area,
         );
@@ -5163,7 +5412,10 @@ impl App {
             ("keyring unlock", self.keyring_armed, SC_KEYRING),
             (
                 "recovery + encryption",
-                self.recovery.map(|r| r.encrypted && r.recovery_set),
+                // The key has to be there too: encrypted with no key is not a
+                // completed step, it is an enrollment nothing can read.
+                self.recovery
+                    .map(|r| r.encrypted && r.recovery_set && r.key_present),
                 SC_RECOVERY,
             ),
             ("login wiring", self.login_wired_known(), SC_PAM),
@@ -5645,25 +5897,43 @@ impl App {
         lines.push(act(
             "[u]",
             "Wire face-sudo",
-            "opt-in; face approves sudo prompts",
+            "opt-in; face + a consent gesture approve sudo prompts",
         ));
         lines.push(act(
             "[p]",
             "Wire app prompts",
             "opt-in; face approves Bitwarden and pkexec",
         ));
-        // Names the nod first, matching the prompts: it needs no calibration and
-        // is unaffected by lighting, while what [c] teaches is stored as absolute
-        // eye measurements that shift as the room changes.
+        // What [c] teaches is only USEFUL in the modes that accept it, so the row
+        // reads the configured mode instead of always calling the closure an
+        // optional extra. Under `closure` the nod is refused and this calibration
+        // is the only way any gesture passes; under `nod` the closure is refused
+        // and teaching it changes nothing. Naming the nod first in the default
+        // mode still matches the prompts: it needs no calibration and is
+        // unaffected by lighting, while this is stored as absolute eye
+        // measurements that shift as the room changes.
         lines.push(act(
             "[c]",
             "Calibrate gesture",
-            "optional eye-closure alternative; the head nod needs no calibration",
+            match irlume_common::config::consent_gesture_mode() {
+                irlume_common::config::ConsentGesture::Closure => {
+                    "REQUIRED: consent_gesture=closure accepts only the eye closure"
+                }
+                irlume_common::config::ConsentGesture::Nod => {
+                    "not accepted: consent_gesture=nod accepts only the head nod"
+                }
+                irlume_common::config::ConsentGesture::Either => {
+                    "optional eye-closure alternative; the head nod needs no calibration"
+                }
+                irlume_common::config::ConsentGesture::Misconfigured => {
+                    "no gesture is accepted until consent_gesture is fixed"
+                }
+            },
         ));
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.
         if matches!(
-            crate::bitwarden::tui_state(),
+            self.heavy.1.clone(),
             Some(crate::bitwarden::TuiState::NeedsSetup)
         ) {
             lines.push(act(
@@ -5684,7 +5954,7 @@ impl App {
         ));
         // Bitwarden status line (not an action): only when installed and the
         // action is present or snapd owns it. Set apart by a blank line.
-        match crate::bitwarden::tui_state() {
+        match &self.heavy.1 {
             Some(crate::bitwarden::TuiState::Ready) => {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
@@ -5743,10 +6013,6 @@ impl App {
                 onoff(self.eyes_open),
             ]),
             Line::from(vec![
-                Span::raw("  blink challenge   "),
-                onoff(self.challenge),
-            ]),
-            Line::from(vec![
                 Span::raw("  keyring unlock    "),
                 onoff_opt(self.keyring_armed),
             ]),
@@ -5760,7 +6026,19 @@ impl App {
             ]),
             Line::from(vec![
                 Span::raw("  templates enc     "),
-                onoff_opt(self.recovery.map(|r| r.encrypted)),
+                // Three states, not two. An encrypted store whose key is gone
+                // cannot be opened by anything, and `encrypted` alone drew it as
+                // a green yes; drawing it as "no" would be just as wrong in the
+                // other direction. The Recovery tab already says this loudly.
+                match self.recovery {
+                    Some(r) if r.encrypted && r.key_present => onoff(true),
+                    Some(r) if r.encrypted => Span::styled(
+                        "✗ key missing",
+                        Style::new().fg(th().err).add_modifier(Modifier::BOLD),
+                    ),
+                    Some(_) => onoff(false),
+                    None => onoff_opt(None),
+                },
             ]),
             Line::from(vec![
                 Span::raw("  recovery pass     "),
@@ -5897,12 +6175,30 @@ impl App {
                 ("d", "delete"),
             ],
             SC_IDENTIFY => &[("i", "identify")],
-            SC_KEYRING => &[
-                ("a", "arm"),
-                ("r", "reseal"),
-                ("f", "forget"),
-                ("p", "refresh pcrlock policy"),
-            ],
+            // Both [r] and [p] are guarded in the handler: [r] reseals a seal that
+            // must already exist, and [p] refreshes the boot-measurement policy a
+            // Tier 2 seal is bound to. Advertising either where its guard cannot
+            // pass offered a key that did nothing and said nothing.
+            SC_KEYRING => match (
+                self.keyring_armed == Some(true),
+                self.keyring_policy
+                    .as_deref()
+                    .is_some_and(|p| p.contains("Tier 2")),
+            ) {
+                (true, true) => &[
+                    ("a", "arm"),
+                    ("r", "reseal"),
+                    ("f", "forget"),
+                    ("p", "refresh pcrlock policy"),
+                ],
+                (true, false) => &[("a", "arm"), ("r", "reseal"), ("f", "forget")],
+                (false, true) => &[
+                    ("a", "arm"),
+                    ("f", "forget"),
+                    ("p", "refresh pcrlock policy"),
+                ],
+                (false, false) => &[("a", "arm"), ("f", "forget")],
+            },
             SC_RECOVERY => &[("s", "set"), ("t", "restore"), ("f", "forget")],
             SC_FINGERPRINT => &[
                 ("a", "enroll finger"),
@@ -5922,7 +6218,8 @@ impl App {
             ],
             SC_SETTINGS => &[
                 ("enter", "eyes-open off"),
-                ("c", "blink"),
+                ("↑/↓", "pick service"),
+                ("c", "toggle gesture"),
                 ("g", "keyring gesture"),
                 ("b", "biopolicy"),
                 ("m", "3rd-party model"),
@@ -5966,7 +6263,14 @@ impl App {
         if self.op.is_some() {
             let spans = vec![
                 key("q / esc"),
-                Span::styled(" cancel · working…", Style::new().dim()),
+                // "quit", not "cancel": these keys leave the TUI. The op keeps
+                // running in the daemon and its result is dropped; nothing here
+                // can call it back. Esc means "back out and stay" on every other
+                // screen, so promising a cancel here read as the safe choice.
+                Span::styled(
+                    " quit (the op keeps running) · working…",
+                    Style::new().dim(),
+                ),
             ];
             let blk = Block::bordered()
                 .border_type(BorderType::Rounded)
@@ -6020,7 +6324,13 @@ impl App {
         // on any terminal width; borders + 1-col horizontal padding = 4 chars.
         let inner = (w as usize).saturating_sub(4).max(1);
         let lines = wrapped_line_count(body, inner) as u16;
-        let h = (lines + 2).clamp(3, area.height);
+        // `clamp(3, area.height)` PANICS when the frame is shorter than 3 rows
+        // (min > max), taking the whole interface down for anyone whose terminal
+        // is a couple of rows tall (a dragged-narrow window, a small tmux split).
+        // Cap the floor by what the frame actually has, so a tiny frame gets a
+        // cramped box instead of a crash.
+        let max_h = area.height.max(1);
+        let h = (lines + 2).clamp(3.min(max_h), max_h);
         let rect = Rect {
             x: area.width.saturating_sub(w) / 2,
             y: area.height.saturating_sub(h) / 2,
@@ -6204,13 +6514,6 @@ fn ort_fallback_check(found: bool) -> Check {
             Fix::Manual("start the daemon first; it reports its real ONNX state".into())
         },
     }
-}
-
-/// Is opt-in biopolicy enforcement enabled (settings.conf)?
-fn biopolicy_on() -> bool {
-    irlume_common::config::read_kv("settings.conf", "enforce_biopolicy")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
 }
 
 // ---- async response mappers (Response -> (ok, message)) -------------------
@@ -6626,7 +6929,6 @@ mod tests {
             sel: 0,
             profiles: Vec::new(),
             eyes_open: false,
-            challenge: false,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -6651,6 +6953,9 @@ mod tests {
             repair: Vec::new(),
             repair_sel: 0,
             cam_sel: 0,
+            settings_svc_sel: 0,
+            heavy: (crate::models::tui_state(), crate::bitwarden::tui_state()),
+            heavy_at: std::time::Instant::now(),
             error: None,
             daemon_up: false,
             enroll_error: None,
@@ -6844,7 +7149,6 @@ mod tests {
         let (ok, _) = map_settings(Response::Enrollment {
             profiles: Vec::new(),
             require_eyes_open: true,
-            require_challenge: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         });
@@ -6889,12 +7193,13 @@ mod tests {
     // title, a single line clamped to the box width, so a long target name was
     // cut off. It must render inside the wrapping body, with the deliberate
     // [y] yes / [n] no hint from 093dc56.
-    /// The keyring-gesture toggle: OFF is the direction that weakens credential
-    /// release, so it must go through the y/n gate and never act on the keypress
-    /// alone. ON (and the unreadable case) restore the default and go straight
-    /// through. The rendered section must report the state it actually read.
+    /// The keyring-gesture toggle: DEFAULT OFF, so neither direction weakens a
+    /// default and [g] acts on the keypress with no y/n gate. The default renders
+    /// as off and [g] there enables the opt-in; an explicit on renders as opt-in
+    /// and [g] there returns to the default off. The rendered section reports the
+    /// state it actually read.
     #[test]
-    fn keyring_gesture_toggle_confirms_before_disabling() {
+    fn keyring_gesture_toggle_needs_no_confirm() {
         let _g = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6908,46 +7213,147 @@ mod tests {
         let mut app = test_app();
         app.screen = SC_SETTINGS;
 
-        // Default (no settings.conf): shown as required, and [g] asks first.
+        // Default (no settings.conf): shown as off (default); [g] enables the
+        // opt-in with no confirm.
         let text = draw_text(&app);
         assert!(
-            text.contains("Gesture before keyring release") && text.contains("required (default)"),
-            "the default must render as required:\n{text}"
+            text.contains("Gesture before keyring release") && text.contains("off (default)"),
+            "the default must render as off:\n{text}"
         );
         app.on_key(KeyCode::Char('g'));
+        assert!(app.confirm.is_none(), "toggling needs no confirm");
         assert!(
-            app.suspend.is_none(),
-            "disabling must not act on the keypress alone"
+            matches!(
+                app.suspend.take(),
+                Some(Suspend::CredentialReleaseChallenge(true))
+            ),
+            "from the default (off), [g] enables the opt-in"
         );
-        match app.confirm.take() {
-            Some((q, verb, ConfirmAct::Sus(Suspend::CredentialReleaseChallenge(false)))) => {
-                assert_eq!(verb, "Disable");
-                assert!(
-                    q.contains("IR print"),
-                    "the confirm must name the consequence: {q}"
-                );
-            }
-            Some((q, verb, _)) => panic!("wrong confirm action: {verb} / {q}"),
-            None => panic!("disabling must raise a confirm"),
-        }
 
-        // Already off: the row warns, and [g] restores the default with no gate.
+        // Explicitly on: rendered as opt-in; [g] returns to the default off with
+        // no gate.
         std::fs::write(
             dir.join("settings.conf"),
-            "credential_release_challenge=0\n",
+            "credential_release_challenge=1\n",
         )
         .unwrap();
         let text = draw_text(&app);
         assert!(
-            text.contains("DISABLED"),
-            "an opted-out gate must be visible on the page:\n{text}"
+            text.contains("required (opt-in)"),
+            "an enabled gate must render as opt-in:\n{text}"
         );
         app.on_key(KeyCode::Char('g'));
-        assert!(app.confirm.is_none(), "re-enabling needs no confirm");
+        assert!(
+            app.confirm.is_none(),
+            "returning to the default needs no confirm"
+        );
         assert!(matches!(
             app.suspend.take(),
-            Some(Suspend::CredentialReleaseChallenge(true))
+            Some(Suspend::CredentialReleaseChallenge(false))
         ));
+
+        match old {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The per-service consent-gesture toggle: ↑/↓ pick a service, [c] toggles
+    /// it. Disabling a high-privilege service (all four in the list are) asks
+    /// first and acts on the confirm, not the keypress; enabling one that is off
+    /// goes straight through. The write shells out to the CLI (settings.conf is
+    /// root-only), so the action is a suspend to
+    /// `credential-release-challenge <service> on|off --yes`.
+    #[test]
+    fn settings_per_service_gesture_toggle_picks_and_confirms() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-tui-svc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+
+        // The section renders with the service names.
+        let text = draw_text(&app);
+        assert!(text.contains("Per-service consent gesture"), "{text}");
+        assert!(text.contains("sudo") && text.contains("polkit-1"), "{text}");
+
+        // Default (no key): sudo defaults gesture ON, so [c] DISABLES it and must
+        // confirm first (high-privilege), acting on the confirm, not the keypress.
+        assert_eq!(app.settings_svc_sel, 0, "sudo is first");
+        app.on_key(KeyCode::Char('c'));
+        assert!(
+            app.suspend.is_none(),
+            "disabling a high-priv service must not act on the keypress alone"
+        );
+        match app.confirm.take() {
+            Some((q, verb, ConfirmAct::Sus(Suspend::ServiceGesture { service, on }))) => {
+                assert_eq!(service, "sudo");
+                assert!(!on, "the confirm must target DISABLE");
+                assert_eq!(verb, "Disable");
+                assert!(q.contains("sudo"), "the confirm must name the service: {q}");
+            }
+            Some((q, verb, _)) => panic!("wrong confirm action: {verb} / {q}"),
+            None => panic!("disabling a high-priv service must raise a confirm"),
+        }
+
+        // ↑/↓ move the picked service.
+        app.on_key(KeyCode::Down);
+        assert_eq!(app.settings_svc_sel, 1, "Down picks the next service");
+        app.on_key(KeyCode::Up);
+        assert_eq!(app.settings_svc_sel, 0);
+
+        // polkit-1 with no override. It is AppConsent, which the ENGINE defaults
+        // to gesture-ON, so the first [c] must offer to DISABLE it. Only sudo
+        // (index 0) was ever driven here, so the elevation-only default read
+        // polkit as already-off and the first press wrote an `on` that changed
+        // nothing, with no confirmation, and every test still passed.
+        std::fs::write(dir.join("settings.conf"), "").unwrap();
+        let polkit_i = SETTINGS_GESTURE_SERVICES
+            .iter()
+            .position(|&s| s == "polkit-1")
+            .expect("polkit-1 is in the list");
+        app.settings_svc_sel = polkit_i;
+        let text = draw_text(&app);
+        assert!(
+            text.contains("polkit-1: ● yes"),
+            "polkit must render as REQUIRED, matching the daemon: {text}"
+        );
+        app.on_key(KeyCode::Char('c'));
+        assert!(
+            app.suspend.is_none(),
+            "disabling polkit must not act on the keypress alone"
+        );
+        match app.confirm.take() {
+            Some((q, verb, ConfirmAct::Sus(Suspend::ServiceGesture { service, on }))) => {
+                assert_eq!(service, "polkit-1");
+                assert!(!on, "the first press on a default-ON polkit must DISABLE");
+                assert_eq!(verb, "Disable");
+                assert!(q.contains("polkit-1"), "the confirm must name it: {q}");
+            }
+            Some((q, verb, _)) => panic!("wrong confirm action: {verb} / {q}"),
+            None => panic!("disabling polkit must raise a confirm"),
+        }
+        app.settings_svc_sel = 0;
+
+        // A service explicitly OFF: [c] ENABLES it and goes straight through
+        // (turning a gesture ON only adds friction, so no confirm).
+        std::fs::write(dir.join("settings.conf"), "service_gesture.sudo=0\n").unwrap();
+        app.on_key(KeyCode::Char('c'));
+        assert!(app.confirm.is_none(), "enabling needs no confirm");
+        assert!(
+            matches!(
+                app.suspend.take(),
+                Some(Suspend::ServiceGesture { ref service, on: true }) if service == "sudo"
+            ),
+            "enabling must suspend to the on toggle"
+        );
 
         match old {
             Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
@@ -6983,6 +7389,22 @@ mod tests {
     fn parity_keys_route_to_the_right_actions() {
         // The new per-screen actions: keys must set the right suspend/confirm,
         // and destructive ones must go through the y/n gate, not act directly.
+        //
+        // A readable config, because [b] now refuses to pick a direction it
+        // cannot read: the shipped settings.conf is 0600 root-owned, so an
+        // unprivileged run sees EACCES and must say so rather than offer to
+        // enable a gate that may already be enforcing.
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-tui-parity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.conf"), "enforce_biopolicy=0\n").unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY");
+
         let mut app = test_app();
         app.screen = SC_PAM;
         app.on_key(KeyCode::Char('u'));
@@ -7056,6 +7478,11 @@ mod tests {
         assert!(app.mouse_select);
         app.on_key(KeyCode::Char('M'));
         assert!(!app.mouse_select);
+        match old_cfg {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -8263,24 +8690,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_c_toggles_blink_challenge_via_the_daemon() {
-        let _sock = dead_socket();
-        let mut app = test_app();
-        app.screen = SC_SETTINGS;
-        app.on_key(KeyCode::Char('c'));
-        assert_eq!(
-            app.op.as_ref().map(|o| o.label.as_str()),
-            Some("toggle require-challenge"),
-            "[c] must fire the SetRequireChallenge toggle, not fall through"
-        );
-        wait_op_done(&mut app);
-        assert!(
-            app.error.is_some(),
-            "a failed toggle must raise the error banner, not vanish"
-        );
-    }
-
-    #[test]
     fn repair_ir_selftest_suspends_to_sudo_not_a_direct_daemon_call() {
         // The daemon root-gates SelfTest (spoof-tuning oracle), so [l] must run
         // it via sudo like every other root action, not fail on a peer-uid
@@ -8343,10 +8752,18 @@ mod tests {
             suspended_by(&mut app, 7),
             Some(Suspend::SelinuxLoad)
         ));
-        // Out of range: a no-op, not a panic.
+        // Out of range: no panic, and no silent nothing either. [f] is
+        // advertised, so a stale selection has to say why it did not act.
         let before = app.activity.len();
         app.apply_fix(99);
-        assert_eq!(app.activity.len(), before);
+        assert_eq!(app.activity.len(), before + 1);
+        assert!(
+            app.activity
+                .last()
+                .is_some_and(|l| l.1.contains("no check is selected")),
+            "{:?}",
+            app.activity.last()
+        );
     }
 
     // ---- text entry & submit ----------------------------------------------
@@ -9123,7 +9540,6 @@ mod tests {
         tx.send(ProfilesOutcome::Loaded {
             profiles: vec![profile("Alice", &["s1"])],
             eyes_open: true,
-            challenge: false,
         })
         .unwrap();
         app.poll();
@@ -9167,7 +9583,6 @@ mod tests {
         tx.send(ProfilesOutcome::Loaded {
             profiles: Vec::new(),
             eyes_open: false,
-            challenge: false,
         })
         .unwrap();
         app.poll();
@@ -9630,6 +10045,11 @@ mod tests {
         let old = std::env::var_os("IRLUME_STATE_DIR");
         std::env::set_var("IRLUME_STATE_DIR", &empty);
         app.health.as_mut().unwrap().third_party_pad = None;
+        // The draw path reads a cache taken at construction (hashing every
+        // enabled weight file on each frame was costing megabytes of I/O per
+        // keypress). The running TUI re-takes it on its poll; a test that moves
+        // the state dir under it has to do the same.
+        app.refresh_heavy();
         let text = draw_text(&app);
         assert!(text.contains("none (default)"), "empty state dir -> ○ none");
         match old {
@@ -10267,7 +10687,7 @@ mod tests {
     }
 
     #[test]
-    fn run_checks_flags_version_skew_challenge_gap_and_corrupt_enrollment() {
+    fn run_checks_flags_version_skew_and_corrupt_enrollment() {
         let _sock = dead_socket();
         let mut app = test_app();
         app.health = Some(HealthInfo {
@@ -10282,7 +10702,6 @@ mod tests {
             third_party_detector: None,
             apparmor: None,
         });
-        app.challenge = true;
         app.enroll_error = Some("bad ciphertext".into());
         app.run_checks();
         let find = |label: &str| {
@@ -10297,9 +10716,6 @@ mod tests {
             build.detail.contains("0.0.1-old"),
             "names the stale version"
         );
-        let blink = find("Blink challenge");
-        assert!(blink.sev == Sev::Fail);
-        assert!(blink.detail.contains("challenge is skipped"));
         let enroll = find("Enrollment");
         assert!(enroll.sev == Sev::Fail, "unreadable ≠ not enrolled");
         assert!(enroll.detail.contains("bad ciphertext"));
@@ -10741,16 +11157,613 @@ mod tests {
         assert!(!text.contains("dark mode"), "{text}");
     }
 
+    /// Every screen must render at any terminal size, including sizes too small
+    /// to hold its content.
+    ///
+    /// Layout arithmetic is where a TUI panics: a width or height subtraction
+    /// that underflows, a constraint that cannot be satisfied, a centred popup
+    /// wider than the frame. A user who drags a terminal narrow, or runs in a tmux
+    /// split, must get a cramped screen and not a crash that takes their setup
+    /// session with it. 1x1 is included deliberately: it is the degenerate case
+    /// every clamp has to survive.
     #[test]
-    fn gesture_explainer_uses_the_right_article_across_its_line_break() {
+    fn every_screen_renders_at_every_size() {
+        let sizes = [
+            (1, 1),
+            (2, 2),
+            (10, 3),
+            (20, 5),
+            (40, 10),
+            (60, 20),
+            (80, 24),
+            (120, 50),
+            (200, 60),
+        ];
+        for screen in 0..SCREENS.len() {
+            for (w, h) in sizes {
+                let mut app = test_app();
+                app.screen = screen;
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+
+                // The same size with the modal layers up: a popup is laid out
+                // against the frame, so it is the case most likely to underflow.
+                let mut app = test_app();
+                app.screen = screen;
+                app.show_help = true;
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+
+                let mut app = test_app();
+                app.screen = screen;
+                app.set_error("an error long enough to need wrapping in a narrow frame");
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+
+                // The confirm and input modals lay out the same way, and a
+                // confirm is what stands between a user and a destructive action,
+                // so it is the worst one to lose to a layout panic.
+                let mut app = test_app();
+                app.screen = screen;
+                app.confirm = Some((
+                    "A confirmation question long enough to wrap more than once in a narrow frame"
+                        .into(),
+                    "Disable",
+                    ConfirmAct::Daemon(Request::Ping),
+                ));
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+
+                let mut app = test_app();
+                app.screen = screen;
+                app.input = Some((
+                    "Rename profile 'a-fairly-long-profile-name' to:".into(),
+                    "typed text".into(),
+                    Pending::RenameProfile("a-fairly-long-profile-name".into()),
+                ));
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+            }
+        }
+    }
+
+    /// Every screen must survive every key without panicking, and must still
+    /// render afterwards.
+    ///
+    /// The TUI is a state machine over 12 screens with per-screen key handlers,
+    /// selection indices into lists that can be empty, and modal states
+    /// (confirm/input/help) layered on top. A handler that indexes its list, or
+    /// that assumes a selection is in range, panics the whole interface for the
+    /// user mid-setup. `on_key` only ever RECORDS a privileged step (the run loop
+    /// executes it), so driving every key here touches no system state.
+    ///
+    /// Crossed with the modal states, because a key that is safe on a screen can
+    /// still be routed to a modal handler that reads different state.
+    #[test]
+    fn every_screen_survives_every_key() {
+        // Some keys spawn a daemon request on a detached worker. Those workers
+        // connect to whatever IRLUME_SOCKET names when they run, so without this
+        // they land on another test's socket and inflate its connection count
+        // (`wedged_daemon_poll_short_circuits_after_ping` counts accepts and says
+        // so in its own comment). Point them at a path nothing is listening on,
+        // under the env lock, so this test cannot perturb another.
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dead =
+            std::env::temp_dir().join(format!("irlume-keyfuzz-nothing-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dead);
+        let old_sock = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", &dead);
+
+        let keys: Vec<KeyCode> = ('a'..='z')
+            .chain('A'..='Z')
+            .chain('0'..='9')
+            .map(KeyCode::Char)
+            .chain([
+                KeyCode::Enter,
+                KeyCode::Esc,
+                KeyCode::Tab,
+                KeyCode::BackTab,
+                KeyCode::Up,
+                KeyCode::Down,
+                KeyCode::Left,
+                KeyCode::Right,
+                KeyCode::Home,
+                KeyCode::End,
+                KeyCode::PageUp,
+                KeyCode::PageDown,
+                KeyCode::Backspace,
+                KeyCode::Delete,
+                KeyCode::Insert,
+                KeyCode::Char(' '),
+                KeyCode::Char('/'),
+                KeyCode::Char('?'),
+                KeyCode::Char('-'),
+                KeyCode::F(1),
+                KeyCode::F(12),
+            ])
+            .collect();
+
+        for screen in 0..SCREENS.len() {
+            for key in &keys {
+                // Fresh app per key: this asserts each key is safe from a clean
+                // state, not that some earlier key happened to guard it.
+                let mut app = test_app();
+                app.screen = screen;
+                app.on_key(*key);
+                let _ = draw_text(&app);
+
+                // Same key with a selection pushed past the end of every list,
+                // which is what an empty profile list plus a remembered index
+                // looks like after a delete.
+                let mut app = test_app();
+                app.screen = screen;
+                app.sel = 99;
+                app.hub_sel = 99;
+                app.settings_svc_sel = 99;
+                app.on_key(*key);
+                let _ = draw_text(&app);
+            }
+        }
+
+        match old_sock {
+            Some(v) => std::env::set_var("IRLUME_SOCKET", v),
+            None => std::env::remove_var("IRLUME_SOCKET"),
+        }
+    }
+
+    /// Every key a screen advertises must do something on that screen.
+    ///
+    /// The footer is the disclosure ladder: a key listed there is a promise. The
+    /// Keyring tab listed [r] reseal in every state while its handler required an
+    /// armed seal, so on a fresh machine the key did nothing and said nothing.
+    /// This drives each advertised key on its own screen and asserts the app
+    /// changed in some observable way, which is the weakest honest definition of
+    /// "did something" that does not need to know what each key means.
+    #[test]
+    fn every_advertised_key_does_something_on_its_screen() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dead =
+            std::env::temp_dir().join(format!("irlume-footer-nothing-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dead);
+        let old_sock = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", &dead);
+
+        for (screen, screen_name) in SCREENS.iter().enumerate() {
+            let probe = {
+                let mut a = test_app();
+                a.screen = screen;
+                a
+            };
+            for (key, label) in probe.screen_actions() {
+                // Only single-character keys are drivable here; "enter"/"esc" and
+                // the arrow hints are covered by the key-fuzz test.
+                let mut chars = key.chars();
+                let (Some(c), None) = (chars.next(), chars.next()) else {
+                    continue;
+                };
+                let mut app = test_app();
+                app.screen = screen;
+                let before = draw_text(&app);
+                let before_state = (
+                    app.quit,
+                    app.screen,
+                    app.show_help,
+                    app.confirm.is_some(),
+                    app.input.is_some(),
+                    app.suspend.is_some(),
+                    app.op.is_some(),
+                    app.activity.len(),
+                    app.error.is_some(),
+                );
+                app.on_key(KeyCode::Char(c));
+                let after_state = (
+                    app.quit,
+                    app.screen,
+                    app.show_help,
+                    app.confirm.is_some(),
+                    app.input.is_some(),
+                    app.suspend.is_some(),
+                    app.op.is_some(),
+                    app.activity.len(),
+                    app.error.is_some(),
+                );
+                let moved = before_state != after_state || draw_text(&app) != before;
+                assert!(
+                    moved,
+                    "screen {screen_name} ({screen}) advertises [{key}] {label}, \
+                     and pressing it changed nothing"
+                );
+            }
+        }
+
+        match old_sock {
+            Some(v) => std::env::set_var("IRLUME_SOCKET", v),
+            None => std::env::remove_var("IRLUME_SOCKET"),
+        }
+    }
+
+    /// A hub selection must stay inside the list when the list shrinks.
+    ///
+    /// The hub shows only visible screens, and [v] leaving advanced view removes
+    /// several. `move_sel` wraps modulo the current length, so a stale index
+    /// recovers on the next arrow, but until then nothing is highlighted and
+    /// Enter opens nothing at all.
+    #[test]
+    fn the_hub_selection_survives_the_list_shrinking() {
+        let mut app = test_app();
+        app.screen = SC_WELCOME;
+        app.advanced = true;
+        app.daemon_up = true;
+        app.fp_present = true;
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.recompute_visible();
+        let wide = app.hub_rows().len();
+        assert!(wide > 1, "premise: advanced view lists several sections");
+        app.hub_sel = wide - 1;
+
+        // Leaving advanced view removes screens, so the list gets shorter.
+        app.advanced = false;
+        app.recompute_visible();
+        let narrow = app.hub_rows().len();
+        assert!(narrow > 0, "the hub always has rows");
+        assert!(
+            app.hub_sel < narrow,
+            "selection {} must be inside the {narrow} remaining rows",
+            app.hub_sel
+        );
+        // And Enter opens the row it is on rather than nothing.
+        let target = app.hub_rows()[app.hub_sel].2;
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.screen, target, "Enter opens the highlighted section");
+    }
+
+    /// An encrypted enrollment whose template key is gone must not read as a
+    /// completed step anywhere.
+    ///
+    /// Nothing opens it: no recovery passphrase, no reseal, only a re-enrol. The
+    /// Recovery tab said so loudly while the Repair check passed it as
+    /// "encrypted + recovery set", the Done row drew a green yes, and the hub
+    /// badge counted the step done.
+    #[test]
+    fn a_missing_template_key_is_not_a_completed_step() {
+        let mut app = test_app();
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            recovery_set: true,
+            tpm_present: true,
+            key_present: false,
+        });
+        app.run_checks();
+
+        // Repair: a failure with a re-enrol remedy, not an OK.
+        let backstop = app
+            .repair
+            .iter()
+            .find(|c| c.label == "Recovery backstop")
+            .expect("the backstop check is present");
+        assert!(matches!(backstop.sev, Sev::Fail), "{}", backstop.detail);
+        assert!(backstop.detail.contains("MISSING"), "{}", backstop.detail);
+
+        // Done dashboard: not a green yes.
+        app.screen = SC_DONE;
+        let text = draw_text(&app);
+        assert!(text.contains("key missing"), "{text}");
+
+        // Hub badge: the step is not done. (The hub lists only VISIBLE screens,
+        // and the test app has no camera, so make them all visible first, as the
+        // hub-navigation test does.)
+        app.screen = SC_WELCOME;
+        app.visible = (0..SCREENS.len()).collect();
+        let rows = app.hub_rows();
+        let enc = rows
+            .iter()
+            .find(|(label, _, _)| *label == "recovery + encryption")
+            .expect("the hub lists the recovery step");
+        assert_eq!(enc.1, Some(false), "an unopenable store is not done");
+
+        // With the key present, all three read as done again.
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            recovery_set: true,
+            tpm_present: true,
+            key_present: true,
+        });
+        app.run_checks();
+        let backstop = app
+            .repair
+            .iter()
+            .find(|c| c.label == "Recovery backstop")
+            .unwrap();
+        assert!(matches!(backstop.sev, Sev::Ok), "{}", backstop.detail);
+        app.visible = (0..SCREENS.len()).collect();
+        let rows = app.hub_rows();
+        let enc = rows
+            .iter()
+            .find(|(label, _, _)| *label == "recovery + encryption")
+            .unwrap();
+        assert_eq!(enc.1, Some(true));
+    }
+
+    /// Cancelling a guided enrolment must re-read the profile list.
+    ///
+    /// Scan 1 creates the profile on the daemon before the later scans run, so a
+    /// cancel after it leaves a real profile the cached list has never seen. The
+    /// screen then showed nothing, and enrolling again on top of that is the
+    /// natural next move.
+    #[test]
+    fn cancelling_an_enrolment_re_reads_the_profiles() {
+        let mut app = test_app();
+        let (_tx, rx) = mpsc::channel();
+        app.enroll = Some(EnrollUi {
+            rx,
+            stop: Arc::new(AtomicBool::new(false)),
+            profile: "BEN".into(),
+            last: None,
+            count: None,
+            stalled: None,
+            captured: 1,
+            target: 5,
+            base: 0,
+            ambient_base: 0,
+        });
+        assert!(app.profiles_load.is_none(), "premise: no load in flight");
+        app.on_key(KeyCode::Esc);
+        assert!(app.enroll.is_none(), "Esc cancels the guided enrolment");
+        assert!(
+            app.profiles_load.is_some(),
+            "and asks the daemon what the profile list is now"
+        );
+    }
+
+    /// With the daemon down and nothing probed, the Repair tab must say it cannot
+    /// check the cameras, not that there are none.
+    ///
+    /// `nodes` is filled only by a classifying scan, and this screen deliberately
+    /// never runs one (classifying opens every node, the contention #187 is
+    /// about). The empty list was being read as proof of absence, so every user
+    /// whose daemon was down was told face auth was unavailable on the very
+    /// screen they opened to fix it.
+    #[test]
+    fn a_daemon_down_repair_tab_does_not_claim_the_cameras_are_missing() {
+        let mut app = test_app();
+        app.daemon_up = false;
+        app.nodes.clear();
+        app.screen = SC_REPAIR;
+        app.run_checks();
+        let text = draw_text(&app);
+        assert!(
+            !text.contains("no camera: face auth unavailable"),
+            "an unprobed list is not an absent camera: {text}"
+        );
+        assert!(
+            text.contains("cannot check the cameras while the daemon is down"),
+            "it must say what it actually knows: {text}"
+        );
+
+        // When a scan HAS classified nodes, the real verdicts still apply.
+        app.nodes = vec![("/dev/video0".into(), irlume_camera::Role::Rgb)];
+        app.run_checks();
+        let text = draw_text(&app);
+        assert!(
+            text.contains("RGB-only") || text.contains("convenience"),
+            "a classified RGB-only machine keeps its verdict: {text}"
+        );
+    }
+
+    /// The biopolicy row must agree with the daemon about what counts as ON.
+    ///
+    /// The daemon accepts `1`, `true`, `yes` and `on`. The TUI had its own reader
+    /// that took only `1` and `true`, so `enforce_biopolicy=yes` drew "turn it on"
+    /// and the key offered to enable a gate the daemon was already enforcing.
+    #[test]
+    fn the_biopolicy_row_reads_every_value_the_daemon_calls_on() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-tui-bio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY");
+
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        for on in ["1", "true", "yes", "on", " ON "] {
+            std::fs::write(
+                dir.join("settings.conf"),
+                format!("enforce_biopolicy={on}\n"),
+            )
+            .unwrap();
+            let text = draw_text(&app);
+            assert!(
+                text.contains("turn it off"),
+                "enforce_biopolicy={on:?} is ON to the daemon, so the row must offer OFF: {text}"
+            );
+        }
+        for off in ["0", "false", "no", "off"] {
+            std::fs::write(
+                dir.join("settings.conf"),
+                format!("enforce_biopolicy={off}\n"),
+            )
+            .unwrap();
+            let text = draw_text(&app);
+            assert!(
+                text.contains("turn it on"),
+                "enforce_biopolicy={off:?} is OFF, so the row must offer ON: {text}"
+            );
+        }
+
+        match old {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When settings.conf cannot be read, the gesture row must say so rather than
+    /// render a default as a fact, and [c] must refuse to pick a direction.
+    ///
+    /// The file ships 0600 root-owned, so this is what an ordinary `irlume tui`
+    /// sees. Guessing made the key one-way: every service read as required, so
+    /// the only move [c] offered was DISABLE, and pressing it after a disable
+    /// wrote `off` again while the row still claimed the gesture was in place.
+    #[test]
+    fn an_unreadable_settings_file_shows_unknown_and_refuses_to_toggle() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-tui-noread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("settings.conf");
+        std::fs::write(&conf, "service_gesture.sudo=0\n").unwrap();
+        // Unreadable, the way the shipped file is to a non-root TUI.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let old = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        // Root can read a 0000 file, so this test only means anything unprivileged.
+        // SAFETY: geteuid reads our own credentials and cannot fail.
+        let is_root = unsafe { libc::geteuid() } == 0;
+        if !is_root {
+            let mut app = test_app();
+            app.screen = SC_SETTINGS;
+            let text = draw_text(&app);
+            assert!(
+                text.contains("◐ unknown"),
+                "an unreadable config must render as unknown, not as a default: {text}"
+            );
+
+            let before = app.suspend.is_none() && app.confirm.is_none();
+            assert!(before);
+            app.on_key(KeyCode::Char('c'));
+            assert!(
+                app.suspend.is_none() && app.confirm.is_none(),
+                "[c] must not pick a direction from a state it cannot read"
+            );
+            assert!(
+                app.activity.iter().any(|l| l.1.contains("root-only")),
+                "and it must say why: {:?}",
+                app.activity
+            );
+        }
+
+        let _ = std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o600));
+        match old {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A privileged step must not re-`sudo` when the TUI is already root: the
+    /// inner sudo resets SUDO_USER to "root", and every per-user command
+    /// resolves its target from it, so `sudo irlume tui` -> `[c]` stored the eye
+    /// calibration for root instead of the person who ran the TUI.
+    #[test]
+    fn a_root_tui_runs_privileged_steps_without_a_second_sudo() {
+        let args = ["/usr/bin/irlume", "calibrate-closure"];
+
+        // Already root: run the binary directly, so the OUTER sudo's SUDO_USER
+        // survives and names the real user.
+        let cmd = App::privileged_cmd(&args, true);
+        assert_eq!(cmd.get_program(), "/usr/bin/irlume");
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            vec!["calibrate-closure"],
+            "no sudo, and the arguments are unchanged"
+        );
+
+        // Unprivileged: sudo is how the step gets its privilege at all.
+        let cmd = App::privileged_cmd(&args, false);
+        assert_eq!(cmd.get_program(), "sudo");
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            vec!["/usr/bin/irlume", "calibrate-closure"]
+        );
+    }
+
+    /// The PAM tab's [c] row must describe the calibration the CONFIGURED mode
+    /// actually uses. It was one fixed string calling the eye closure an optional
+    /// alternative, which is true only in the default mode: under
+    /// `consent_gesture=closure` the nod is refused and this calibration is the
+    /// only way any gesture passes (the old text sent that user to nod at a gate
+    /// that would deny them), and under `consent_gesture=nod` the closure is
+    /// refused, so teaching it changes nothing.
+    #[test]
+    fn calibrate_row_describes_the_configured_gesture_mode() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-tui-calibmode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CONSENT_GESTURE");
+
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        for (conf, expect) in [
+            ("", "optional eye-closure alternative"),
+            ("consent_gesture=closure\n", "REQUIRED"),
+            ("consent_gesture=nod\n", "not accepted"),
+            ("consent_gesture=banana\n", "until consent_gesture is fixed"),
+        ] {
+            std::fs::write(dir.join("settings.conf"), conf).unwrap();
+            let text = draw_text(&app);
+            let row = row_with(&text, "Calibrate gesture");
+            assert!(
+                row.contains(expect),
+                "mode {conf:?} must say {expect:?}, got: {row}"
+            );
+        }
+
+        match old {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Settings tab must name BOTH halves of the gesture. A user told only
+    /// how to approve does not know a head shake is a deliberate decline the
+    /// daemon acts on (it cancels the request, and on a polkit prompt it ends the
+    /// attempt). Before this, no user-visible string in the CLI or TUI mentioned
+    /// the shake at all.
+    #[test]
+    fn settings_names_the_shake_decline() {
         let mut app = test_app();
         app.screen = SC_SETTINGS;
         let text = draw_text(&app);
-        // The hand-wrapped pair rendered "…NODDING (or a / eye closure)".
         assert!(
-            row_with(&text, "CONTINUOUS NODDING").contains("(or an"),
+            text.contains("shake your head to decline"),
+            "the gesture section must name the decline: {text}"
+        );
+    }
+
+    #[test]
+    fn gesture_explainer_uses_the_right_article() {
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        let text = draw_text(&app);
+        // The explainer offers the eye closure as the alternative to nodding; the
+        // article before "eye" must be "an", and the phrase is kept on one line so
+        // it cannot render as "(or a / eye closure)".
+        assert!(
+            row_with(&text, "or an eye closure").contains("or an eye closure"),
             "{text}"
         );
+        assert!(!text.contains("or a eye closure"), "{text}");
     }
 
     #[test]
@@ -10772,8 +11785,27 @@ mod tests {
             "{}",
             app.help_body()
         );
-        // Keyring: [p] refreshes the pcrlock policy on a Tier-2 seal.
+        // Keyring: [p] refreshes the pcrlock policy on a Tier-2 seal, and its
+        // handler is guarded on exactly that, so the disclosure follows the guard.
+        // Listing it on a seal that has no such policy offered a key that did
+        // nothing and said nothing.
         app.screen = SC_KEYRING;
+        app.keyring_armed = Some(true);
+        app.keyring_policy = Some("pcrlock NV 0x18fb7a2 (Tier 2)".into());
         assert!(app.help_body().contains("pcrlock"), "{}", app.help_body());
+        app.keyring_policy = None;
+        assert!(
+            !app.help_body().contains("pcrlock"),
+            "no Tier-2 policy, so no [p]: {}",
+            app.help_body()
+        );
+        // And [r] follows the armed state the same way.
+        assert!(app.help_body().contains("reseal"), "{}", app.help_body());
+        app.keyring_armed = Some(false);
+        assert!(
+            !app.help_body().contains("reseal"),
+            "nothing to reseal on an unarmed keyring: {}",
+            app.help_body()
+        );
     }
 }

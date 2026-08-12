@@ -91,6 +91,11 @@ pub struct Engine {
     /// The gate treats `false` as "not seen yet", which is the fail-closed
     /// reading: the worst a stale `false` can do is ask for another gesture.
     gesture_seen_before_match: bool,
+    /// True when a headshake was detected during the consent watch. A shake
+    /// cancels the request: the user explicitly denied consent. Set in
+    /// [`Self::consent_watch`], read in [`Self::consent_gesture_gate`], cleared
+    /// in [`Self::authenticate_for`].
+    gesture_cancelled: bool,
     /// Asked between whole captures: "should this long operation stop now?".
     ///
     /// The daemon points this at its arbiter so an enrolment yields the camera
@@ -208,6 +213,12 @@ pub enum OutcomeKind {
     /// Every other refusal: pre-camera policy/state denials, camera-binding
     /// mismatches, challenge-gate failures.
     OtherDeny,
+    /// A DELIBERATE head-shake decline during the consent watch (pre- or
+    /// post-match). Kept distinct from `OtherDeny` so the daemon can report it as
+    /// `declined_by_gesture` and pam_irlume can abort a polkit dialog on it, and
+    /// only it. Non-retryable: a decline is final, so it stays OUT of
+    /// [`presence_retryable`] (the same as `OtherDeny`).
+    GestureDeclined,
 }
 
 impl Outcome {
@@ -241,6 +252,24 @@ impl Outcome {
             score,
             reason: reason.into(),
             kind: OutcomeKind::Granted,
+        }
+    }
+
+    /// A DELIBERATE head-shake decline: kind [`OutcomeKind::GestureDeclined`], the
+    /// class the daemon maps to `declined_by_gesture` and pam_irlume aborts a polkit
+    /// dialog on. Built HERE, used by BOTH the pre- and post-match shake sites, so
+    /// "a shake is GestureDeclined" is one tested contract, not a class repeated at
+    /// two sites where a revert to `OtherDeny` would pass every camera-less test
+    /// (pinned by `a_shake_decline_reads_as_a_gesture_decline`). `live`/`score`
+    /// carry through from the take (`0.0`/`false` when the shake came before any
+    /// match), so the reason is uniform but the evidence is not fabricated.
+    fn gesture_declined(live: bool, score: f32) -> Self {
+        Self {
+            granted: false,
+            live,
+            score,
+            reason: "head shake cancelled the request".into(),
+            kind: OutcomeKind::GestureDeclined,
         }
     }
 }
@@ -384,11 +413,10 @@ fn grace_window_ms(service: Option<&str>) -> u64 {
 /// `IRLUME_POLKIT_GESTURE=0` or `polkit_gesture=0` in settings.conf. Verify
 /// stays face-gated either way; this only controls the extra blink.
 fn consent_gesture_enabled() -> bool {
-    let falsy = |v: &str| matches!(v.trim(), "0" | "false" | "no" | "off");
-    if let Ok(v) = std::env::var("IRLUME_POLKIT_GESTURE") {
-        return !falsy(&v);
-    }
-    !irlume_common::config::read_kv("settings.conf", "polkit_gesture").is_some_and(|v| falsy(&v))
+    // One definition, in irlume_common, because the TUI badge and the CLI status
+    // listing answer the same question and a private copy here is how they came
+    // to disagree with the engine about polkit.
+    irlume_common::config::polkit_gesture_enabled()
 }
 
 /// The consent verdict once the watch's stream has ended: what the in-loop
@@ -416,6 +444,26 @@ fn completed_consent_take_hit(
             irlume_liveness::detect_deliberate_closure(ears, cal)
                 == irlume_liveness::BlinkResult::Blinked
         })
+}
+
+/// Resolve a consent watch's verdict from what the stream reported.
+///
+/// `stream_hit` is `capture_ir_streaming`'s break value: `Some(true)` an accepted
+/// nod/closure, `Some(false)` a head-shake decline, `None` the budget ran out with
+/// no in-loop verdict. A `Some(_)` outcome is TERMINAL and returned as-is; the
+/// decline in particular must never be re-examined, or a completed-take nod/closure
+/// reading would overturn it into a grant. `completed_take_hit` is consulted, and
+/// evaluated, ONLY for `None`: it is what closes the trailing-poses boundary the
+/// in-loop cadence leaves (#101). Kept pure so a test can prove a decline stays a
+/// decline; the call site's own coverage cannot reach the camera.
+fn resolve_consent_watch(
+    stream_hit: Option<bool>,
+    completed_take_hit: impl FnOnce() -> bool,
+) -> bool {
+    match stream_hit {
+        Some(accepted) => accepted,
+        None => completed_take_hit(),
+    }
 }
 
 // The consent-gesture mode is defined in irlume_common::config so the PAM module
@@ -447,8 +495,9 @@ fn forced_consent_for(service: Option<&str>) -> bool {
 /// does not, and nothing in between can blur the two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthenticationPurpose {
-    /// Prove identity for a session (login, lock screen, sudo). Only the
-    /// per-enrollment `require_challenge` opt-in adds a gate. Unchanged behaviour.
+    /// Prove identity for a session (login, lock screen, sudo). A gesture is
+    /// demanded only when the service's own policy asks for it (elevation
+    /// defaults on; see `demands_gesture`).
     Verify,
     /// Approve one application request (a polkit prompt). Requires the deliberate
     /// consent gesture, because the user is answering a prompt they did not type
@@ -479,11 +528,39 @@ impl AuthenticationPurpose {
 
     /// Whether the deliberate consent gesture is required regardless of the
     /// user's per-enrollment opt-in.
-    fn demands_gesture(self) -> bool {
+    ///
+    /// `service` is the PAM service name when available (e.g. `sudo`, `polkit-1`).
+    /// It is consulted for per-service overrides in `settings.conf` under
+    /// `service_gesture.<service>`. When absent, the per-purpose default is used.
+    fn demands_gesture(self, service: Option<&str>) -> bool {
         match self {
-            Self::Verify => false,
-            Self::AppConsent => true,
-            Self::CredentialRelease { temporal_challenge } => temporal_challenge,
+            Self::Verify => {
+                // Elevation services (sudo, su, doas) default to gesture ON.
+                // The user can override per-service in settings.conf.
+                service.is_some_and(|s| {
+                    irlume_common::config::service_gesture(s)
+                        .unwrap_or_else(|| irlume_common::config::service_gesture_default(s))
+                })
+            }
+            Self::AppConsent => {
+                // App-consent services (polkit) default to gesture ON, but honor
+                // an explicit per-service override so `service_gesture.polkit-1=0`
+                // actually disables it. Before this, the arm was an unconditional
+                // `true`, so the CLI could write and report `polkit-1 off` while
+                // the engine still forced the gesture.
+                service
+                    .and_then(irlume_common::config::service_gesture)
+                    .unwrap_or(true)
+            }
+            Self::CredentialRelease { temporal_challenge } => {
+                // Per-service override for the credential-release path
+                // (special token "credential_release"), then the global
+                // credential_release_challenge fallback.
+                if let Some(v) = irlume_common::config::service_gesture("credential_release") {
+                    return v;
+                }
+                temporal_challenge
+            }
         }
     }
 }
@@ -513,6 +590,19 @@ pub fn presence_retryable(o: &Outcome) -> bool {
         o.kind,
         OutcomeKind::NoFace | OutcomeKind::Uncertain | OutcomeKind::SpoofNoIrFace
     )
+}
+
+/// Was this refusal a DELIBERATE head-shake decline?
+///
+/// The daemon maps this onto the wire `AuthResult.declined_by_gesture` field, and
+/// pam_irlume aborts a polkit dialog on it (and only it), so this is a
+/// security-relevant boundary and lives as a tested pure function rather than an
+/// inline `matches!` at the wire site. Only [`OutcomeKind::GestureDeclined`]
+/// qualifies: a timeout, a no-match, a caught spoof, or any policy denial is NOT a
+/// deliberate decline and must never close a dialog. Pinned by
+/// `only_a_gesture_decline_is_a_gesture_decline`.
+pub fn is_gesture_decline(o: &Outcome) -> bool {
+    matches!(o.kind, OutcomeKind::GestureDeclined)
 }
 
 /// Start of the reason irlume-liveness produces when the IR format defines no
@@ -1246,6 +1336,7 @@ impl Engine {
             // `with_devices`, so `IRLUME_FORCE_NO_IR=1` still outranks it.
             ir_available: selected_ir_available(irlume_camera::DEFAULT_IR_DEVICE),
             gesture_seen_before_match: false,
+            gesture_cancelled: false,
             stop_requested: None,
         })
     }
@@ -2275,6 +2366,12 @@ impl Engine {
     /// [`irlume_liveness::detect_blink`] then finds a dip below the open baseline. A
     /// static print holds EAR flat and never dips. Live-validated 2026-07-01: genuine
     /// natural blink → Blinked, static vinyl banner → NoBlink.
+    // Production-dead since the blink `require_challenge` gate was removed (nod/
+    // shake supersede it). `require_eyes_open` gates on the per-frame `eyes_open`
+    // flag, not this blink-window detector. Kept for its tests and because it is
+    // the worked example of the EAR path `capture_ear_samples` (still used by the
+    // eyes-open calibration) drives.
+    #[allow(dead_code)]
     fn run_passive_liveness(&mut self) -> irlume_common::Result<irlume_liveness::BlinkResult> {
         // ~5s window at the raw ~15 fps rate.
         const SAMPLES: usize = 75;
@@ -2546,6 +2643,25 @@ impl Engine {
         let mut ears: Vec<irlume_liveness::EarSample> = Vec::new();
         let mut err: Option<irlume_common::Error> = None;
         let hit = irlume_camera::capture_ir_streaming(&ir_dev, max_frames, |sf| {
+            // Stop the moment the work is no longer wanted: the client that asked
+            // for it has gone (its polkit dialog closed, so the daemon's connection
+            // thread asked us to stop), or a new authentication needs the camera.
+            //
+            // Checked HERE, per frame, because this loop is where an authentication
+            // spends its seconds: the watch runs for the whole consent budget, and
+            // the only other stop checks sit between whole captures on the ENROLMENT
+            // path, so nothing was watching during the one phase a user actually
+            // waits through. Measured 2026-08-11: cancelling a polkit prompt left
+            // the IR emitter lit and this loop streaming for the rest of the budget.
+            // A frame boundary is safe: nothing is written mid-stream, and setting
+            // `err` makes the whole request end rather than reporting a false
+            // "no gesture" that a caller might treat as a real refusal.
+            if self.should_stop() {
+                err = Some(irlume_common::Error::Preempted(
+                    "the request was cancelled before a consent gesture arrived".into(),
+                ));
+                return std::ops::ControlFlow::Break(true);
+            }
             let idx = poses.len();
             match self.frame_to_consent_samples(&sf.frame, idx) {
                 Ok((pose, ear)) => {
@@ -2560,9 +2676,27 @@ impl Engine {
             if !poses.len().is_multiple_of(CHECK_EVERY) {
                 return std::ops::ControlFlow::Continue(());
             }
-            if allow_nod && irlume_liveness::detect_nod(&poses) == irlume_liveness::HeadGesture::Nod
-            {
-                return std::ops::ControlFlow::Break(true);
+            if allow_nod {
+                let g = irlume_liveness::detect_nod(&poses);
+                if !matches!(
+                    g,
+                    irlume_liveness::HeadGesture::Nod | irlume_liveness::HeadGesture::None
+                ) {
+                    irlume_common::dlog!(
+                        "consent: detect_nod returned {g:?} at frame {}",
+                        poses.len()
+                    );
+                }
+                match g {
+                    irlume_liveness::HeadGesture::Nod => {
+                        return std::ops::ControlFlow::Break(true);
+                    }
+                    irlume_liveness::HeadGesture::Shake => {
+                        self.gesture_cancelled = true;
+                        return std::ops::ControlFlow::Break(false);
+                    }
+                    _ => {}
+                }
             }
             if let Some(cal) = &closure_cal {
                 if irlume_liveness::detect_deliberate_closure(&ears, cal)
@@ -2576,18 +2710,22 @@ impl Engine {
         if let Some(e) = err {
             return Err(e);
         }
-        // The in-loop check runs every CHECK_EVERY poses, so a take whose
-        // length is not a multiple of it ends with unevaluated trailing poses,
-        // and a gesture completing in exactly those frames is refused with
-        // whole-take evidence that passes every gate. Measured 2026-08-04
-        // (#101): two 20-pose windows printed pitch_range 0.077-0.085 against
-        // the 0.075 floor after their last check ran at pose 18, and one cost
-        // a real trial its release. One evaluation of the COMPLETE series
-        // closes the boundary at zero capture cost.
-        let hit_in_loop = hit == Some(true);
-        let hit =
-            completed_consent_take_hit(hit_in_loop, allow_nod, &poses, &ears, closure_cal.as_ref());
-        if hit && !hit_in_loop {
+        // Resolve the take. A stream that broke in the loop is TERMINAL, whether
+        // it accepted (`Some(true)`, a nod or closure) or declined (`Some(false)`,
+        // a head-shake, which also set `gesture_cancelled`). Only a budget-
+        // exhausted `None` consults the completed take, to catch a gesture that
+        // finished inside the trailing poses the in-loop cadence never checked
+        // (measured 2026-08-04, #101: two 20-pose windows at pitch_range
+        // 0.077-0.085 against the 0.075 floor, last in-loop check at pose 18; one
+        // cost a real trial its release). The decline must NOT reach that check:
+        // re-reading the whole take (which holds the shake motion) as a nod, or
+        // letting `detect_deliberate_closure` fire on the eye geometry a head-turn
+        // produces, would overturn an explicit decline into a grant.
+        let stream_hit = hit;
+        let hit = resolve_consent_watch(stream_hit, || {
+            completed_consent_take_hit(false, allow_nod, &poses, &ears, closure_cal.as_ref())
+        });
+        if stream_hit.is_none() && hit {
             // Observable in the journal so a hardware replay can show THIS
             // path fired, not just that a trial released.
             irlume_common::dlog!(
@@ -2660,96 +2798,40 @@ impl Engine {
     /// Apply whatever gate the purpose and the enrollment ask for on top of the
     /// match, just before granting.
     ///
-    /// Two different gates live here:
-    ///
-    /// * The DELIBERATE consent gesture (nod / calibrated eye closure), required
-    ///   by [`AuthenticationPurpose::AppConsent`] (polkit) and, by default, by
-    ///   [`AuthenticationPurpose::CredentialRelease`]. A gesture is intent, not
-    ///   just liveness, and it fails closed.
-    /// * The per-enrollment passive natural-blink opt-in (`require_challenge`,
-    ///   ADR-0002), unchanged.
+    /// One gate lives here: the DELIBERATE consent gesture (nod / calibrated eye
+    /// closure), required by [`AuthenticationPurpose::AppConsent`] (polkit), by
+    /// elevation services under [`AuthenticationPurpose::Verify`], and by
+    /// [`AuthenticationPurpose::CredentialRelease`] when the user has opted in
+    /// (it defaults off). A gesture is intent, not just liveness, and it fails
+    /// closed.
     ///
     /// Every failure downgrades to a non-grant with an Uncertain-style reason, so
     /// PAM cascades to the typed password; nothing here can lock a user out. When
-    /// IR or the FaceMesh model is missing, both gates fail closed to the password
+    /// IR or the FaceMesh model is missing, the gate fails closed to the password
     /// rather than hand back a grant weaker than what was asked for.
     fn challenge_if_required(
         &mut self,
         enr: &irlume_core::storage::Enrollment,
         purpose: AuthenticationPurpose,
+        service: Option<&str>,
         outcome: Outcome,
     ) -> irlume_common::Result<Outcome> {
         if !outcome.granted {
             return Ok(outcome);
         }
-        if purpose.demands_gesture() {
+        if purpose.demands_gesture(service) {
             let seen = self.gesture_seen_before_match;
             return self.consent_gesture_gate(enr, outcome, seen);
         }
-        // Credential release with the challenge switched OFF, and no per-enrollment
-        // gate either: the operator chose this, so honour it, but say so on every
-        // release. A journal line is the only durable record that a stored
-        // credential left the TPM behind a gate the operator weakened. A global
-        // opt-out does NOT cancel a user's own `require_challenge`, which still
-        // runs below, so the warning is limited to the genuinely ungated case.
-        if !enr.require_challenge
-            && matches!(
-                purpose,
-                AuthenticationPurpose::CredentialRelease {
-                    temporal_challenge: false
-                }
-            )
-        {
-            eprintln!(
-                "irlumed: WARNING: credential release WITHOUT a temporal challenge \
-                 ({key}=off): a static IR print that passes the face checks can \
-                 release this password. Re-enable: sudo irlume \
-                 credential-release-challenge on",
-                key = irlume_common::config::CREDENTIAL_RELEASE_CHALLENGE_KEY
-            );
-        }
-        // Opt-in per-enrollment gate (ADR-0002): a natural blink, unchanged. When
-        // IR or the FaceMesh model is missing it logs and skips rather than lock
-        // a user out of an undeployed model.
-        if !enr.require_challenge {
-            return Ok(outcome);
-        }
-        if !self.ir_available || self.mesh.is_none() {
-            // The user OPTED INTO the challenge, but it cannot run here (no IR,
-            // or face_landmark.onnx is not deployed). Fail CLOSED to the
-            // password rather than grant a face match weaker than they asked
-            // for. The password always works, so this is a fallback, not a
-            // lockout. (Was a silent skip-and-grant; the security audit flagged
-            // it as failing open on an explicit security opt-in.)
-            let why = if self.mesh.is_none() {
-                "face_landmark.onnx is not loaded (set IRLUME_MESH_MODEL)"
-            } else {
-                "this camera has no IR"
-            };
-            eprintln!(
-                "irlumed: passive liveness (require-challenge) is on but {why}; \
-                 denying, use your password"
-            );
-            return Ok(Outcome::deny_live(
-                OutcomeKind::OtherDeny,
-                outcome.score,
-                "passive liveness is required for this profile but cannot run here; use your password",
-            ));
-        }
-        use irlume_liveness::BlinkResult;
-        Ok(match self.run_passive_liveness()? {
-            BlinkResult::Blinked => outcome,
-            BlinkResult::NoBlink => Outcome::deny_live(
-                OutcomeKind::OtherDeny,
-                outcome.score,
-                "passive liveness: no natural blink in the window; look at the camera a moment longer",
-            ),
-            BlinkResult::NoEyes => Outcome {
-                granted: false, live: false, score: outcome.score,
-                reason: "passive liveness: no live eyes (looks like a print/no face)".into(),
-                kind: OutcomeKind::OtherDeny,
-            },
-        })
+        // No gesture is demanded here. Releasing the keyring with no nod is the
+        // DEFAULT now (a greeter cold login and logout release after the face
+        // match; the gesture is intent, not the anti-print layer, so there is
+        // nothing to warn about on every release). The blink `require_challenge`
+        // gate is gone; the consent gesture gate above covers the AppConsent and
+        // CredentialRelease paths when their policy asks for it, and the Verify
+        // path is gated per service. run_passive_liveness / capture_ear_samples
+        // stay for require_eyes_open.
+        Ok(outcome)
     }
 
     /// The forced consent gate: require a DELIBERATE gesture before approving a
@@ -2806,6 +2888,13 @@ impl Engine {
         if self.consent_watch(max_frames, allow_nod, closure_cal)? {
             irlume_common::dlog!("consent: gesture seen after the match");
             Ok(outcome)
+        } else if self.gesture_cancelled {
+            irlume_common::dlog!("consent: head shake cancelled the request");
+            // GestureDeclined via the shared constructor, not the local `deny`
+            // (which is OtherDeny): a deliberate shake is reported distinctly so
+            // pam_irlume can abort a polkit dialog on it, and only it. Carries the
+            // take's live/score, as the local `deny` would.
+            Ok(Outcome::gesture_declined(live, score))
         } else {
             Ok(deny(match mode {
                 ConsentGesture::Nod => "keep nodding your head to approve",
@@ -2916,8 +3005,19 @@ impl Engine {
         // grace window can hold several attempts and none of them should re-ask
         // for a gesture already given.
         self.gesture_seen_before_match = false;
-        if purpose.demands_gesture() {
+        self.gesture_cancelled = false;
+        if purpose.demands_gesture(service) {
             self.gesture_seen_before_match = self.early_consent_watch(&enr)?;
+            // A head-shake during the pre-match watch is an explicit decline.
+            // Close the request now: do not spend the capture and match only to
+            // deny after a second post-match watch, and do not let a later cue
+            // override the decline. `early_consent_watch` sets `gesture_cancelled`
+            // via `consent_watch` when the shake fires.
+            if self.gesture_cancelled {
+                irlume_common::dlog!("consent: head shake before the match cancelled the request");
+                // A pre-match shake never reached matching: no live face, no score.
+                return Ok(Outcome::gesture_declined(false, 0.0));
+            }
         }
         // Hold the camera sessions across the grace window's retries. Every retry
         // otherwise re-opens, re-negotiates, re-maps and re-warms both streams
@@ -2969,7 +3069,7 @@ impl Engine {
         let mut attempt = 0u32;
         let out = loop {
             attempt += 1;
-            let out = self.authenticate_once(&enr, purpose, &mut held)?;
+            let out = self.authenticate_once(&enr, purpose, service, &mut held)?;
             if !presence_retryable(&out) || std::time::Instant::now() >= deadline {
                 if attempt > 1 {
                     irlume_common::dlog!(
@@ -2997,6 +3097,7 @@ impl Engine {
         &mut self,
         enr: &irlume_core::storage::Enrollment,
         purpose: AuthenticationPurpose,
+        service: Option<&str>,
         held: &mut Option<(
             &mut irlume_camera::RgbSession<'_>,
             &mut irlume_camera::IrSession<'_>,
@@ -3105,6 +3206,7 @@ impl Engine {
                 return self.challenge_if_required(
                     enr,
                     purpose,
+                    service,
                     Outcome::grant(score, format!("match: {who} (rgb)")),
                 );
             }
@@ -3136,7 +3238,9 @@ impl Engine {
                         *held = None;
                         return self.challenge_if_required(
                     enr,
-                    purpose, Outcome::grant(f.prob,
+                    purpose,
+                    service,
+                    Outcome::grant(f.prob,
                             format!("match: {who} (rgb+ir fusion p={:.2}; rgb {score:.2}/ir {ir_score:.2})", f.prob)));
                     }
                     // (b) pure IR fallback: still valid when IR alone is clearly strong
@@ -3157,7 +3261,9 @@ impl Engine {
                         *held = None;
                         return self.challenge_if_required(
                     enr,
-                    purpose, Outcome::grant(ir_score,
+                    purpose,
+                    service,
+                    Outcome::grant(ir_score,
                             format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})")));
                     }
                     // (c) calibrated-centroid fallback (ADR-0004): the mean-
@@ -3171,7 +3277,9 @@ impl Engine {
                             *held = None;
                             return self.challenge_if_required(
                     enr,
-                    purpose, Outcome::grant(*cs,
+                    purpose,
+                    service,
+                    Outcome::grant(*cs,
                                 format!("match: {cwho} (calibrated centroid, dim light; rgb {score:.2}<{thr:.2})")));
                         }
                     }
@@ -3306,6 +3414,7 @@ impl Engine {
                 return self.challenge_if_required(
                     enr,
                     purpose,
+                    service,
                     Outcome::grant(score, format!("match: {who} (ir/dark)")),
                 );
             }
@@ -3317,6 +3426,7 @@ impl Engine {
                     return self.challenge_if_required(
                         enr,
                         purpose,
+                        service,
                         Outcome::grant(
                             *cs,
                             format!("match: {cwho} (ir/dark, calibrated centroid)"),
@@ -3328,6 +3438,7 @@ impl Engine {
             return self.challenge_if_required(
                 enr,
                 purpose,
+                service,
                 Outcome::deny_live(OutcomeKind::BelowThreshold, score, "below threshold (ir)"),
             );
         }
@@ -5195,6 +5306,37 @@ mod tests {
     /// parallel test threads. Engine tests share it via `super::tests`.
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// A head-shake decline is TERMINAL: `resolve_consent_watch` returns the
+    /// stream's `Some(false)` verdict without evaluating the completed-take
+    /// closure, so a completed-take nod or closure reading can never overturn a
+    /// decline into a grant. The panicking closures prove the completed take is
+    /// not consulted for either `Some` outcome; before the fix a shake fell
+    /// through to it and a take carrying the shake motion could be re-read as an
+    /// approval. Only a budget-exhausted `None` consults the boundary check.
+    #[test]
+    fn shake_decline_is_terminal_and_skips_completed_take() {
+        assert!(
+            !resolve_consent_watch(Some(false), || panic!(
+                "a decline must not evaluate the completed take"
+            )),
+            "a head-shake decline must resolve to false"
+        );
+        assert!(
+            resolve_consent_watch(Some(true), || panic!(
+                "an in-loop accept must not evaluate the completed take"
+            )),
+            "an in-loop accept must resolve to true"
+        );
+        assert!(
+            resolve_consent_watch(None, || true),
+            "budget exhausted defers to the completed-take check"
+        );
+        assert!(
+            !resolve_consent_watch(None, || false),
+            "budget exhausted with no completed-take gesture is a miss"
+        );
+    }
+
     /// `Misconfigured` permits NO gesture, which is the entire reason the
     /// variant exists.
     ///
@@ -5537,6 +5679,53 @@ mod tests {
     }
 
     #[test]
+    fn only_a_gesture_decline_is_a_gesture_decline() {
+        // The wire boundary: pam_irlume aborts a polkit dialog on `declined_by_gesture`
+        // and nothing else, so `is_gesture_decline` must read true for a deliberate
+        // shake and false for every other refusal (a timeout, a no-match, a caught
+        // spoof, a policy denial). A mutant that matched OtherDeny (the class the
+        // shake used before this feature) would abort a dialog on an ordinary denial.
+        assert!(is_gesture_decline(&Outcome::deny(
+            OutcomeKind::GestureDeclined,
+            "head shake cancelled the request"
+        )));
+        for kind in [
+            OutcomeKind::NoFace,
+            OutcomeKind::Uncertain,
+            OutcomeKind::SpoofNoIrFace,
+            OutcomeKind::Spoof,
+            OutcomeKind::BelowThreshold,
+            OutcomeKind::OtherDeny,
+        ] {
+            assert!(
+                !is_gesture_decline(&Outcome::deny(kind, "x")),
+                "{kind:?} must not read as a gesture decline"
+            );
+        }
+        assert!(!is_gesture_decline(&Outcome::grant(0.9, "match")));
+    }
+
+    #[test]
+    fn a_shake_decline_reads_as_a_gesture_decline() {
+        // Pins the shared shake-outcome constructor: BOTH shake sites build their
+        // Outcome here, so a revert of this kind to OtherDeny would stop the daemon
+        // setting declined_by_gesture and silently kill the feature, yet every other
+        // camera-less test would stay green. Also pins the reason and that a
+        // pre-match shake carries no live face and no score.
+        let pre = Outcome::gesture_declined(false, 0.0);
+        assert!(
+            is_gesture_decline(&pre),
+            "a shake decline is a gesture decline"
+        );
+        assert_eq!(pre.reason, "head shake cancelled the request");
+        assert!(!pre.granted && !pre.live && pre.score == 0.0);
+        // The post-match variant carries the take's live/score but is still a decline.
+        let post = Outcome::gesture_declined(true, 0.42);
+        assert!(is_gesture_decline(&post));
+        assert!(!post.granted && post.live && post.score == 0.42);
+    }
+
+    #[test]
     fn grace_retries_only_presence_failures() {
         use irlume_liveness::Verdict;
         // Retryable: the user simply was not usably in frame yet. Strings are
@@ -5836,7 +6025,6 @@ mod tests {
         let enr = Enrollment {
             user: "u".into(),
             require_eyes_open: false,
-            require_challenge: false,
             camera_binding: None,
             closure_calibration: None,
             profiles: vec![
@@ -7146,6 +7334,58 @@ mod tests {
         assert!(both_eyes_open(&open, 64, 48, &lm, Some(255)));
     }
 
+    /// The ceiling test is `peak >= ceiling`, not `peak == ceiling`: a
+    /// limited-range stream rails at 235, so a window peaking ABOVE it (240) is
+    /// railed and must read not-open. The railed test above only exercises
+    /// peak == ceiling == 255, which a `>=` -> `==` mutant also satisfies
+    /// (pattern #28), leaving every 235-ceiling device's #386 fail-open uncaught.
+    #[test]
+    fn a_window_above_a_limited_range_ceiling_reads_not_open() {
+        let (mut grey, lm) = ir_frame_with_glints(false, false);
+        for &(ex, ey) in &lm[0..2] {
+            let (cx, cy) = (ex as usize, ey as usize);
+            for dy in 0..3usize {
+                for dx in 0..3usize {
+                    grey[(cy + dy - 1) * 64 + (cx + dx - 1)] = 240;
+                }
+            }
+        }
+        assert!(
+            !both_eyes_open(&grey, 64, 48, &lm, Some(235)),
+            "peak 240 is at or above the 235 ceiling; == would let it through"
+        );
+        // The same buffer under a 255 ceiling: 240 is genuinely sub-ceiling, so
+        // it passes, proving the refusal is the ceiling comparison and not a
+        // blanket denial of a 240 peak.
+        assert!(
+            both_eyes_open(&grey, 64, 48, &lm, Some(255)),
+            "peak 240 < ceiling 255 is a real sub-ceiling window"
+        );
+    }
+
+    /// ONE non-finite landmark coordinate must fail closed, not only an all-NaN
+    /// pair. `x.is_finite() && y.is_finite()` flipped to `||` lets a (NaN, y)
+    /// landmark through; the NaN then saturates to x=0 and the gate reads the
+    /// frame edge as an eye. The all-NaN test cannot see this: (NaN,NaN) is false
+    /// under `||` too, so both original and mutant fail closed there.
+    #[test]
+    fn a_single_non_finite_eye_coordinate_fails_closed() {
+        let (mut grey, mut lm) = ir_frame_with_glints(true, true);
+        let ey = lm[0].1 as usize;
+        // Make the left edge at that row bright, so a mutant that lets the NaN
+        // through would read x=0 as an open eye.
+        for dy in 0..3usize {
+            for x in 0..3usize {
+                grey[(ey + dy - 1) * 64 + x] = 255;
+            }
+        }
+        lm[0] = (f32::NAN, lm[0].1);
+        assert!(
+            !both_eyes_open(&grey, 64, 48, &lm, None),
+            "a landmark we cannot place is an eye we cannot verify: fail closed"
+        );
+    }
+
     /// The other half of #386, which the test above cannot see. Rejecting a
     /// railed peak is worth nothing if the gate is handed the SUBTRACTED frame,
     /// because subtraction moves every railed 255 to 254: under the ceiling and
@@ -7952,20 +8192,21 @@ mod engine_tests {
         let granted = || Outcome::grant(0.9, "match");
         let out = s
             .engine
-            .challenge_if_required(&enr, AuthenticationPurpose::AppConsent, granted())
+            .challenge_if_required(&enr, AuthenticationPurpose::AppConsent, None, granted())
             .unwrap();
         assert!(!out.granted, "forced gate must fail closed without IR");
         assert!(out.reason.contains("consent gesture"), "{}", out.reason);
-        let mut opt_in = Enrollment::new("irlume-test-consent");
-        opt_in.require_challenge = true;
+        // A plain Verify with no service demands no gesture, so it grants.
         let out = s
             .engine
-            .challenge_if_required(&opt_in, AuthenticationPurpose::Verify, granted())
+            .challenge_if_required(
+                &Enrollment::new("irlume-test-consent"),
+                AuthenticationPurpose::Verify,
+                None,
+                granted(),
+            )
             .unwrap();
-        assert!(
-            !out.granted,
-            "opt-in path also fails closed when the gate can't run"
-        );
+        assert!(out.granted, "plain Verify must not gate: {}", out.reason);
 
         teardown_sandbox(&dir);
     }
@@ -7973,66 +8214,47 @@ mod engine_tests {
     /// The credential-release gate, purpose by purpose, on an IR-less engine (so
     /// a required gesture always fails and the deny reason names which gate ran).
     ///
-    /// The contract: a credential release with the challenge ON demands the
-    /// deliberate gesture even for an enrollment that opted into nothing; with the
-    /// challenge OFF it falls back to exactly the per-enrollment behaviour, which a
-    /// global opt-out must not cancel. Verify is untouched either way.
+    /// The contract: a credential release whose `temporal_challenge` is ON demands
+    /// the deliberate gesture; with it OFF (the default) the release grants after
+    /// the match. Verify is untouched either way. The purpose carries the resolved
+    /// setting explicitly, so this pins the arm independent of the config default.
     #[test]
-    fn credential_release_requires_the_gesture_by_default_and_honours_the_opt_out() {
+    fn credential_release_gates_on_the_temporal_challenge_flag() {
         let _g = env_guard();
         let mut s = shared();
         let dir = state_sandbox("credrelease");
 
         let plain = Enrollment::new("irlume-test-credrel");
-        let mut opted_in = Enrollment::new("irlume-test-credrel");
-        opted_in.require_challenge = true;
         let grant = || Outcome::grant(0.9, "match");
         let release = |on: bool| AuthenticationPurpose::CredentialRelease {
             temporal_challenge: on,
         };
 
-        // Challenge ON (the default) + an enrollment that opted into nothing:
-        // the deliberate gesture is still required, and fails closed here.
+        // temporal_challenge ON: the deliberate gesture is required, and fails
+        // closed here (IR-less).
         let out = s
             .engine
-            .challenge_if_required(&plain, release(true), grant())
+            .challenge_if_required(&plain, release(true), None, grant())
             .unwrap();
-        assert!(!out.granted, "default-on release must gate: {}", out.reason);
+        assert!(!out.granted, "an on release must gate: {}", out.reason);
         assert!(
             out.reason.contains("consent gesture"),
             "the gesture gate must be the one that ran: {}",
             out.reason
         );
 
-        // Challenge OFF + no per-enrollment opt-in: today's behaviour, a grant.
+        // temporal_challenge OFF (the default): a grant, no gesture.
         let out = s
             .engine
-            .challenge_if_required(&plain, release(false), grant())
+            .challenge_if_required(&plain, release(false), None, grant())
             .unwrap();
-        assert!(out.granted, "opt-out must not add a gate: {}", out.reason);
+        assert!(out.granted, "an off release must not gate: {}", out.reason);
 
-        // Challenge OFF + the user's own require_challenge: the global opt-out
-        // does NOT cancel it. The passive gate runs, and fails closed IR-less.
-        let out = s
-            .engine
-            .challenge_if_required(&opted_in, release(false), grant())
-            .unwrap();
-        assert!(
-            !out.granted,
-            "a global opt-out must not cancel require_challenge: {}",
-            out.reason
-        );
-        assert!(
-            out.reason.contains("passive liveness"),
-            "the per-enrollment gate must be the one that ran: {}",
-            out.reason
-        );
-
-        // Verify is unchanged by either setting: no opt-in, no gate.
+        // Verify is unchanged: no service, no gate.
         for purpose in [AuthenticationPurpose::Verify, release(false)] {
             assert!(
                 s.engine
-                    .challenge_if_required(&plain, purpose, grant())
+                    .challenge_if_required(&plain, purpose, None, grant())
                     .unwrap()
                     .granted,
                 "{purpose:?} must not gate a plain enrollment"
@@ -8044,7 +8266,7 @@ mod engine_tests {
         let denied = Outcome::deny_live(OutcomeKind::BelowThreshold, 0.1, "below threshold");
         let out = s
             .engine
-            .challenge_if_required(&plain, release(true), denied)
+            .challenge_if_required(&plain, release(true), None, denied)
             .unwrap();
         assert!(!out.granted);
         assert!(
@@ -8061,7 +8283,7 @@ mod engine_tests {
         s.engine.gesture_seen_before_match = true;
         let out = s
             .engine
-            .challenge_if_required(&plain, release(true), grant())
+            .challenge_if_required(&plain, release(true), None, grant())
             .unwrap();
         assert!(
             out.granted,
@@ -8074,7 +8296,7 @@ mod engine_tests {
         s.engine.gesture_seen_before_match = false;
         let out = s
             .engine
-            .challenge_if_required(&plain, release(true), grant())
+            .challenge_if_required(&plain, release(true), None, grant())
             .unwrap();
         assert!(
             !out.granted,
@@ -8083,12 +8305,120 @@ mod engine_tests {
         );
 
         // demands_gesture is the whole policy surface; pin it.
-        assert!(!AuthenticationPurpose::Verify.demands_gesture());
-        assert!(AuthenticationPurpose::AppConsent.demands_gesture());
-        assert!(release(true).demands_gesture());
-        assert!(!release(false).demands_gesture());
+        assert!(!AuthenticationPurpose::Verify.demands_gesture(None));
+        assert!(AuthenticationPurpose::AppConsent.demands_gesture(None));
+        assert!(release(true).demands_gesture(None));
+        assert!(!release(false).demands_gesture(None));
 
         teardown_sandbox(&dir);
+    }
+
+    /// polkit is app-consent, which defaults the gesture ON, but an explicit
+    /// `service_gesture.polkit-1=0` must turn it OFF: the CLI writes that key and
+    /// reports it disabled, and before the fix the AppConsent arm was an
+    /// unconditional `true` that ignored it. Absent or `=1` keeps the gesture.
+    #[test]
+    fn app_consent_honors_the_polkit_service_override() {
+        let _g = env_guard();
+        let dir =
+            std::env::temp_dir().join(format!("irlume-auth-polkitovr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        let ac = AuthenticationPurpose::AppConsent;
+        assert!(
+            ac.demands_gesture(Some("polkit-1")),
+            "no override: app-consent must default the gesture ON"
+        );
+        std::fs::write(dir.join("settings.conf"), "service_gesture.polkit-1=0\n").unwrap();
+        assert!(
+            !ac.demands_gesture(Some("polkit-1")),
+            "service_gesture.polkit-1=0 must disable the gesture"
+        );
+        std::fs::write(dir.join("settings.conf"), "service_gesture.polkit-1=1\n").unwrap();
+        assert!(
+            ac.demands_gesture(Some("polkit-1")),
+            "service_gesture.polkit-1=1 must require the gesture"
+        );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The call-site WIRING of `demands_gesture`, not just the
+    /// `service_gesture_default` helper (pattern #75). The `None`-only
+    /// assertions elsewhere are satisfied by a mutant that drops the Verify arm
+    /// (returns `false`) or the CredentialRelease per-service override branch, so
+    /// this pins the two arms through a real service and a real settings.conf.
+    #[test]
+    fn demands_gesture_wires_verify_and_credential_release() {
+        let _g = env_guard();
+        let dir = std::env::temp_dir().join(format!("irlume-auth-dgwire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
+
+        let verify = AuthenticationPurpose::Verify;
+        let release = |on| AuthenticationPurpose::CredentialRelease {
+            temporal_challenge: on,
+        };
+
+        // Verify arm: an elevation service demands the gesture by default, a
+        // non-elevation service does not, and the per-service override wins.
+        assert!(
+            verify.demands_gesture(Some("sudo")),
+            "sudo (elevation) must default the gesture ON"
+        );
+        assert!(
+            verify.demands_gesture(Some("su-l")),
+            "su - (service su-l) must default ON via the shared classifier"
+        );
+        assert!(
+            !verify.demands_gesture(Some("kde")),
+            "a lock screen must default OFF"
+        );
+        assert!(!verify.demands_gesture(None), "no service demands nothing");
+        std::fs::write(dir.join("settings.conf"), "service_gesture.sudo=0\n").unwrap();
+        assert!(
+            !verify.demands_gesture(Some("sudo")),
+            "service_gesture.sudo=0 must disable it"
+        );
+
+        // CredentialRelease arm: the per-service credential_release override
+        // wins over the temporal_challenge fallback, both directions.
+        std::fs::write(
+            dir.join("settings.conf"),
+            "service_gesture.credential_release=1\n",
+        )
+        .unwrap();
+        assert!(
+            release(false).demands_gesture(None),
+            "credential_release=1 must win over temporal_challenge=false"
+        );
+        std::fs::write(
+            dir.join("settings.conf"),
+            "service_gesture.credential_release=0\n",
+        )
+        .unwrap();
+        assert!(
+            !release(true).demands_gesture(None),
+            "credential_release=0 must win over temporal_challenge=true"
+        );
+        // No override: the arm falls back to temporal_challenge.
+        let _ = std::fs::remove_file(dir.join("settings.conf"));
+        assert!(
+            release(true).demands_gesture(None),
+            "no override falls back to temporal_challenge=true"
+        );
+        assert!(
+            !release(false).demands_gesture(None),
+            "no override falls back to temporal_challenge=false"
+        );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// THE invariant behind a default-on gate: with the challenge required, NO
@@ -8127,7 +8457,7 @@ mod engine_tests {
                 // would let the stage pass without exercising its branch at all.
                 let assert_no_grant =
                     |engine: &mut Engine, stage: &str, err_must_say: &str| match engine
-                        .challenge_if_required(enr, release, Outcome::grant(0.95, "match"))
+                        .challenge_if_required(enr, release, None, Outcome::grant(0.95, "match"))
                     {
                         Ok(o) => assert!(
                             !o.granted,
@@ -8279,58 +8609,6 @@ mod engine_tests {
     }
 
     #[test]
-    fn challenge_gate_only_arms_when_grant_flag_and_hardware_align() {
-        let _g = env_guard();
-        let mut s = shared();
-        let enr_flag = |flag: bool| {
-            let mut e = Enrollment::new("u");
-            e.require_challenge = flag;
-            e
-        };
-        let grant = || Outcome::grant(0.9, "match: p (rgb)");
-        // A denial is never escalated into a challenge.
-        let denied = Outcome::deny_live(OutcomeKind::BelowThreshold, 0.0, "below threshold (ir)");
-        let o = s
-            .engine
-            .challenge_if_required(&enr_flag(true), AuthenticationPurpose::Verify, denied)
-            .unwrap();
-        assert!(!o.granted);
-        // Grant without the opt-in flag: passes through untouched.
-        let o = s
-            .engine
-            .challenge_if_required(&enr_flag(false), AuthenticationPurpose::Verify, grant())
-            .unwrap();
-        assert!(o.granted);
-        // Flag on but no IR hardware (convenience tier): the blink challenge
-        // cannot run, so it FAILS CLOSED to the password (a user who opted into
-        // the challenge does not get a weaker grant when it cannot run).
-        assert!(!s.engine.ir_available);
-        let o = s
-            .engine
-            .challenge_if_required(&enr_flag(true), AuthenticationPurpose::Verify, grant())
-            .unwrap();
-        assert!(!o.granted, "no-IR + require-challenge must fail closed");
-        // Flag on + IR + no mesh model deployed: also fails closed to password.
-        s.engine.ir_available = true;
-        let mesh = s.engine.mesh.take();
-        let o = s
-            .engine
-            .challenge_if_required(&enr_flag(true), AuthenticationPurpose::Verify, grant())
-            .unwrap();
-        assert!(!o.granted, "require-challenge + no mesh must fail closed");
-        // Flag on + IR + mesh loaded: the passive-liveness capture actually
-        // runs, and fails hard without a camera (a grant is never released on
-        // an unverifiable challenge).
-        s.engine.mesh = mesh;
-        let err = s
-            .engine
-            .challenge_if_required(&enr_flag(true), AuthenticationPurpose::Verify, grant())
-            .unwrap_err();
-        assert!(err.to_string().contains("no camera found"), "{err}");
-        s.engine.ir_available = false; // restore the shared baseline
-    }
-
-    #[test]
     fn passive_liveness_without_mesh_reports_no_eyes() {
         let _g = env_guard();
         let mut s = shared();
@@ -8421,7 +8699,6 @@ mod engine_tests {
             &Enrollment {
                 user: "lbuser".into(),
                 require_eyes_open: false,
-                require_challenge: false,
                 camera_binding: None,
                 closure_calibration: None,
                 profiles: vec![FaceProfile {
@@ -8573,5 +8850,45 @@ mod engine_tests {
             })
             .collect();
         assert!(!completed_consent_take_hit(false, true, &poses, &[], None));
+    }
+
+    /// The CLOSURE operand of the completed-take evaluation, which every other
+    /// completed_take_* test leaves unexercised by passing `None` for closure_cal
+    /// (pattern #75/#28). A closure-calibrated user whose eyes stayed OPEN made no
+    /// gesture, so the take must NOT fire; the fail-open mutant that drops the
+    /// `== Blinked` check (`is_some_and` -> `is_some`) returns true here and is
+    /// caught. This would otherwise release the sealed credential to a user who
+    /// never closed their eyes.
+    #[test]
+    fn completed_take_closure_operand_needs_an_actual_closure() {
+        let cal = irlume_liveness::ClosureCalibration {
+            ear_open: 0.30,
+            ear_closed: 0.05,
+        };
+        assert!(
+            cal.is_usable(),
+            "the calibration must be usable or the operand is skipped upstream"
+        );
+        // Eyes open the whole take: no closure, so no deliberate-closure gesture.
+        let open: Vec<irlume_liveness::EarSample> = (0..20)
+            .map(|idx| irlume_liveness::EarSample {
+                idx,
+                ear: Some(0.30),
+                bri: 60.0,
+                cx: 0.5,
+                cy: 0.5,
+                fsize: 0.3,
+                contrast: 40.0,
+            })
+            .collect();
+        assert_ne!(
+            irlume_liveness::detect_deliberate_closure(&open, &cal),
+            irlume_liveness::BlinkResult::Blinked,
+            "open eyes are not a closure gesture (test premise)"
+        );
+        assert!(
+            !completed_consent_take_hit(false, false, &[], &open, Some(&cal)),
+            "a usable calibration with no closure must not satisfy the take"
+        );
     }
 }

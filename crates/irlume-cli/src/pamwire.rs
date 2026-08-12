@@ -302,7 +302,17 @@ fn reconcile() -> ExitCode {
 /// active DM actually consults, so reconcile repairs the login that matters. An
 /// absent active-greeter file counts as not-wired too (a deleted /etc override).
 /// Falls back to `login_wired()` when the active DM is unknown/absent.
-fn active_login_wired() -> bool {
+/// Does the KDE lock-screen override actually carry the module right now?
+///
+/// The self-heal marker records this so a later absence is only a regression
+/// when the line was ours to maintain. Both apply paths must record what is
+/// WIRED rather than what was asked for: writing `with_lock=true` on a host that
+/// wires no lock screen makes reconcile chase a surface that was never there.
+pub(crate) fn lock_wired() -> bool {
+    Path::new(LOCKSCREEN.etc).exists() && file_has_module(Path::new(LOCKSCREEN.etc))
+}
+
+pub(crate) fn active_login_wired() -> bool {
     let Some(dm) = active_display_manager() else {
         return login_wired();
     };
@@ -822,7 +832,7 @@ fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut S
         );
     }
     if polkit_in_scope(enable, with_polkit) {
-        visit(&POLKIT, ROLE_POLKIT, &wire_verify_service, true);
+        visit(&POLKIT, ROLE_POLKIT, &wire_polkit_service, true);
     }
 }
 
@@ -944,6 +954,47 @@ pub(crate) fn prepare(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<A
 /// only moment it exists to be read; afterwards the file has already changed.
 /// Every surface is recorded even when a later one fails, since a partial apply
 /// is exactly the case a rollback has to be able to undo.
+/// The record for a surface irlume REFUSED to touch (a symlink, or a file with
+/// more than one name).
+///
+/// It reports what is on disk, not "absent". The rollback precheck compares each
+/// recorded after-digest against the live file, so claiming absence about a file
+/// that exists made the whole transaction read as drift and refuse to roll back,
+/// which is exactly when a partly applied enable needs undoing. `before: None`
+/// also means "remove it" to a restore, the opposite of leaving it alone.
+fn refused_surface_record(
+    svc: &Svc,
+    role: &'static str,
+    path: &Path,
+    message: String,
+) -> AppliedSurface {
+    let current = std::fs::read_to_string(path).ok();
+    let current_meta = std::fs::symlink_metadata(path).ok().as_ref().map(|m| {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        (m.permissions().mode() & 0o7777, m.uid(), m.gid())
+    });
+    AppliedSurface {
+        id: service_name(svc.etc),
+        role,
+        path: svc.etc.to_string(),
+        change: PlannedChange::NotInstalled,
+        before: current,
+        before_metadata: current_meta,
+        sidecar_before: None,
+        sidecar_metadata: None,
+        sidecar_existed: false,
+        // The digest shape the applied path records and the precheck compares:
+        // the live file alone, not the live+backup pair `surface_state` makes.
+        after_sha256: match std::fs::read(path) {
+            Ok(bytes) => crate::logintx::sha256_hex(&bytes),
+            Err(_) => crate::logintx::ABSENT.to_string(),
+        },
+        sidecar_after_sha256: None,
+        error: Some(message),
+    }
+}
+
 pub(crate) fn apply(
     enable: bool,
     with_sudo: bool,
@@ -977,20 +1028,7 @@ pub(crate) fn apply(
             // this check did not: a rename replaces one directory entry and
             // leaves every other name for the inode on the old content.
             if let Err(message) = inspect_target(path) {
-                out.push(AppliedSurface {
-                    id: service_name(svc.etc),
-                    role,
-                    path: svc.etc.to_string(),
-                    change: PlannedChange::NotInstalled,
-                    before: None,
-                    before_metadata: None,
-                    sidecar_before: None,
-                    sidecar_metadata: None,
-                    sidecar_existed: false,
-                    after_sha256: crate::logintx::ABSENT.to_string(),
-                    sidecar_after_sha256: None,
-                    error: Some(message),
-                });
+                out.push(refused_surface_record(svc, role, path, message));
                 return;
             }
             let planned_state = expected
@@ -1259,14 +1297,19 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
         }
     }
     if polkit_in_scope(enable, with_polkit) {
-        match wire_service(&POLKIT, enable, apply, &wire_verify_service) {
+        match wire_service(&POLKIT, enable, apply, &wire_polkit_service) {
             Ok(msg) => {
                 println!("  {msg}");
                 if enable && apply {
+                    // The nod is the default gesture and needs NO calibration;
+                    // `calibrate-closure` teaches the optional eye-closure
+                    // alternative. This line used to present the calibration as a
+                    // prerequisite and the closure as the way to approve, which
+                    // sent every new polkit user through a step they did not need.
                     println!(
-                        "    polkit prompts (Bitwarden unlock, pkexec) will accept your face once\n    \
-                         you calibrate the consent gesture:  sudo irlume calibrate-closure\n    \
-                         Then approve a prompt by closing your eyes for ~1s and opening them."
+                        "    polkit prompts (Bitwarden unlock, pkexec) now take your face.\n    \
+                         Keep nodding to approve; shake your head to decline.\n    \
+                         No calibration needed. Optional eye-closure alternative:  sudo irlume calibrate-closure"
                     );
                 }
             }
@@ -1293,7 +1336,22 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
         // after a distro update rewrites a greeter's PAM file out from under us
         // (authselect, pam-auth-update, or a package upgrade shipping a fresh
         // vendor copy). On disable we clear the marker so reconcile stays quiet.
-        write_wired_marker(enable, with_sudo, with_polkit, want_face_lock);
+        // Record what is WIRED, not what this invocation asked for. The scopes are
+        // opt-in and independent: `login enable --with-polkit --apply` followed by
+        // `login enable --with-sudo --apply` leaves polkit's stack wired (the
+        // second run does not touch it, `polkit_in_scope` is false without the
+        // flag) while the marker from that run said `with_polkit=false`. Reconcile
+        // reads the marker, so the surface silently dropped out of the self-heal
+        // and a later distro PAM rewrite would strip irlume from it for good.
+        // Observed the same way `reconcile`'s adopt path already does it.
+        if enable {
+            let obs_sudo = Path::new(SUDO).exists() && file_has_module(Path::new(SUDO));
+            let obs_polkit = polkit_wired() == Some(true);
+            let obs_lock = lock_wired();
+            write_wired_marker(enable, obs_sudo, obs_polkit, obs_lock);
+        } else {
+            write_wired_marker(enable, with_sudo, with_polkit, want_face_lock);
+        }
         // Say it at the moment the user wired it, not only when they next run
         // `login status`: a wallet that still prompts after `enable --apply`
         // otherwise reads as irlume having failed.
@@ -1536,6 +1594,13 @@ fn wire_service(
                 let bak_content = read(&bak.to_string_lossy())?;
                 if stripped == bak_content {
                     if apply {
+                        // The same refusal every other write path in this module
+                        // applies. A rename over a SYMLINK replaces the link with
+                        // a regular file, and a multiply-linked PAM file loses a
+                        // name irlume cannot put back; both are exactly what
+                        // `inspect_target` exists to stop, and this restore was
+                        // the one path that skipped it.
+                        inspect_target(etc)?;
                         std::fs::rename(&bak, etc)
                             .map_err(|e| format!("restore {}: {e}", s.etc))?;
                     }
@@ -1649,8 +1714,21 @@ fn selinux(enable: bool, apply: bool) -> Result<String, String> {
             return Ok("· SELinux module not loaded".into());
         }
         if apply {
-            let _ = Command::new("semodule").args(["-r", "irlume"]).status();
-            Ok("✓ SELinux module removed".into())
+            // Checked, like the install side a few lines above. Discarding the
+            // status and printing the tick regardless told the operator the
+            // module was gone whenever `semodule -r` failed (policy busy, an
+            // selinux-policy version that refuses, no semodule at all), and the
+            // next `login status` would then disagree with the line they had
+            // just been shown.
+            match Command::new("semodule").args(["-r", "irlume"]).status() {
+                Ok(st) if st.success() => Ok("✓ SELinux module removed".into()),
+                Ok(st) => Err(format!(
+                    "semodule -r irlume failed ({st}); the module is still loaded"
+                )),
+                Err(e) => Err(format!(
+                    "could not run semodule ({e}); the module is still loaded"
+                )),
+            }
         } else {
             Ok("→ would remove the SELinux module (if loaded)".into())
         }
@@ -2419,6 +2497,84 @@ mod tests {
         let (out, changed) = wire_verify_service(stock);
         assert!(!changed);
         assert_eq!(out, stock);
+    }
+
+    #[test]
+    fn polkit_service_inserts_the_abort_die_stanza() {
+        // A shake must be able to CLOSE the polkit dialog, which needs the control
+        // to `die` on PAM_ABORT; a plain `sufficient` `default=ignore`s it (pam.conf
+        // (5)). So the polkit stanza carries `abort=die`, unlike sudo's `sufficient`.
+        for stock in [
+            "#%PAM-1.0\nauth       include      system-auth\naccount    include      system-auth\n",
+            "#%PAM-1.0\n@include common-auth\n@include common-account\n",
+        ] {
+            let (wired, changed) = wire_polkit_service(stock);
+            assert!(changed, "{stock:?}");
+            let face = wired
+                .lines()
+                .find(|l| l.contains(MODULE))
+                .expect("stanza present");
+            assert!(
+                face.contains("abort=die"),
+                "polkit line must die on abort: {face}"
+            );
+            assert!(!face.contains("unseal"), "polkit is verify-only: {face}");
+            // Above the first non-irlume auth anchor, like the sudo verify stanza.
+            let face_i = wired.lines().position(|l| l.contains(MODULE)).unwrap();
+            let anchor_i = wired
+                .lines()
+                .position(|l| {
+                    !l.contains(MODULE) && (l.starts_with("auth") || l.starts_with("@include"))
+                })
+                .unwrap();
+            assert!(face_i < anchor_i, "{wired}");
+            // Idempotent and fully reversible.
+            assert!(
+                !wire_polkit_service(&wired).1,
+                "second wire is a no-op: {wired}"
+            );
+            let (back, undone) = unwire_lines(&wired);
+            assert!(undone && !content_has_module(&back));
+        }
+    }
+
+    #[test]
+    fn migrating_an_old_polkit_line_yields_the_abort_die_control() {
+        // An older irlume wired polkit-1 with a plain `sufficient` line, under which
+        // a shake's PAM_ABORT is `default=ignore`d and the dialog never closes.
+        // `login reconcile`/`enable` must migrate it to the abort=die control. In
+        // production that happens in `wire_service`, which strips every irlume line
+        // with `unwire_lines` and THEN calls `wire_polkit_service` on the clean base.
+        // Test that exact composition (not `wire_polkit_service` alone, which by
+        // design refuses a file that still has the module), so the migration the doc
+        // promises is the migration a real re-wire performs.
+        let old = format!(
+            "#%PAM-1.0\nauth       sufficient                   {MODULE}\n\
+             auth       include      system-auth\naccount    include      system-auth\n"
+        );
+        let (base, stripped) = unwire_lines(&old);
+        assert!(stripped, "the old irlume line must be stripped first");
+        assert!(
+            !content_has_module(&base),
+            "no irlume line survives the strip: {base}"
+        );
+        let (wired, changed) = wire_polkit_service(&base);
+        assert!(
+            changed && wired.contains("abort=die"),
+            "migrated line must die on abort: {wired}"
+        );
+        // Exactly ONE irlume line, and no plain-`sufficient` control survives.
+        assert_eq!(
+            wired.lines().filter(|l| l.contains(MODULE)).count(),
+            1,
+            "migration must not duplicate the irlume line: {wired}"
+        );
+        assert!(
+            !wired
+                .lines()
+                .any(|l| l.contains(MODULE) && l.contains(" sufficient ")),
+            "the plain sufficient control must be gone: {wired}"
+        );
     }
 
     #[test]
@@ -4223,6 +4379,102 @@ auth required pam_fprintd.so\n\
         // Second identical enable is a recognised no-op (rebuilt from backup).
         let msg2 = wire_service(&svc, true, true, &wire).unwrap();
         assert!(msg2.message.contains("already correctly wired"), "{msg2}");
+    }
+
+    /// A surface irlume REFUSED to touch must be recorded as it is on disk, not
+    /// as absent.
+    ///
+    /// The rollback precheck compares each recorded after-digest with the file,
+    /// so "absent before, absent after" about a file that exists reads as drift
+    /// and refuses the WHOLE transaction: a partly applied enable could not be
+    /// undone at all. `before: None` also means "remove it" to a restore, which
+    /// is the opposite of leaving it alone.
+    #[test]
+    fn a_refused_surface_is_recorded_as_it_stands() {
+        let dir = TestDir::new("wsvc-refused-record");
+        // A symlinked PAM path: every write refuses it, so an apply records it
+        // with an error and touches nothing.
+        let real = dir.0.join("real-sudo");
+        std::fs::write(
+            &real,
+            "auth include system-auth
+",
+        )
+        .unwrap();
+        let etc = dir.0.join("sudo");
+        std::os::unix::fs::symlink(&real, &etc).unwrap();
+
+        let refusal = inspect_target(&etc).expect_err("a symlink is refused");
+        let rec = refused_surface_record(
+            &Svc {
+                etc: leak(&etc),
+                vendor: None,
+            },
+            ROLE_SUDO,
+            &etc,
+            refusal,
+        );
+        assert!(rec.error.is_some(), "with the reason it was refused");
+        assert_ne!(
+            rec.after_sha256,
+            crate::logintx::ABSENT,
+            "the file exists, so recording it as absent makes the rollback see drift"
+        );
+        assert_eq!(
+            rec.after_sha256,
+            crate::logintx::sha256_hex(&std::fs::read(&etc).unwrap()),
+            "the recorded digest is the file's own"
+        );
+        assert!(
+            rec.before.is_some(),
+            "before: None tells a restore to REMOVE a file irlume never touched"
+        );
+    }
+
+    /// A disable that restores its backup must refuse a PAM path that is a
+    /// symlink, like every other write in this module.
+    ///
+    /// The restore was a bare `rename`, and renaming over a symlink REPLACES the
+    /// link with a regular file: a distro that symlinks a PAM service would have
+    /// had the link silently converted, with the target left behind holding
+    /// whatever it held.
+    #[test]
+    fn wire_service_disable_refuses_to_restore_over_a_symlink() {
+        let dir = TestDir::new("wsvc-symlink");
+        let (wired, _) = wire_greeter_impl(GDM, true, true, false);
+
+        // The real file lives elsewhere; the PAM path is a link to it.
+        let real = dir.0.join("real-gdm-password");
+        std::fs::write(&real, &wired).unwrap();
+        let etc = dir.0.join("gdm-password");
+        std::os::unix::fs::symlink(&real, &etc).unwrap();
+
+        // A backup that matches the stripped file, so the restore branch is the
+        // one taken.
+        let (stripped, _) = unwire_lines(&wired);
+        std::fs::write(dir.0.join(format!("gdm-password{BACKUP}")), &stripped).unwrap();
+
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, true, false);
+        let err = match wire_service(&svc, false, true, &wire) {
+            Err(e) => e,
+            Ok(msg) => panic!("restoring over a symlink must be refused, got: {msg}"),
+        };
+        assert!(
+            err.to_lowercase().contains("symlink"),
+            "the refusal must name why: {err}"
+        );
+        // The link is intact and still points at the real file.
+        assert!(
+            std::fs::symlink_metadata(&etc)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the PAM path must still be a symlink"
+        );
     }
 
     #[test]

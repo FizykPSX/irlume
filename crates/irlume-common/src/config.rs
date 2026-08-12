@@ -351,24 +351,164 @@ pub fn write_camera_pin(rgb: &str, ir: &str, rgb_id: &str, ir_id: &str) -> std::
 /// The settings.conf key for the credential-release temporal-liveness gate.
 pub const CREDENTIAL_RELEASE_CHALLENGE_KEY: &str = "credential_release_challenge";
 
-/// Is the credential-release temporal challenge required? DEFAULT ON.
+/// Is the credential-release temporal challenge required? DEFAULT OFF.
 ///
-/// Releasing the TPM-sealed login-keyring password is the one operation where a
-/// successful spoof hands the attacker a reusable secret instead of one session,
-/// so it asks for a deliberate gesture (nod, or a calibrated eye closure) on top
-/// of the face match. Everything else (login, lock screen, sudo) is unaffected.
+/// Releasing the TPM-sealed login-keyring password happens on a greeter cold
+/// login (from reboot) and after logout. Requiring a nod there was measured to
+/// be intent, not liveness: the gesture fired on a hand-held print 2 times in 24
+/// (2026-07-27), so it never stood between a photograph and the credential;
+/// cross-spectrum liveness and the PAD cue do, and the typed password is always
+/// the fallback. So this defaults OFF: a cold login and logout release the
+/// keyring after the face match with no nod. Only an explicit truthy spelling
+/// turns it on, for a user who wants the extra deliberate-intent step. Everything
+/// else (lock screen, sudo, polkit) is decided by its own service policy.
 ///
-/// FAILS SECURE: absent key, empty value, unreadable file, or an unrecognized
-/// spelling all leave the gate ON. Only an explicit `0|false|no|off` disables it,
-/// so a typo can never quietly weaken credential release. Read live per request
-/// (no daemon restart needed), mirroring `enforce_biopolicy`.
-///
-/// `IRLUME_CREDENTIAL_RELEASE_CHALLENGE` overrides the file, for tests.
+/// Read live per request (no daemon restart needed). An unrecognized value reads
+/// as the default (off), not as on. `IRLUME_CREDENTIAL_RELEASE_CHALLENGE`
+/// overrides the file.
 pub fn credential_release_challenge() -> bool {
     if let Ok(v) = std::env::var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE") {
+        return truthy(&v);
+    }
+    read_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY).is_some_and(|v| truthy(&v))
+}
+
+/// The settings.conf key prefix for per-service consent-gesture overrides.
+///
+/// Each key is `service_gesture.<service_name>`, where `<service_name>` is the
+/// PAM service name (e.g. `sudo`, `polkit-1`) or the special token
+/// `credential_release` for the cold-login keyring-unlock path. Values are `1`
+/// (gesture required) or `0` (no gesture). An absent key falls through to the
+/// per-service default.
+///
+/// The defaults: elevation services (sudo, su, doas) require the gesture.
+/// Everything else, including the credential-release path, does not. The user
+/// can override any service; a warning is printed when disabling a
+/// high-privilege service.
+pub const SERVICE_GESTURE_KEY: &str = "service_gesture";
+
+/// Read the per-service consent-gesture override from settings.conf.
+///
+/// Returns `Some(true)` when the gesture is explicitly required for this
+/// service, `Some(false)` when explicitly disabled, and `None` when no
+/// override is set (the caller applies the default).
+pub fn service_gesture(service: &str) -> Option<bool> {
+    read_kv("settings.conf", &format!("{SERVICE_GESTURE_KEY}.{service}")).map(|v| !falsy(&v))
+}
+
+/// The per-service default for the consent gesture, when no override is set.
+/// Elevation defaults to ON; everything else defaults to OFF.
+///
+/// The elevation set is read from the shared [`crate::pam_service`] table, not
+/// a private list here: that table already carries every spelling
+/// (`sudo`, `sudo-i`, `su`, `su-l`, `runuser`, `runuser-l`, `doas`) and trims
+/// and case-folds the name. A local `matches!("sudo" | "su" | "doas")` is the
+/// exact three-consumer drift #362 unified, and it silently defaulted `su -`
+/// (service `su-l`) and `sudo -i` (service `sudo-i`) to OFF.
+pub fn service_gesture_default(service: &str) -> bool {
+    matches!(
+        crate::pam_service::classify(service),
+        Some(crate::pam_service::ServiceKind::Elevation)
+    )
+}
+
+/// Is the polkit (app-consent) gesture switched on at all?
+///
+/// `IRLUME_POLKIT_GESTURE`, else `polkit_gesture` in settings.conf, else on.
+/// Turning it off drops an app-consent request to a plain verify, so the
+/// per-service default below stops applying to polkit.
+///
+/// Lives HERE rather than in the engine because three surfaces answer "does
+/// this service need a gesture" and they must not answer it differently: the
+/// engine enforces it, `credential-release-challenge status` reports it, and
+/// the TUI renders a badge for it.
+pub fn polkit_gesture_enabled() -> bool {
+    if let Ok(v) = std::env::var("IRLUME_POLKIT_GESTURE") {
         return !falsy(&v);
     }
-    !read_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY).is_some_and(|v| falsy(&v))
+    !read_kv("settings.conf", "polkit_gesture").is_some_and(|v| falsy(&v))
+}
+
+/// [`service_gesture_required`] when the answer can be KNOWN, `None` when the
+/// config cannot be read.
+///
+/// settings.conf ships 0600 root-owned, so an unprivileged reader gets EACCES,
+/// and [`read_kv`] reports that as "absent" like any other miss. Every caller
+/// that REPORTS state to a person needs the third answer instead: a TUI running
+/// without sudo was rendering the elevation/polkit defaults as a definite
+/// "required" for a file it had never read, and deriving its toggle direction
+/// from the same guess, so the key could only ever turn a gesture off and the row
+/// went on asserting a gate the user had just removed through it.
+pub fn service_gesture_required_visible(service: &str) -> Option<bool> {
+    match observe_kv("settings.conf", &format!("{SERVICE_GESTURE_KEY}.{service}")) {
+        KvObservation::Value(v) => Some(!falsy(&v)),
+        KvObservation::Unknown(_) => None,
+        // No override: the default applies, and for an app-consent service that
+        // default is itself conditional on `polkit_gesture`, which lives in the
+        // same unreadable file. Ask about that key the same honest way.
+        KvObservation::Absent => {
+            if matches!(
+                crate::pam_service::classify(service),
+                Some(crate::pam_service::ServiceKind::AppConsent)
+            ) {
+                if std::env::var_os("IRLUME_POLKIT_GESTURE").is_some() {
+                    return Some(polkit_gesture_enabled() || service_gesture_default(service));
+                }
+                match observe_kv("settings.conf", "polkit_gesture") {
+                    KvObservation::Value(v) => Some(!falsy(&v) || service_gesture_default(service)),
+                    KvObservation::Absent => Some(true),
+                    KvObservation::Unknown(_) => None,
+                }
+            } else {
+                Some(service_gesture_default(service))
+            }
+        }
+    }
+}
+
+/// The EFFECTIVE consent-gesture state for a PAM service: what the engine will
+/// actually do, not what one config key says.
+///
+/// The engine's rule has two defaults, not one. An app-consent service (polkit)
+/// defaults ON while the polkit gesture is enabled; an elevation service
+/// (sudo/su/doas and their `-i`/`-l` spellings) defaults ON through
+/// [`service_gesture_default`]; everything else defaults off. An explicit
+/// `service_gesture.<service>` override beats both.
+///
+/// Written because the three surfaces had drifted: the TUI applied the
+/// elevation default to polkit and rendered `polkit-1: no` on a default install
+/// while the daemon required the gesture and the CLI printed `REQUIRED`, and the
+/// TUI's toggle then read the same wrong value, so the first press wrote an `on`
+/// that changed nothing instead of offering to turn it off.
+pub fn service_gesture_required(service: &str) -> bool {
+    if let Some(explicit) = service_gesture(service) {
+        return explicit;
+    }
+    if matches!(
+        crate::pam_service::classify(service),
+        Some(crate::pam_service::ServiceKind::AppConsent)
+    ) {
+        // Mirrors irlume-auth: AppConsent defaults ON, but `polkit_gesture=0`
+        // turns the consent purpose off entirely, and the request then falls
+        // back to the plain-verify rule below.
+        return polkit_gesture_enabled() || service_gesture_default(service);
+    }
+    service_gesture_default(service)
+}
+
+/// Whether releasing the sealed login-keyring password requires the deliberate
+/// consent gesture, as ONE definition both the daemon (which enforces it) and
+/// the PAM module (which tells the user to perform it) call.
+///
+/// Precedence: the per-service `service_gesture.credential_release` override
+/// wins; absent, it falls back to [`credential_release_challenge`] (itself
+/// `IRLUME_CREDENTIAL_RELEASE_CHALLENGE` over the global `settings.conf` key).
+/// This existed inline in the auth engine while `irlume-pam` computed the
+/// instruction from only the global key, so the greeter could tell a user to
+/// gesture on a release the daemon granted ungated, or stay silent on a release
+/// the daemon gated. One helper keeps the message and the enforcement in step.
+pub fn credential_release_gesture_required() -> bool {
+    service_gesture("credential_release").unwrap_or_else(credential_release_challenge)
 }
 
 /// Which deliberate gesture the consent gate accepts.
@@ -533,6 +673,60 @@ mod camera_pin_tests {
 }
 
 #[cfg(test)]
+mod service_gesture_default_tests {
+    use super::service_gesture_default;
+
+    /// The elevation default must cover every spelling the shared pam_service
+    /// table calls Elevation, not the three literals `sudo`/`su`/`doas` the
+    /// first cut used. `su -` reaches PAM as `su-l` and `sudo -i` as `sudo-i`;
+    /// under the private list both defaulted the consent gesture OFF, so a print
+    /// that clears the single-frame cues could elevate to root ungated.
+    #[test]
+    fn every_elevation_spelling_defaults_on() {
+        for svc in [
+            "sudo",
+            "sudo-i",
+            "su",
+            "su-l",
+            "runuser",
+            "runuser-l",
+            "doas",
+        ] {
+            assert!(
+                service_gesture_default(svc),
+                "elevation service {svc} must default the consent gesture ON"
+            );
+        }
+        // Case and surrounding whitespace are folded by the shared classifier.
+        assert!(
+            service_gesture_default(" SUDO "),
+            "the classifier trims and case-folds; a padded name must still match"
+        );
+    }
+
+    /// Non-elevation services default OFF. polkit's gesture comes from the
+    /// AppConsent purpose, not this default, so `polkit-1` is OFF here too; an
+    /// unrecognised name is not elevation and defaults OFF.
+    #[test]
+    fn non_elevation_defaults_off() {
+        for svc in [
+            "kde",
+            "swaylock",
+            "sddm",
+            "gdm-password",
+            "sshd",
+            "polkit-1",
+            "totally-made-up",
+        ] {
+            assert!(
+                !service_gesture_default(svc),
+                "non-elevation service {svc} must default the consent gesture OFF"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod consent_gesture_tests {
     use super::{consent_gesture_mode_reporting, ConsentGesture};
 
@@ -602,10 +796,21 @@ mod consent_gesture_tests {
 }
 
 /// The spellings that turn a boolean settings.conf key off.
-fn falsy(v: &str) -> bool {
+pub fn falsy(v: &str) -> bool {
     matches!(
         v.trim().to_ascii_lowercase().as_str(),
         "0" | "false" | "no" | "off"
+    )
+}
+
+/// The spellings that turn a boolean settings.conf key ON. Not the complement of
+/// [`falsy`]: an unrecognized value is neither, and a default-off key reads it as
+/// off. The single set both the value read and its `_visible` display use, so
+/// they cannot disagree on what `yes` means.
+pub fn truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
     )
 }
 
@@ -613,19 +818,21 @@ fn falsy(v: &str) -> bool {
 ///
 /// `None` when settings.conf exists and this process may not read it. That is
 /// every unprivileged caller: the file is 0600 root-only, so `irlume status` as an
-/// ordinary user cannot tell "key absent" (on) from "key set to off". Reporting a
-/// guessed security state is worse than saying to re-run under sudo, so the
-/// display paths take the `None` and say so. The daemon is root and never sees it.
+/// ordinary user cannot tell "key absent" (off, the default) from "key set to on".
+/// Reporting a guessed security state is worse than saying to re-run under sudo,
+/// so the display paths take the `None` and say so. The daemon is root and never
+/// sees it. Mirrors [`enforce_biopolicy_visible`]: same truthy set, same env
+/// override, Absent means the default.
 pub fn credential_release_challenge_visible() -> Option<bool> {
     // An explicit env override answers regardless of file permissions.
     if std::env::var_os("IRLUME_CREDENTIAL_RELEASE_CHALLENGE").is_some() {
         return Some(credential_release_challenge());
     }
-    match std::fs::File::open(config_path("settings.conf")) {
-        Ok(_) => Some(credential_release_challenge()),
-        // No file at all is not ambiguous: no key means the default, on.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
-        Err(_) => None,
+    match observe_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY) {
+        KvObservation::Value(v) => Some(truthy(&v)),
+        // No file, or no key in it, is unambiguous: the default is off.
+        KvObservation::Absent => Some(false),
+        KvObservation::Unknown(_) => None,
     }
 }
 
@@ -642,7 +849,6 @@ pub fn enforce_biopolicy_visible() -> Option<bool> {
     // opinion that decides anything: same truthy set, same env override. The two
     // display sites used to accept "1"|"true" alone, so `enforce_biopolicy=yes`
     // printed "off" while the daemon was enforcing.
-    let truthy = |s: &str| matches!(s.trim(), "1" | "true" | "yes" | "on");
     if let Ok(v) = std::env::var("IRLUME_ENFORCE_BIOPOLICY") {
         return Some(truthy(&v));
     }
@@ -758,6 +964,59 @@ mod tests {
             config_path("cameras.conf"),
             PathBuf::from("/etc/irlume/cameras.conf")
         );
+    }
+
+    #[test]
+    fn the_effective_service_gesture_matches_what_the_engine_enforces() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-svcgest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_POLKIT_GESTURE");
+
+        // No overrides. polkit is the case the TUI got wrong: AppConsent defaults
+        // ON in the engine, while the elevation-only default reports OFF.
+        std::fs::write(config_path("settings.conf"), "").unwrap();
+        assert!(
+            service_gesture_required("polkit-1"),
+            "polkit defaults ON, as the engine's AppConsent arm does"
+        );
+        assert!(!service_gesture_default("polkit-1"), "premise: the elevation-only default says otherwise, which is the bug this helper fixes");
+        for svc in ["sudo", "su", "doas", "sudo-i", "su-l", "runuser"] {
+            assert!(service_gesture_required(svc), "{svc} is elevation: ON");
+        }
+        assert!(
+            !service_gesture_required("kde"),
+            "a screen unlock stays off"
+        );
+
+        // An explicit override beats both defaults, in both directions.
+        std::fs::write(
+            config_path("settings.conf"),
+            "service_gesture.polkit-1=0\nservice_gesture.kde=1\n",
+        )
+        .unwrap();
+        assert!(
+            !service_gesture_required("polkit-1"),
+            "an explicit off wins"
+        );
+        assert!(service_gesture_required("kde"), "an explicit on wins");
+
+        // `polkit_gesture=0` turns the consent purpose off entirely, so polkit
+        // falls back to the plain-verify rule and stops demanding a gesture.
+        std::fs::write(config_path("settings.conf"), "polkit_gesture=0\n").unwrap();
+        assert!(
+            !service_gesture_required("polkit-1"),
+            "polkit_gesture=0 disables the AppConsent default"
+        );
+        assert!(
+            service_gesture_required("sudo"),
+            "and leaves elevation untouched"
+        );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1110,10 +1369,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The one default-ON security key: absent means ON, only an explicit falsy
-    /// spelling turns it off, and an unrecognized value fails SECURE (stays on).
+    /// DEFAULT OFF: absent means OFF, only an explicit truthy spelling turns it
+    /// on, and an unrecognized value reads as the default (off), not on. The nod
+    /// on a greeter cold login / logout was retired to intent-not-liveness, so the
+    /// keyring releases after the face match with no nod unless a user opts in.
     #[test]
-    fn credential_release_challenge_defaults_on_and_fails_secure() {
+    fn credential_release_challenge_defaults_off() {
         let _g = testenv::lock();
         let dir = std::env::temp_dir().join(format!("irlume-crc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1122,25 +1383,22 @@ mod tests {
         std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
 
         let key = CREDENTIAL_RELEASE_CHALLENGE_KEY;
-        // No settings.conf at all -> on.
-        assert!(credential_release_challenge(), "missing file must stay on");
+        // No settings.conf at all -> off (the default).
+        assert!(!credential_release_challenge(), "missing file must be off");
 
-        // Every falsy spelling, in either case, turns it off.
-        for v in ["0", "false", "no", "off", "OFF", "False"] {
+        // Every truthy spelling, in either case, turns it on.
+        for v in ["1", "true", "yes", "on", "ON", "True"] {
             write_kv("settings.conf", key, v).unwrap();
-            assert!(
-                !credential_release_challenge(),
-                "'{v}' must disable the gate"
-            );
+            assert!(credential_release_challenge(), "'{v}' must enable the gate");
         }
-        // Truthy spellings and a typo both leave it ON (fail secure).
-        for v in ["1", "true", "yes", "on", "0ff", "disabled", "maybe"] {
+        // Falsy spellings and an unrecognized value all read as off (the default).
+        for v in ["0", "false", "no", "off", "0ff", "enabled", "maybe"] {
             write_kv("settings.conf", key, v).unwrap();
-            assert!(credential_release_challenge(), "'{v}' must leave it on");
+            assert!(!credential_release_challenge(), "'{v}' must leave it off");
         }
-        // An empty value reads as absent -> on.
+        // An empty value reads as absent -> off.
         write_kv("settings.conf", key, "").unwrap();
-        assert!(credential_release_challenge(), "empty value must stay on");
+        assert!(!credential_release_challenge(), "empty value must be off");
 
         // The env override wins over the file, both directions.
         write_kv("settings.conf", key, "off").unwrap();
@@ -1153,10 +1411,53 @@ mod tests {
 
         // Unrelated keys survive a write of ours.
         write_kv("settings.conf", "consent_gesture", "nod").unwrap();
-        write_kv("settings.conf", key, "0").unwrap();
+        write_kv("settings.conf", key, "1").unwrap();
         assert_eq!(
             read_kv("settings.conf", "consent_gesture").as_deref(),
             Some("nod")
+        );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The credential-release gesture helper the daemon and PAM share must give
+    /// the per-service override priority over the global key, so the greeter
+    /// instruction and the daemon's enforcement cannot disagree.
+    #[test]
+    fn credential_release_gesture_required_prefers_the_service_override() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-crgr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
+
+        // No override and no global key: defaults OFF (the greeter/logout nod was
+        // retired to intent-not-liveness), so the keyring releases with no nod.
+        assert!(
+            !credential_release_gesture_required(),
+            "default is off: a cold login releases the keyring with no nod"
+        );
+
+        // A per-service override ON requires it even against the default/global.
+        write_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY, "off").unwrap();
+        assert!(
+            !credential_release_gesture_required(),
+            "global off with no override disables it"
+        );
+        write_kv("settings.conf", "service_gesture.credential_release", "1").unwrap();
+        assert!(
+            credential_release_gesture_required(),
+            "service override ON wins over global off"
+        );
+
+        // Global ON, but a per-service override OFF wins.
+        write_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY, "on").unwrap();
+        write_kv("settings.conf", "service_gesture.credential_release", "0").unwrap();
+        assert!(
+            !credential_release_gesture_required(),
+            "service override OFF wins over global on"
         );
 
         std::env::remove_var("IRLUME_CONFIG_DIR");

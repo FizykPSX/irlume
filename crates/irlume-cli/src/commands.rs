@@ -630,6 +630,27 @@ fn daemon_up() -> bool {
 
 /// `irlume status`: one-shot health dashboard. Always exits 0 (it reports state,
 /// it doesn't gate anything); use `irlume detect` for script-friendly exit codes.
+/// How many enrolled scans the CURRENTLY LOADED recognizer could match, summed
+/// over every profile, or `None` when the daemon did not say.
+///
+/// A template only matches the recognizer that produced it. Reporting the raw
+/// scan count as health lets a profile whose templates all belong to a model
+/// that is no longer loaded read as ready while no face can authenticate.
+/// `None` is deliberately not zero: a daemon older than the per-recognizer
+/// counts sends an empty map, and treating that as "nothing usable" would tell
+/// a healthy install to re-enroll.
+fn usable_scans(profiles: &[irlume_common::ProfileSummary]) -> Option<usize> {
+    profiles
+        .iter()
+        .map(
+            |p| match (&p.live_recognizer, p.scans_by_recognizer.is_empty()) {
+                (Some(live), false) => Some(p.scans_by_recognizer.get(live).copied().unwrap_or(0)),
+                _ => None,
+            },
+        )
+        .try_fold(0usize, |acc, n| n.map(|n| acc + n))
+}
+
 pub fn status(args: &[String]) -> ExitCode {
     let user = user_arg(args);
     println!("irlume status for '{user}'");
@@ -667,26 +688,37 @@ pub fn status(args: &[String]) -> ExitCode {
         Ok(Response::Enrollment {
             profiles,
             require_eyes_open,
-            require_challenge,
             ..
         }) if !profiles.is_empty() => {
             let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
             println!(
-                "  enrollment    : {} profile(s), {scans} scan(s) {OK}{}{}",
+                "  enrollment    : {} profile(s), {scans} scan(s) {OK}{}",
                 profiles.len(),
                 if require_eyes_open {
                     " · eyes-open required"
-                } else {
-                    ""
-                },
-                if require_challenge {
-                    " · passive blink liveness"
                 } else {
                     ""
                 }
             );
             for p in &profiles {
                 println!("                  - {} ({} scan(s))", p.name, p.scans.len());
+            }
+            // A scan can only match the recognizer it was captured with, which is
+            // what `scans_by_recognizer`'s own doc says: "how many scans" has no
+            // single answer worth reporting on its own. The line above reports
+            // exactly that number with a tick, so a profile whose templates all
+            // belong to a recognizer that is no longer loaded (a third-party model
+            // disabled, or swapped) read as healthy while no face could match.
+            //
+            // Silent when the daemon sent no counts at all: that is an older
+            // daemon, and unknown is not zero.
+            let usable = usable_scans(&profiles);
+            if let Some(0) = usable {
+                if scans > 0 {
+                    println!(
+                        "                  {WARN} none of those scans belong to the recognizer                          that is loaded now, so no face can match: re-enable the model it was                          enrolled with, or run `irlume enroll` again"
+                    );
+                }
             }
         }
         Ok(Response::Enrollment { .. }) => {
@@ -768,20 +800,15 @@ pub fn status(args: &[String]) -> ExitCode {
         }
     );
 
-    // The credential-release gesture gate (default on). Only interesting when it
-    // is OFF or unreadable, but print it always: a security default the user can
-    // turn off should be visible where they look for the current state.
+    // The credential-release gesture gate (DEFAULT OFF). Print it always: an
+    // opt-in step the user may want to know is available shows where they look
+    // for the current state. Off is the default, not a warning.
     println!(
         "  keyring gate  : {}",
         match irlume_common::config::credential_release_challenge_visible() {
-            Some(true) => format!("gesture required {OK} (default)"),
-            // Qualified, matching CREDENTIAL_RELEASE_RISK. Saying a print
-            // "may release the password" overstates it: it must pass the
-            // face and liveness checks first, and none of 24 measured
-            // presentations did.
-            Some(false) => format!(
-                "DISABLED {WARN} (an IR print that passes the face checks could release it)"
-            ),
+            Some(true) => format!("gesture required {OK} (opt-in)"),
+            Some(false) =>
+                "off (default): the keyring releases after the face match with no nod".into(),
             None => "root-only setting (re-run with sudo)".into(),
         }
     );
@@ -817,16 +844,49 @@ pub fn status(args: &[String]) -> ExitCode {
 ///   0  = ready    (daemon reachable AND the user is enrolled)
 ///   10 = partial  (installed but not ready: daemon down or not enrolled)
 ///   20 = absent   (irlumed is not installed)
+/// Is the daemon binary on this machine, wherever the distro keeps it?
+///
+/// The FHS paths first, then `PATH`, which is how a Nix profile
+/// (/run/current-system/sw/bin) and a home-manager install are found. Checked
+/// only when the socket says nothing: a reachable daemon has already answered
+/// the question.
+fn irlumed_binary_present() -> bool {
+    irlumed_binary_in(std::env::var_os("PATH").as_deref())
+}
+
+/// [`irlumed_binary_present`] with the search path passed in.
+///
+/// Split out so a test can hand it a directory instead of setting `PATH` for the
+/// whole process. The harness runs tests in parallel, and a process-wide `PATH`
+/// change breaks any concurrent test that spawns a program: this reached CI as a
+/// package-origin test unwrapping a NotFound under the sanitizer's slower
+/// interleaving, having passed locally on timing alone.
+fn irlumed_binary_in(path: Option<&std::ffi::OsStr>) -> bool {
+    const FHS: &[&str] = &[
+        "/usr/local/bin/irlumed",
+        "/usr/bin/irlumed",
+        "/run/current-system/sw/bin/irlumed",
+    ];
+    if FHS.iter().any(|p| std::path::Path::new(p).exists()) {
+        return true;
+    }
+    path.is_some_and(|paths| std::env::split_paths(paths).any(|d| d.join("irlumed").exists()))
+}
+
 pub fn detect(args: &[String]) -> ExitCode {
     let user = user_arg(args);
-    let installed = ["/usr/local/bin/irlumed", "/usr/bin/irlumed"]
-        .iter()
-        .any(|p| std::path::Path::new(p).exists());
+    // A REACHABLE daemon is the strongest possible evidence of an install, so ask
+    // that before looking for files. Two hardcoded paths decided this before, and
+    // NixOS puts the binary in /nix/store with a link from
+    // /run/current-system/sw/bin: a packaged, documented, fully working install
+    // reported "absent: irlumed is not installed" and exit 20, the code that
+    // tells an installer irlume is not on the machine at all.
+    let reach = daemon_reach();
+    let installed = reach != DaemonReach::Down || irlumed_binary_present();
     if !installed {
         println!("absent: irlumed is not installed");
         return ExitCode::from(20);
     }
-    let reach = daemon_reach();
     // Without socket access neither readiness nor enrollment is knowable, and
     // claiming "not enrolled" would be a guess. Report the real obstacle and
     // stay at 10 (partial): 0 would assert a readiness we cannot see.
@@ -1277,54 +1337,180 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
     }
 }
 
-/// One line naming what the challenge is, for the places that have to explain the
-/// consequence of turning it off. Kept in one place so the CLI, the TUI confirm and
-/// doctor cannot drift into describing different security properties.
-pub const CREDENTIAL_RELEASE_RISK: &str =
-    "a static IR print that passes the face checks can then release your \
-     TPM-sealed login-keyring password";
-
-/// `irlume credential-release-challenge <on|off|status>`: the deliberate-gesture
-/// gate on releasing the sealed login-keyring password (`credential_release_challenge`
-/// in settings.conf). DEFAULT ON. The daemon reads it live per request, so no
-/// restart is needed.
+/// `irlume credential-release-challenge [<service>] <on|off|status>`: the
+/// per-service consent-gesture toggle, plus the global credential-release gate on
+/// releasing the sealed login-keyring password (`credential_release_challenge` in
+/// settings.conf). The daemon reads all of it live per request, so no restart is
+/// needed.
 ///
-/// Turning it off never locks anyone out (the typed password is always the
-/// fallback) but it does drop the deliberate-intent check on credential release,
-/// so `off` asks for confirmation and says why. It is INTENT that is dropped,
-/// not liveness: measured 2026-07-27, the gesture fired on a hand-held print 2
-/// times in 24, so it never was the layer standing between a photograph and the
-/// credential; cross-spectrum liveness and the PAD cue are.
+/// The keyring gate DEFAULTS OFF: a greeter cold login and logout release the
+/// keyring after the face match with no nod, because the gesture is INTENT, not
+/// liveness (measured 2026-07-27, the gesture fired on a hand-held print 2 times
+/// in 24, so it never stood between a photograph and the credential; the
+/// cross-spectrum liveness and PAD cues do, and the typed password is always the
+/// fallback). Turning any gesture on adds a deliberate step; disabling it for a
+/// high-privilege escalation service (sudo, su, doas, polkit) asks for
+/// confirmation first.
 pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitCode {
     const TAG: &str = "[credential-release-challenge]";
     match sub {
         None | Some("status") => {
-            match irlume_common::config::credential_release_challenge_visible() {
-                Some(true) => println!("{TAG} temporal challenge: REQUIRED {OK} (default)"),
-                Some(false) => {
-                    println!("{TAG} temporal challenge: DISABLED {WARN}");
-                    println!("     {CREDENTIAL_RELEASE_RISK}.");
-                    println!("     Re-enable: sudo irlume credential-release-challenge on");
+            // The EFFECTIVE per-service policy, then the global credential-release
+            // setting. An absent key reports its effective default, not a guess; an
+            // unreadable root-only file says so rather than printing a state it
+            // could not read (settings.conf is 0600, so an unprivileged `status`
+            // sees Unknown, not the value).
+            let services = ["sudo", "su", "doas", "polkit-1", "credential_release"];
+            for svc in services {
+                let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
+                match irlume_common::config::observe_kv("settings.conf", &key) {
+                    // Per-service keys use `!falsy` (the daemon's `service_gesture`
+                    // reading), NOT the global `truthy`, so the display agrees with
+                    // what the engine does for this key.
+                    irlume_common::config::KvObservation::Value(v) => {
+                        if !irlume_common::config::falsy(&v) {
+                            println!("{TAG} {svc}: REQUIRED {OK} (explicit)");
+                        } else {
+                            println!("{TAG} {svc}: off (explicit)");
+                        }
+                    }
+                    irlume_common::config::KvObservation::Absent => {
+                        let required = match svc {
+                            // The keyring release falls back to the global gate,
+                            // which now defaults OFF.
+                            "credential_release" => {
+                                irlume_common::config::credential_release_challenge()
+                            }
+                            // Every PAM service through the shared helper, which
+                            // knows polkit (AppConsent) defaults ON and that
+                            // `polkit_gesture=0` turns that default off. The
+                            // hardcoded `true` here could not see the second half.
+                            _ => irlume_common::config::service_gesture_required(svc),
+                        };
+                        if required {
+                            println!("{TAG} {svc}: REQUIRED {OK} (default)");
+                        } else {
+                            println!("{TAG} {svc}: off (default)");
+                        }
+                    }
+                    irlume_common::config::KvObservation::Unknown(_) => {
+                        println!("{TAG} {svc}: root-only setting, re-run with sudo");
+                    }
                 }
-                // Root-only file: don't print a guessed security state.
+            }
+            // Global credential-release-challenge fallback (DEFAULT OFF).
+            match irlume_common::config::credential_release_challenge_visible() {
+                Some(true) => {
+                    println!("{TAG} global credential_release_challenge: REQUIRED {OK}")
+                }
+                Some(false) => {
+                    println!("{TAG} global credential_release_challenge: off (default)")
+                }
                 None => println!(
-                    "{TAG} temporal challenge: root-only setting, re-run with sudo to read it"
+                    "{TAG} global credential_release_challenge: root-only setting, re-run with sudo"
                 ),
+            }
+            // A REQUIRED gesture that no gesture can satisfy is not a healthy
+            // state, and every line above reads as one. The mode decides WHICH
+            // gesture is accepted, so an unreadable `consent_gesture` leaves the
+            // requirement standing with nothing able to meet it, and every prompt
+            // falls to the password.
+            if irlume_common::config::consent_gesture_mode()
+                == irlume_common::config::ConsentGesture::Misconfigured
+            {
+                println!(
+                    "{TAG} WARNING: `consent_gesture` is set to a value irlume cannot read \
+                     (expected nod or closure), so NO gesture is accepted and every \
+                     REQUIRED line above falls back to the password until it is fixed."
+                );
             }
             ExitCode::SUCCESS
         }
+        // Service-specific toggle: irlume credential-release-challenge sudo on|off
+        Some(svc) if svc != "on" && svc != "off" => {
+            // `args` is the whole argv minus the program name (main.rs skips 1
+            // and passes the full vector), so args[0] is the subcommand name,
+            // args[1] is `svc` (this arm's `sub`), and the on/off token is
+            // args[2]. Reading args[0] here matched the literal subcommand and
+            // sent every `<service> on|off` to the usage arm (exit 2).
+            let on_off = args.get(2).map(String::as_str);
+            match on_off {
+                Some(v @ ("on" | "off")) => {
+                    if !crate::is_root() {
+                        eprintln!(
+                            "{TAG} needs root: sudo irlume credential-release-challenge {svc} {v}"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    // A name irlume does not recognise still WRITES, because a
+                    // hand-wired PAM service is a real thing and the daemon looks
+                    // the key up by whatever name PAM passes. But a typo is far
+                    // likelier than a custom stack, and it used to report success
+                    // for a service that does not exist: `credential-release-
+                    // challenge sudp off` printed "sudp: consent gesture off" and
+                    // left a key nothing would ever read. Say which it is.
+                    if irlume_common::pam_service::classify(svc).is_none()
+                        && svc != "credential_release"
+                    {
+                        eprintln!(
+                            "{TAG} note: '{svc}' is not a PAM service irlume knows \
+                             (sudo, su, doas, sudo-i, su-l, runuser, polkit-1, or the \
+                             special token credential_release). Writing it anyway: it takes \
+                             effect only if a PAM stack really uses that service name."
+                        );
+                    }
+                    // Disabling the gesture for a high-privilege escalation
+                    // service (sudo, su, doas, sudo-i, su-l, runuser, polkit) asks
+                    // for confirmation first: a face match alone would then
+                    // approve it. The set comes from the shared pam_service table,
+                    // not a private list that already omitted sudo-i/su-l/runuser
+                    // (the #362 drift). The keyring release (`credential_release`)
+                    // is NOT here: it defaults OFF by design, so disabling it is
+                    // the default state, not a weakening that warrants a warning.
+                    let high_priv = matches!(
+                        irlume_common::pam_service::classify(svc),
+                        Some(
+                            irlume_common::pam_service::ServiceKind::Elevation
+                                | irlume_common::pam_service::ServiceKind::AppConsent
+                        )
+                    );
+                    if v == "off" && high_priv {
+                        let assumed_yes = args.iter().any(|a| a == "--yes" || a == "-y");
+                        if !assumed_yes && !confirm_high_privilege_disable(svc) {
+                            println!("{TAG} {svc}: left REQUIRED.");
+                            return ExitCode::SUCCESS;
+                        }
+                    }
+                    let val = if v == "on" { "1" } else { "0" };
+                    let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
+                    match irlume_common::config::write_kv("settings.conf", &key, val) {
+                        Ok(()) => {
+                            if v == "on" {
+                                println!("{TAG} {svc}: consent gesture REQUIRED {OK}");
+                            } else {
+                                eprintln!("{TAG} {svc}: consent gesture off {WARN}");
+                            }
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("{TAG} could not update settings.conf: {e}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("{TAG} usage: irlume credential-release-challenge [<service>] <on|off|status>");
+                    ExitCode::from(2)
+                }
+            }
+        }
         Some(v @ ("on" | "off")) => {
+            // Global keyring-release gate. DEFAULT OFF, so `on` is the notable
+            // action (it ADDS a deliberate step) and `off` just returns to the
+            // default; neither needs a confirmation.
             if !crate::is_root() {
                 eprintln!("{TAG} needs root: sudo irlume credential-release-challenge {v}");
                 return ExitCode::FAILURE;
-            }
-            // Weakening credential release is the one direction that needs an
-            // explicit yes. `--yes` exists for scripted installs, and still prints
-            // the warning: the point is the record, not the keystroke.
-            let assumed_yes = args.iter().any(|a| a == "--yes" || a == "-y");
-            if v == "off" && !assumed_yes && !confirm_disable() {
-                println!("{TAG} left enabled.");
-                return ExitCode::SUCCESS;
             }
             let val = if v == "on" { "1" } else { "0" };
             match irlume_common::config::write_kv(
@@ -1335,16 +1521,15 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                 Ok(()) => {
                     if v == "on" {
                         println!(
-                            "{TAG} temporal challenge REQUIRED {OK}: releasing your keyring \
-                             password now needs continuous nodding (or a calibrated eye closure ~1s) after \
-                             the face match. Takes effect on the next face auth."
+                            "{TAG} consent gesture REQUIRED {OK}: releasing your keyring \
+                             password now needs {} after the face match. Takes effect on the \
+                             next face auth.",
+                            irlume_common::config::consent_gesture_mode().instruction("approve")
                         );
                     } else {
-                        eprintln!(
-                            "{TAG} WARNING: the deliberate-consent gate on credential \
-                             release is DISABLED. {CREDENTIAL_RELEASE_RISK}. Your typed password still \
-                             works either way. Re-enable: sudo irlume \
-                             credential-release-challenge on"
+                        println!(
+                            "{TAG} temporal challenge off (the default): the keyring releases \
+                             after the face match with no nod. Your typed password still works."
                         );
                     }
                     ExitCode::SUCCESS
@@ -1357,28 +1542,26 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
         }
         Some(other) => {
             eprintln!(
-                "{TAG} usage: irlume credential-release-challenge <on|off|status> (got '{other}')"
+                "{TAG} usage: irlume credential-release-challenge [<service>] <on|off|status> (got '{other}')"
             );
             ExitCode::from(2)
         }
     }
 }
 
-/// The confirm step before disabling the gate. A non-terminal stdin (a script, a
-/// pipe) is NOT taken as consent: it must send an explicit `y`, or pass `--yes`.
-fn confirm_disable() -> bool {
+/// Confirmation for disabling the consent gesture on a high-privilege service.
+fn confirm_high_privilege_disable(service: &str) -> bool {
     use std::io::Write as _;
     println!(
-        "WARNING: Disabling the credential-release challenge means {CREDENTIAL_RELEASE_RISK}.\n\
-         Your typed password remains available either way."
+        "WARNING: Disabling the consent gesture for '{service}' means a face match alone\n\
+         approves this service. If someone holds a print of your face to the camera,\n\
+         they can use '{service}' without your knowledge."
     );
-    print!("Disable the challenge? [y/N] ");
+    print!("Disable the gesture for '{service}'? [y/N] ");
     let _ = std::io::stdout().flush();
     let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    std::io::stdin().read_line(&mut line).unwrap_or_default();
+    matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
 }
 
 pub fn reseal(args: &[String]) -> ExitCode {
@@ -1768,7 +1951,9 @@ SETUP & STATUS
 
 ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset]   capture a face profile
-  profiles [list|add-scan|rename|delete|forget-model|eyes-open|challenge <on|off>]   manage profiles
+  profiles [list|add-scan|rename|delete|forget-model|eyes-open off]   manage profiles
+                        (eyes-open can only be turned OFF: the gate refuses the
+                        users it exists to admit, see issue #386)
   identify              1:N \"who is this?\" (all users as root; else scoped to you)
   calibrate-closure [--rounds N] [--force]   teach the eye-closure gesture for app
                         prompts; captures N rounds (default 3) and stores the median
@@ -1814,10 +1999,14 @@ SYSTEM INTEGRATION
                         measured threshold. Fetched or user-supplied, never shipped
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)
-  credential-release-challenge <on|off|status>
-                        require continuous nodding (or a calibrated eye closure) before your
-                        keyring password is released. ON by default; turning it
-                        off lets an IR print that passes the face checks release it
+  credential-release-challenge [<service>] <on|off|status>
+                        the consent gesture: keep nodding to approve, shake your
+                        head to decline. Named with a service (sudo, su, doas,
+                        polkit-1) it sets that service's gesture; sudo-style
+                        elevation and polkit require one by default. Bare, it
+                        sets the gate on releasing your keyring password, which
+                        is OFF by default: a cold login and logout release it on
+                        the face match alone
   update [--check]                update via the channel this was installed from
                         (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
   uninstall [--keep-data] [--yes] un-wire PAM, stop the daemon, wipe enrolled
@@ -2192,4 +2381,88 @@ mod setup_offer_tests {
             "the fixture name must be absent from the catalog for this to discriminate"
         );
     }
+}
+
+/// The scan count irlume prints as health must be the count that can
+/// actually match, and "the daemon did not say" must not read as zero.
+#[test]
+fn usable_scans_counts_only_the_loaded_recognizer() {
+    let prof = |live: Option<&str>, counts: &[(&str, usize)], scans: usize| {
+        irlume_common::ProfileSummary {
+            name: "P".into(),
+            scans: (0..scans).map(|i| format!("scan{i}")).collect(),
+            scans_by_recognizer: counts.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            live_recognizer: live.map(str::to_string),
+        }
+    };
+
+    // Every template belongs to the loaded space.
+    assert_eq!(
+        usable_scans(&[prof(Some("embed:a"), &[("embed:a", 11)], 11)]),
+        Some(11)
+    );
+    // The templates belong to a recognizer that is no longer loaded: the
+    // profile looks full and can match nothing. This is the case that used to
+    // print "11 scan(s) ✅".
+    assert_eq!(
+        usable_scans(&[prof(Some("embed:b"), &[("embed:a", 11)], 11)]),
+        Some(0)
+    );
+    // Summed across profiles, only the loaded space counting.
+    assert_eq!(
+        usable_scans(&[
+            prof(Some("embed:a"), &[("embed:a", 3)], 3),
+            prof(Some("embed:a"), &[("embed:a", 4), ("embed:b", 9)], 13),
+        ]),
+        Some(7)
+    );
+    // An older daemon sends no counts: unknown, not zero.
+    assert_eq!(usable_scans(&[prof(Some("embed:a"), &[], 11)]), None);
+    assert_eq!(usable_scans(&[prof(None, &[("embed:a", 11)], 11)]), None);
+    // One silent profile makes the total unknown rather than an undercount.
+    assert_eq!(
+        usable_scans(&[
+            prof(Some("embed:a"), &[("embed:a", 3)], 3),
+            prof(None, &[], 5),
+        ]),
+        None
+    );
+}
+
+/// `detect` must not decide "not installed" from a list of FHS paths.
+///
+/// NixOS keeps the binary in /nix/store and links it from
+/// /run/current-system/sw/bin, so a packaged and documented install reported
+/// `absent: irlumed is not installed` and exit 20, the code an installer
+/// reads as "irlume is not on this machine".
+#[test]
+fn the_daemon_binary_is_found_wherever_the_distro_keeps_it() {
+    // The search path is passed IN, never set on the process: the harness runs
+    // tests in parallel, and a global PATH change breaks any concurrent test that
+    // spawns a program. That is how this first failed in CI, as a package-origin
+    // test unwrapping a NotFound under the sanitizer's slower interleaving.
+    let dir = std::env::temp_dir().join(format!("irlume-detect-path-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // An empty search path leaves only the FHS answer, and this machine may
+    // legitimately have one, so compare against that fact rather than assume.
+    let fhs_present = [
+        "/usr/local/bin/irlumed",
+        "/usr/bin/irlumed",
+        "/run/current-system/sw/bin/irlumed",
+    ]
+    .iter()
+    .any(|p| std::path::Path::new(p).exists());
+    assert_eq!(irlumed_binary_in(Some(dir.as_os_str())), fhs_present);
+    assert_eq!(irlumed_binary_in(None), fhs_present);
+
+    // The Nix-shaped case: nowhere in FHS, but on the search path.
+    std::fs::write(dir.join("irlumed"), b"#!/bin/sh\n").unwrap();
+    assert!(
+        irlumed_binary_in(Some(dir.as_os_str())),
+        "a daemon on PATH (a Nix profile link) is installed"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

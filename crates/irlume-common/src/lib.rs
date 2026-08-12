@@ -500,9 +500,6 @@ pub enum Request {
     },
     /// Toggle the per-user "require eyes open to unlock" gate. PRIVILEGED.
     SetRequireEyesOpen { user: String, on: bool },
-    /// Toggle the per-user "require blink challenge to unlock" gate (temporal
-    /// liveness vs static prints, ADR-0002). PRIVILEGED.
-    SetRequireChallenge { user: String, on: bool },
     /// Capture a short IR sequence and return the MEDIAN eye-aspect-ratio over
     /// it: one phase of the deliberate-closure consent calibration. The caller
     /// prompts the user (eyes open, then eyes closed) and sends this once per
@@ -758,6 +755,25 @@ pub enum Response {
         /// Liveness verdict; auth is granted only if `live` AND score>=threshold.
         live: bool,
         reason: String,
+        /// True when the refusal came from POLICY rather than from looking at a
+        /// face: the configured method is fingerprint, the RGB-only convenience
+        /// tier does not allow this service, the opt-in biopolicy gate refuses
+        /// it, or the user is rate-limited. Every one of those answers
+        /// `granted: false, live: false`, which a reader cannot tell apart from
+        /// a spoof verdict, so `auth test` reported them all as "not-live" and a
+        /// desktop told the user their face looked fake. `#[serde(default)]` so
+        /// an older daemon decodes as false.
+        #[serde(default)]
+        refused_by_policy: bool,
+        /// True only when this refusal is a DELIBERATE head-shake decline (the
+        /// daemon's consent watch saw a shake and cancelled), never for a timeout,
+        /// a no-match, or a pre-camera policy denial. pam_irlume maps a polkit
+        /// shake-decline to `PAM_ABORT` so the agent closes its dialog; every other
+        /// non-grant stays a soft `IGNORE` that cascades to the password. Fail-safe:
+        /// a shake can only DENY, never grant. `#[serde(default)]` so an older
+        /// daemon that never sets it decodes as `false` (no abort).
+        #[serde(default)]
+        declined_by_gesture: bool,
     },
     Profiles(Vec<String>),
     /// Answer to [`Request::ListCameras`]: every physical camera exposing an
@@ -773,11 +789,10 @@ pub enum Response {
         reason: String,
     },
     /// Structured enrollment listing: profiles (each with its scan names) plus
-    /// the per-user require-eyes-open and require-challenge settings.
+    /// the per-user require-eyes-open setting.
     Enrollment {
         profiles: Vec<ProfileSummary>,
         require_eyes_open: bool,
-        require_challenge: bool,
         /// Whether a usable eye-closure consent calibration is stored (for the
         /// polkit gesture); surfaced so `doctor` can flag wired-but-uncalibrated.
         #[serde(default)]
@@ -1074,6 +1089,38 @@ mod tests {
             panic!("round-trip changed the variant");
         };
         assert_eq!(ambient_lit, None, "absent must be None, not Some(0)");
+    }
+
+    #[test]
+    fn auth_result_without_declined_by_gesture_reads_false() {
+        // An OLDER daemon never sets declined_by_gesture. The new pam_irlume must
+        // decode the absent field as FALSE, never abort a polkit dialog on an
+        // ordinary timeout or no-match: #[serde(default)] must stay a false default.
+        // Set the source true so a truthy default (or a failed strip) cannot pass by
+        // accident. Mirrors enrolled_without_ambient_lit_reads_as_daemon_did_not_say.
+        let full = super::Response::AuthResult {
+            granted: false,
+            score: 0.0,
+            live: true,
+            reason: "no match".into(),
+            declined_by_gesture: true,
+            refused_by_policy: false,
+        };
+        let mut v = serde_json::to_value(&full).expect("serialize");
+        let obj = v
+            .get_mut("AuthResult")
+            .and_then(|e| e.as_object_mut())
+            .expect("externally tagged AuthResult object");
+        obj.remove("declined_by_gesture").expect("field serializes");
+        let old: super::Response = serde_json::from_value(v).expect("older-daemon shape parses");
+        let super::Response::AuthResult {
+            declined_by_gesture,
+            ..
+        } = old
+        else {
+            panic!("round-trip changed the variant");
+        };
+        assert!(!declined_by_gesture, "absent must decode false (no abort)");
     }
 
     /// Every directory whose entry has to survive is in the chain, shallowest

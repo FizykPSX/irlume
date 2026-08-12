@@ -767,7 +767,24 @@ fn main() {
                         let mut engine = WorkerEngine::attach(engine, &arbiter);
                         while let Some(job) = arbiter.take() {
                             note_worker_progress();
-                            let Queued { req, peer, reply } = job.payload;
+                            let Queued {
+                                req,
+                                peer,
+                                reply,
+                                link,
+                            } = job.payload;
+                            // The client left while this sat in the queue: never open
+                            // the camera for an answer nobody is waiting for. Release
+                            // the slot first, exactly as the normal path does, so the
+                            // uid is not locked out of the camera.
+                            if !link.claim() {
+                                arbiter.finish(job.class, job.uid);
+                                irlume_common::dlog!(
+                                    "queued request dropped: its client disconnected first"
+                                );
+                                note_worker_idle();
+                                continue;
+                            }
                             // Isolate each request behind catch_unwind. A panic deep in
                             // frame decode or inference (e.g. a V4L2 driver echoing back
                             // a 0-dimension or short-buffered frame) must deny THIS one
@@ -779,7 +796,10 @@ fn main() {
                             }));
                             // Release the slot before anything else can fail, so a
                             // panicking request cannot lock its uid out of the camera
-                            // until the daemon restarts.
+                            // until the daemon restarts. The link is released in the
+                            // same breath: once this job no longer holds the camera, a
+                            // late disconnect on it must not cancel the next job.
+                            link.released();
                             arbiter.finish(job.class, job.uid);
                             let resp = match outcome {
                                 Ok(resp) => resp,
@@ -1114,7 +1134,12 @@ fn env_or(key: &str, default: &str) -> String {
 /// turn on via `IRLUME_ENFORCE_BIOPOLICY=1` or `enforce_biopolicy=1` in
 /// `/etc/irlume/settings.conf`. When off, behaviour is unchanged.
 fn biopolicy_enforced() -> bool {
-    let truthy = |s: &str| matches!(s.trim(), "1" | "true" | "yes" | "on");
+    // The SHARED `truthy`, not a local copy. The copy here matched lowercase
+    // literals against a trimmed value, so `enforce_biopolicy=YES` read as off
+    // while `credential_release_challenge=YES` read as on: one operator spelling,
+    // two answers, and the one that silently lost was a gate somebody had asked
+    // for. Every other key in this file's config already uses the shared reader.
+    use irlume_common::config::truthy;
     if let Ok(v) = std::env::var("IRLUME_ENFORCE_BIOPOLICY") {
         return truthy(&v);
     }
@@ -1273,6 +1298,100 @@ struct Queued {
     req: Request,
     peer: Peer,
     reply: std::sync::mpsc::Sender<Response>,
+    /// Lets the worker learn that this request's client has gone away.
+    link: std::sync::Arc<ClientLink>,
+}
+
+/// The handshake between one connection thread and the camera worker, so work a
+/// client no longer wants stops instead of running to completion.
+///
+/// Without it the worker only discovers a departed client when it tries to send
+/// the reply, so closing a polkit dialog left the IR emitter lit and the camera
+/// capturing for the rest of the budget (observed 2026-08-11). The arbiter's
+/// [`arbiter::CancelToken`] is SHARED by every job, so "the client left, stop the
+/// capture" is only correct for the job that actually holds the camera; this pairs
+/// each connection with its own job so a departing client can never cancel someone
+/// else's authentication.
+#[derive(Default)]
+struct ClientLink {
+    /// Set by the worker when this job starts and owns the camera.
+    running: std::sync::atomic::AtomicBool,
+    /// Set by the connection thread when its peer disconnects.
+    abandoned: std::sync::atomic::AtomicBool,
+}
+
+impl ClientLink {
+    /// Worker side: take ownership of this job. `false` means the client already
+    /// left while the job sat in the queue, so the camera must never open for it.
+    fn claim(&self) -> bool {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        if self.abandoned.load(Acquire) {
+            return false;
+        }
+        self.running.store(true, Release);
+        true
+    }
+
+    /// Worker side: this job is done and no longer owns the camera. Keeps a late
+    /// disconnect on a finished job from cancelling whatever runs next.
+    fn released(&self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Connection side: the peer is gone. `true` means this job is RUNNING and the
+    /// capture should be cancelled; `false` means it is still queued and `claim`
+    /// will drop it, so nothing needs cancelling.
+    ///
+    /// Ordered abandoned-then-running against `claim`'s running-after-abandoned, so
+    /// the two cannot both decide to skip: whichever runs first, the job either
+    /// gets dropped by `claim` or cancelled here. The one interleaving that falls
+    /// through both (claim reads `abandoned` false, then this reads `running`
+    /// false, then claim stores `running`) lets the capture finish uncancelled,
+    /// which wastes the remaining budget but can never cancel a different job or
+    /// grant anything. Fail-safe by construction.
+    fn abandon(&self) -> bool {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        self.abandoned.store(true, Release);
+        self.running.load(Acquire)
+    }
+}
+
+/// Has the peer closed its end?
+///
+/// `MSG_PEEK` so a byte that IS there stays there, `MSG_DONTWAIT` so a waiting
+/// connection thread never blocks here. Only a clean `0` (orderly shutdown) and a
+/// reset connection count as gone; every other answer, including an unexpected
+/// error, reads as still-connected, because the cost of being wrong in that
+/// direction is a few wasted seconds of camera while being wrong the other way
+/// cancels a live authentication.
+fn peer_gone(stream: &UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut byte = 0u8;
+    // SAFETY: `stream` owns the fd for the whole call, and the buffer is one byte
+    // of stack we hold exclusively. MSG_DONTWAIT means no blocking, MSG_PEEK means
+    // nothing is consumed from the socket.
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            std::ptr::addr_of_mut!(byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if n == 0 {
+        return true; // orderly shutdown: the client closed
+    }
+    if n < 0 {
+        // ECONNRESET/ENOTCONN are also "gone"; EAGAIN is the normal "still here,
+        // nothing pending" answer while the worker works.
+        let err = std::io::Error::last_os_error();
+        return matches!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::NotConnected
+        );
+    }
+    false // a byte is pending (pipelined or stray): the peer is still there
 }
 
 /// How long a connection thread waits for the worker before giving up.
@@ -1281,6 +1400,12 @@ struct Queued {
 /// retries is minutes of legitimate work. This is a backstop against a wedged
 /// worker leaving connection threads parked forever, not a latency control.
 const WORKER_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often a waiting connection thread checks whether its client is still
+/// there. Short enough that a cancelled polkit dialog stops the camera while the
+/// user is still looking at the screen, long enough that a parked thread costs
+/// four wakeups a second. The check itself is one non-blocking `recv`.
+const CLIENT_ALIVE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// True the first time this uid is refused an unseal for not being root.
 ///
@@ -1870,10 +1995,12 @@ fn serve(
                 }
             }
             let (reply, answer) = std::sync::mpsc::channel();
+            let link = std::sync::Arc::new(ClientLink::default());
             let queued = Queued {
                 req,
                 peer: peer.clone(),
                 reply,
+                link: std::sync::Arc::clone(&link),
             };
             if let Err(refusal) = arbiter.submit(class, peer.uid, queued) {
                 // Refused, not queued: answer now so the client can retry rather
@@ -1883,13 +2010,41 @@ fn serve(
                 record_refusal(peer.uid);
                 return respond(stream, &Response::Error(refusal.message().into()));
             }
-            let resp = match answer.recv_timeout(WORKER_REPLY_TIMEOUT) {
-                Ok(resp) => resp,
-                // The worker dropped the sender (it panicked and the reply never
-                // came) or took longer than the backstop. Either way this
-                // request has no answer, and a client that gets an error falls
-                // back to the password.
-                Err(_) => Response::Error("request did not complete".into()),
+            // Wait for the worker, checking between slices whether the client is
+            // still there. A polkit dialog the user dismissed (or that closed on a
+            // head-shake) takes its helper process with it, and nothing else tells
+            // the worker to stop: it would hold the camera and the IR emitter for
+            // the rest of the budget for an answer nobody will read.
+            let deadline = std::time::Instant::now() + WORKER_REPLY_TIMEOUT;
+            let resp = loop {
+                match answer.recv_timeout(CLIENT_ALIVE_POLL) {
+                    Ok(resp) => break resp,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if std::time::Instant::now() >= deadline {
+                            break Response::Error("request did not complete".into());
+                        }
+                        if peer_gone(&stream) {
+                            // Cancel ONLY if this connection's own job holds the
+                            // camera; a job still queued is dropped by `claim`
+                            // instead, so another user's authentication is never
+                            // cancelled by someone else hanging up.
+                            if link.abandon() {
+                                arbiter.cancel_token().request_stop();
+                                irlume_common::dlog!(
+                                    "client disconnected mid-request; asked the capture to stop"
+                                );
+                            }
+                            // Nothing to answer: the socket is gone.
+                            return Ok(());
+                        }
+                    }
+                    // The worker dropped the sender (it panicked and the reply never
+                    // came). This request has no answer, and a client that gets an
+                    // error falls back to the password.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break Response::Error("request did not complete".into())
+                    }
+                }
             };
             respond(stream, &resp)
         }
@@ -2008,7 +2163,6 @@ fn posture(req: &Request) -> RequestPosture<'_> {
         | RenameProfile { user, .. }
         | RenameScan { user, .. }
         | SetRequireEyesOpen { user, .. }
-        | SetRequireChallenge { user, .. }
         | SetClosureCalibration { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "modify" },
             user: Some(user.as_str()),
@@ -2236,7 +2390,6 @@ fn publish_engine_bits(engine: &irlume_auth::Engine) {
 struct EnrollmentSummary {
     profiles: Vec<irlume_common::ProfileSummary>,
     require_eyes_open: bool,
-    require_challenge: bool,
     closure_calibrated: bool,
     ir_ratio_calibrated: bool,
 }
@@ -2278,7 +2431,6 @@ fn summarize_enrollment(
                 })
                 .collect(),
             require_eyes_open: enr.require_eyes_open,
-            require_challenge: enr.require_challenge,
             closure_calibrated: enr
                 .closure_calibration
                 .map(|(o, c)| {
@@ -2297,7 +2449,6 @@ fn summarize_enrollment(
         None => EnrollmentSummary {
             profiles: Vec::new(),
             require_eyes_open: false,
-            require_challenge: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         },
@@ -2528,7 +2679,6 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
                 Some(sum) => Response::Enrollment {
                     profiles: sum.profiles,
                     require_eyes_open: sum.require_eyes_open,
-                    require_challenge: sum.require_challenge,
                     closure_calibrated: sum.closure_calibrated,
                     ir_ratio_calibrated: sum.ir_ratio_calibrated,
                 },
@@ -2874,7 +3024,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     Response::Enrollment {
                         profiles: sum.profiles,
                         require_eyes_open: sum.require_eyes_open,
-                        require_challenge: sum.require_challenge,
                         closure_calibrated: sum.closure_calibrated,
                         ir_ratio_calibrated: sum.ir_ratio_calibrated,
                     }
@@ -2907,6 +3056,8 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     score: 0.0,
                     live: false,
                     reason: "face auth disabled: the configured method is fingerprint".into(),
+                    declined_by_gesture: false,
+                    refused_by_policy: true,
                 };
             }
             // Smart-Auto tier gate: on a CONVENIENCE (RGB-only) device, a face
@@ -2941,6 +3092,8 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         reason: format!(
                             "RGB-only convenience: face limited to screen unlock (not {class:?})"
                         ),
+                        declined_by_gesture: false,
+                        refused_by_policy: true,
                     };
                 }
             }
@@ -2958,6 +3111,8 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         score: 0.0,
                         live: false,
                         reason: format!("biopolicy: face may not satisfy '{svc}'"),
+                        declined_by_gesture: false,
+                        refused_by_policy: true,
                     };
                 }
             }
@@ -2968,6 +3123,8 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     score: 0.0,
                     live: false,
                     reason: "too many recent face attempts; use your password".into(),
+                    declined_by_gesture: false,
+                    refused_by_policy: true,
                 };
             }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
@@ -2991,6 +3148,23 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         granted: o.granted,
                         score: o.score,
                         live: o.live,
+                        // The ONE site that carries the engine outcome onto the wire:
+                        // a deliberate head-shake becomes the flag pam_irlume aborts a
+                        // polkit dialog on, and only it. Every other outcome kind, and
+                        // every policy early-return above, is false. `is_gesture_decline`
+                        // and the shared `gesture_declined` constructor are unit-tested
+                        // (a revert of the shake kind to OtherDeny fails there), but this
+                        // call site itself, and the live detection path shake ->
+                        // gesture_declined, are covered ONLY by the hardware gesture test:
+                        // nothing camera-less forces a GestureDeclined outcome through
+                        // dispatch, so a `false` slip here would pass the suite (see the
+                        // handoff's coverage gap). Evaluated before the `reason` move: it
+                        // borrows `o`, the move does not.
+                        declined_by_gesture: irlume_auth::is_gesture_decline(&o),
+                        // This arm carries an ENGINE verdict: a face was looked
+                        // at (or looked for). The policy refusals return above,
+                        // before the camera.
+                        refused_by_policy: false,
                         reason: o.reason,
                     }
                 }
@@ -3629,13 +3803,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             enr.require_eyes_open = on;
             Ok(format!(
                 "require-eyes-open {}",
-                if on { "ENABLED" } else { "disabled" }
-            ))
-        }),
-        Request::SetRequireChallenge { user, on } => mutate_enrollment(&user, |enr| {
-            enr.require_challenge = on;
-            Ok(format!(
-                "require-challenge {}",
                 if on { "ENABLED" } else { "disabled" }
             ))
         }),
@@ -5095,10 +5262,6 @@ mod tests {
             user: u(),
             on: true,
         },
-        SetRequireChallenge => Request::SetRequireChallenge {
-            user: u(),
-            on: false,
-        },
         CaptureEarMedian => Request::CaptureEarMedian { user: u() },
         SetClosureCalibration => Request::SetClosureCalibration {
             user: u(),
@@ -5518,7 +5681,6 @@ mod tests {
                                 live_recognizer: None,
                             }],
                             require_eyes_open: false,
-                            require_challenge: false,
                             closure_calibrated: false,
                             ir_ratio_calibrated: false,
                         },
@@ -5638,6 +5800,7 @@ mod tests {
                         pid: 0,
                     },
                     reply: dead_reply,
+                    link: std::sync::Arc::new(ClientLink::default()),
                 },
             )
             .unwrap();
@@ -5676,6 +5839,67 @@ mod tests {
             });
             assert!(check(&resp), "wedged queue must not delay status: {resp:?}");
         }
+    }
+
+    #[test]
+    fn peer_gone_reads_a_closed_peer_and_only_a_closed_peer() {
+        // The primitive the disconnect check rests on, against a real socket pair
+        // rather than an assumption about what `recv` returns. Being wrong in the
+        // "gone" direction cancels a live authentication, so both states are pinned.
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        assert!(
+            !peer_gone(&ours),
+            "an open peer must never read as gone (that would cancel a live auth)"
+        );
+        // Pending data is not a disconnect either: MSG_PEEK must leave it alone.
+        (&theirs).write_all(b"x").expect("write");
+        assert!(
+            !peer_gone(&ours),
+            "a peer that sent a byte is still connected"
+        );
+        drop(theirs);
+        // The byte is still buffered, so the socket only reports EOF once it is
+        // drained; drain it, then the orderly shutdown must be visible.
+        let mut buf = [0u8; 1];
+        let _ = (&ours).read(&mut buf);
+        assert!(peer_gone(&ours), "a closed peer must be detected");
+    }
+
+    #[test]
+    fn a_departing_client_cancels_only_its_own_running_job() {
+        // The cancellation token is shared by every job, so "the client left" may
+        // only stop the capture when THIS connection's job is the one holding the
+        // camera. Both orderings are pinned because the wrong one cancels a
+        // different user's authentication.
+        //
+        // Queued, then abandoned: nothing to cancel, and the worker must drop it.
+        let queued = ClientLink::default();
+        assert!(
+            !queued.abandon(),
+            "a job that never started must not cancel the running capture"
+        );
+        assert!(
+            !queued.claim(),
+            "the worker must skip a job whose client already left"
+        );
+
+        // Running, then abandoned: this IS the camera holder, so cancel it.
+        let running = ClientLink::default();
+        assert!(running.claim(), "a fresh job is claimable");
+        assert!(
+            running.abandon(),
+            "a running job's client leaving must cancel the capture"
+        );
+
+        // Finished, then a late disconnect: the job no longer owns the camera, so it
+        // must not cancel whatever the worker started next.
+        let finished = ClientLink::default();
+        assert!(finished.claim());
+        finished.released();
+        assert!(
+            !finished.abandon(),
+            "a finished job must not cancel the job that followed it"
+        );
     }
 
     #[test]
@@ -5752,7 +5976,6 @@ mod tests {
                     live_recognizer: None,
                 }],
                 require_eyes_open: true,
-                require_challenge: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: true,
             },
@@ -5796,7 +6019,6 @@ mod tests {
             "RenameProfile",
             "RenameScan",
             "SetRequireEyesOpen",
-            "SetRequireChallenge",
             "SetClosureCalibration",
             "RecoverySetup",
             "RecoveryRestore",
@@ -5843,7 +6065,6 @@ mod tests {
             EnrollmentSummary {
                 profiles: Vec::new(),
                 require_eyes_open: true,
-                require_challenge: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
@@ -5952,6 +6173,7 @@ mod tests {
                         pid: 0,
                     },
                     reply: _dead_reply,
+                    link: std::sync::Arc::new(ClientLink::default()),
                 },
             )
             .unwrap();
@@ -6411,9 +6633,19 @@ mod tests {
         std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", "0");
         assert!(!biopolicy_enforced());
         std::fs::write(dir.join("settings.conf"), "enforce_biopolicy=0\n").unwrap();
-        for truthy in ["1", "true", "yes", "on", " on "] {
+        // Case-insensitive, like every other config key: this reader used a local
+        // copy of `truthy` that compared against lowercase literals, so an
+        // operator who wrote `YES` had the gate silently NOT enforced while the
+        // same spelling enabled the keyring gesture.
+        for truthy in [
+            "1", "true", "yes", "on", " on ", "YES", "On", "TRUE", " Yes ",
+        ] {
             std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", truthy);
             assert!(biopolicy_enforced(), "{truthy:?} must enable");
+        }
+        for falsy in ["0", "false", "no", "off", "NO", "Off", "", "wat"] {
+            std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", falsy);
+            assert!(!biopolicy_enforced(), "{falsy:?} must not enable");
         }
         std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY");
         std::env::remove_var("IRLUME_CONFIG_DIR");
@@ -6421,9 +6653,9 @@ mod tests {
     }
 
     /// The POLICY read behind credential release: `temporal_challenge` tracks the
-    /// live setting so a toggle needs no daemon restart, and DEFAULT ON means an
-    /// absent key still requires the gesture, which is the whole point of the
-    /// change.
+    /// live setting so a toggle needs no daemon restart, and DEFAULT OFF means an
+    /// absent key releases the keyring with no nod (a greeter cold login / logout).
+    /// Only an explicit truthy opt-in adds the gesture.
     ///
     /// Scope, stated plainly: this covers the helper, not the dispatch. That
     /// `UnsealPassword` runs under this purpose rests on
@@ -6434,7 +6666,7 @@ mod tests {
     /// (`no_credential_release_failure_mode_ever_grants`) and the end-to-end proof
     /// in irlume-pam (`pamwrap_refused_challenge_falls_through_to_the_password_module`).
     #[test]
-    fn credential_release_purpose_defaults_to_a_required_challenge() {
+    fn credential_release_purpose_defaults_to_no_challenge() {
         use irlume_auth::AuthenticationPurpose::CredentialRelease;
         let _g = env_lock();
         let dir = std::env::temp_dir().join(format!("irlume-crp-{}", std::process::id()));
@@ -6443,26 +6675,15 @@ mod tests {
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
         std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
 
-        // No settings.conf at all: the challenge is REQUIRED.
-        assert_eq!(
-            credential_release_purpose(),
-            CredentialRelease {
-                temporal_challenge: true
-            },
-            "an absent key must still require the gesture"
-        );
-        // An explicit opt-out, read live, is the only way to drop it.
-        std::fs::write(
-            dir.join("settings.conf"),
-            "credential_release_challenge=off\n",
-        )
-        .unwrap();
+        // No settings.conf at all: the challenge is OFF (the default).
         assert_eq!(
             credential_release_purpose(),
             CredentialRelease {
                 temporal_challenge: false
-            }
+            },
+            "an absent key must release the keyring with no nod"
         );
+        // An explicit opt-in, read live, is the only way to add it.
         std::fs::write(
             dir.join("settings.conf"),
             "credential_release_challenge=on\n",
@@ -6472,6 +6693,17 @@ mod tests {
             credential_release_purpose(),
             CredentialRelease {
                 temporal_challenge: true
+            }
+        );
+        std::fs::write(
+            dir.join("settings.conf"),
+            "credential_release_challenge=off\n",
+        )
+        .unwrap();
+        assert_eq!(
+            credential_release_purpose(),
+            CredentialRelease {
+                temporal_challenge: false
             }
         );
         // Whatever the setting says, the purpose is never Verify or AppConsent:
@@ -6836,7 +7068,6 @@ mod tests {
                     .collect(),
             }],
             require_eyes_open: false,
-            require_challenge: false,
             camera_binding: None,
             closure_calibration: None,
         }
@@ -6962,9 +7193,16 @@ mod tests {
                 score,
                 live,
                 reason,
+                declined_by_gesture,
+                refused_by_policy,
             } => {
                 assert!(!granted && !live);
                 assert_eq!(score, 0.0);
+                // A policy refusal is never a gesture decline: only a shake sets it.
+                assert!(!declined_by_gesture);
+                // …and it IS a policy refusal, which is what tells `auth test`
+                // to stop reporting it as a liveness verdict.
+                assert!(refused_by_policy);
                 assert_eq!(
                     reason,
                     "face auth disabled: the configured method is fingerprint"
@@ -7110,7 +7348,6 @@ mod tests {
             Response::Enrollment {
                 profiles,
                 require_eyes_open,
-                require_challenge,
                 ..
             } => {
                 assert_eq!(profiles.len(), 1);
@@ -7120,7 +7357,6 @@ mod tests {
                     vec!["Face Scan 1".to_string(), "Face Scan 2".to_string()]
                 );
                 assert!(require_eyes_open);
-                assert!(!require_challenge);
             }
             other => panic!("expected Response::Enrollment, got {other:?}"),
         }
@@ -7171,7 +7407,6 @@ mod tests {
                     live_recognizer: None,
                 }],
                 require_eyes_open: false,
-                require_challenge: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
@@ -7617,7 +7852,6 @@ mod tests {
             EnrollmentSummary {
                 profiles: Vec::new(),
                 require_eyes_open: false,
-                require_challenge: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
@@ -7773,17 +8007,6 @@ mod tests {
             Response::Error(msg) => assert!(msg.contains("cannot be enabled"), "{msg}"),
             other => panic!("enabling require-eyes-open must be refused, got {other:?}"),
         }
-        expect_ok(
-            dispatch(
-                Request::SetRequireChallenge {
-                    user: "carol".into(),
-                    on: false,
-                },
-                &root,
-                &mut e,
-            ),
-            "require-challenge disabled",
-        );
         // The saved state reflects every mutation.
         match dispatch(
             Request::ListProfiles {
@@ -7796,7 +8019,6 @@ mod tests {
             Response::Enrollment {
                 profiles,
                 require_eyes_open,
-                require_challenge,
                 ..
             } => {
                 assert_eq!(profiles.len(), 1);
@@ -7807,7 +8029,6 @@ mod tests {
                 // second way, through the published enrollment rather than
                 // through storage.
                 assert!(!require_eyes_open);
-                assert!(!require_challenge);
             }
             other => panic!("expected Response::Enrollment, got {other:?}"),
         }

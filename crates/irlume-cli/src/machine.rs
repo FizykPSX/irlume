@@ -445,7 +445,11 @@ pub fn status(args: &[String]) -> ExitCode {
                 "keyring": keyring,
                 "recovery": recovery,
                 "camera": camera,
-                "fingerprint": irlume_fingerprint::device_name().is_some(),
+                // "Whether a fingerprint reader was found", as the schema puts
+                // it: fprintd present AND a reader present, the same predicate
+                // doctor's line and its `fingerprint-reader` check use. Naming
+                // the device is a narrower question and disagreed with both.
+                "fingerprint": irlume_fingerprint::available(),
             }),
             contract,
         ),
@@ -1314,7 +1318,16 @@ pub fn login_apply(args: &[String]) -> ExitCode {
         // On disable the marker goes entirely, because a disable unwires every
         // surface including those two.
         let (with_sudo, with_polkit, _) = crate::pamwire::read_wired_marker().unwrap_or_default();
-        crate::pamwire::write_wired_marker(enable, with_sudo, with_polkit, enable);
+        // `with_lock` records whether the lock screen IS wired, not whether this
+        // was an enable. Passing `enable` claimed one on every host, including
+        // those that wire no lock screen at all, and reconcile then reads a
+        // surface that was never ours as a regression to repair.
+        crate::pamwire::write_wired_marker(
+            enable,
+            with_sudo,
+            with_polkit,
+            enable && crate::pamwire::lock_wired(),
+        );
     }
     let changes: Vec<Value> = applied
         .iter()
@@ -1737,18 +1750,23 @@ pub fn auth_test(args: &[String]) -> ExitCode {
     }
     let user = crate::user_arg(args);
 
+    // Both of these happen BEFORE the stream begins, and the contract is explicit
+    // about that boundary: a refusal before the stream is a single document with
+    // exit 2, while exit 1 means the stream started and then failed. Returning 1
+    // here told a consumer a capture had begun and died when nothing had run, and
+    // `session-busy` is precisely the case a caller retries on.
     let session = match SessionGuard::acquire() {
         Ok(session) => session,
         Err(SessionRefusal::Busy) => {
             return emit(
                 &failure(COMMAND, "session-busy", true, contract),
-                ExitCode::FAILURE,
+                ExitCode::from(2),
             )
         }
         Err(SessionRefusal::Unavailable) => {
             return emit(
                 &failure(COMMAND, "operation-failed", false, contract),
-                ExitCode::FAILURE,
+                ExitCode::from(2),
             )
         }
     };
@@ -1765,12 +1783,19 @@ pub fn auth_test(args: &[String]) -> ExitCode {
         // surface, so it must not inherit any surface's tier allowances.
         service: None,
     }) {
-        Ok(Response::AuthResult { granted, live, .. }) => stream.finish(
+        Ok(Response::AuthResult {
+            granted,
+            live,
+            declined_by_gesture,
+            refused_by_policy,
+            ..
+        }) => stream.finish(
             "result",
             json!({
                 "granted": granted,
                 "live": live,
                 "reason": auth_reason(granted, live),
+                "refusal": auth_refusal(granted, live, declined_by_gesture, refused_by_policy),
             }),
             // A refusal is a successful test that answered "no". The command
             // failing and the face not matching are different things, and a
@@ -1792,6 +1817,37 @@ pub fn auth_test(args: &[String]) -> ExitCode {
 /// Derived from the two booleans the daemon already returns, never from its
 /// prose. That keeps a reworded daemon message from becoming a breaking API
 /// change, which is the same rule the single-document commands follow.
+/// Why a refusal happened, at a granularity `reason` cannot express.
+///
+/// `reason` has three published values and a schema that pins them, so it cannot
+/// learn a fourth inside this contract. It also cannot tell the truth about a
+/// POLICY refusal: the configured method being fingerprint, the RGB-only
+/// convenience tier, the opt-in biopolicy gate and the rate limiter all answer
+/// `granted: false, live: false`, which `reason` reports as `not-live`, telling a
+/// desktop the user's face looked fake when no face was ever examined. A head
+/// shake had the same problem: a deliberate decline read as a spoof verdict.
+///
+/// Added as a NEW field rather than a new `reason` value, which is what the
+/// contract allows: a consumer written against contract 1 keeps reading `reason`
+/// exactly as before, and one that wants the distinction reads this.
+fn auth_refusal(
+    granted: bool,
+    live: bool,
+    declined_by_gesture: bool,
+    refused_by_policy: bool,
+) -> Option<&'static str> {
+    if granted {
+        return None;
+    }
+    if refused_by_policy {
+        return Some("policy");
+    }
+    if declined_by_gesture {
+        return Some("declined");
+    }
+    Some(if live { "no-match" } else { "not-live" })
+}
+
 fn auth_reason(granted: bool, live: bool) -> &'static str {
     match (granted, live) {
         (true, _) => "granted",
@@ -1872,12 +1928,11 @@ pub fn profiles_list(args: &[String]) -> ExitCode {
         Ok(Response::Enrollment {
             profiles,
             require_eyes_open,
-            require_challenge,
             ..
         }) => emit(
             &success(
                 COMMAND,
-                profiles_data(profiles, require_eyes_open, require_challenge),
+                profiles_data(profiles, require_eyes_open),
                 contract,
             ),
             ExitCode::SUCCESS,
@@ -2051,11 +2106,7 @@ fn third_party_data(stage: irlume_common::thirdparty::Stage) -> Value {
     json!({ "enabled": enabled, "catalog": catalog })
 }
 
-fn profiles_data(
-    profiles: Vec<ProfileSummary>,
-    require_eyes_open: bool,
-    require_challenge: bool,
-) -> Value {
+fn profiles_data(profiles: Vec<ProfileSummary>, require_eyes_open: bool) -> Value {
     // The current enrollment store identifies profiles and scans by their
     // names. Do not falsely present those names as opaque stable IDs. A later
     // contract capability can add mutation-safe IDs after the store owns them.
@@ -2104,13 +2155,41 @@ fn profiles_data(
         .collect::<Vec<_>>();
     json!({
         "profiles": profiles,
-        "require_eyes_open": require_eyes_open,
-        "require_challenge": require_challenge
+        "require_eyes_open": require_eyes_open
     })
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// A refusal that never looked at a face must not be reported as a liveness
+    /// verdict.
+    ///
+    /// The configured method, the RGB-only tier, the biopolicy gate and the rate
+    /// limiter all answer `granted: false, live: false`, and `reason` has three
+    /// published values with no room for a fourth, so every one of them read as
+    /// `not-live`: a desktop told the user their face looked fake when nothing
+    /// had examined it. `reason` keeps its meaning; `refusal` carries the truth.
+    #[test]
+    fn a_policy_refusal_is_not_reported_as_a_liveness_verdict() {
+        // Granted: no refusal at all.
+        assert_eq!(auth_refusal(true, true, false, false), None);
+
+        // Policy, which the daemon flags before any capture. `reason` still says
+        // not-live, because its values are published and fixed.
+        assert_eq!(auth_refusal(false, false, false, true), Some("policy"));
+        assert_eq!(auth_reason(false, false), "not-live");
+
+        // A deliberate decline is its own thing, not a spoof verdict.
+        assert_eq!(auth_refusal(false, false, true, false), Some("declined"));
+
+        // The two verdicts that DID look at a face keep their meaning.
+        assert_eq!(auth_refusal(false, true, false, false), Some("no-match"));
+        assert_eq!(auth_refusal(false, false, false, false), Some("not-live"));
+
+        // Policy wins over a gesture flag: it refused before the watch could run.
+        assert_eq!(auth_refusal(false, false, true, true), Some("policy"));
+    }
     use super::*;
 
     #[test]
@@ -2231,7 +2310,6 @@ mod tests {
                 live_recognizer: None,
             }],
             false,
-            false,
         );
         let profile = &data["profiles"][0];
         assert_eq!(profile["scans"].as_array().unwrap().len(), 2);
@@ -2249,7 +2327,6 @@ mod tests {
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
             }],
-            false,
             false,
         );
         assert_eq!(
@@ -2277,7 +2354,6 @@ mod tests {
                 scans_by_recognizer: counts,
                 live_recognizer: Some("embed:model-b".into()),
             }],
-            false,
             false,
         );
         let recs = data["profiles"][0]["recognizers"].as_array().unwrap();
@@ -2311,7 +2387,7 @@ mod tests {
             .expect("an older daemon's summary must still decode");
         assert!(old_wire.scans_by_recognizer.is_empty());
         assert!(old_wire.live_recognizer.is_none());
-        let data = profiles_data(vec![old_wire], false, false);
+        let data = profiles_data(vec![old_wire], false);
         // This used to assert an empty ARRAY. It now asserts the key is absent:
         // an empty array beside a populated `scans` list says "no recognizer has
         // templates in this profile", which is a definite claim the CLI cannot
@@ -3007,7 +3083,6 @@ mod tests {
                 live_recognizer: None,
             }],
             true,
-            false,
         );
 
         assert_eq!(data["profiles"][0]["display_name"], "Face Profile 1");
@@ -3015,7 +3090,6 @@ mod tests {
         assert!(data["profiles"][0].get("profile_id").is_none());
         assert!(data["profiles"][0]["scans"][0].get("scan_id").is_none());
         assert_eq!(data["require_eyes_open"], true);
-        assert_eq!(data["require_challenge"], false);
     }
 
     #[test]
