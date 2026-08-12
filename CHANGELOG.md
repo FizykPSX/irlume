@@ -5,6 +5,24 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **Metadata camera nodes classify without being opened.** Scanning used
+  to open every `/dev/video*` node to enumerate formats; on kernels before
+  6.16 each open powers the camera up (uvcvideo moved power-up into the
+  ioctl dispatcher in 6.16), a privacy-LED blink per node per scan. The
+  media graph now answers the capture-or-metadata question first, with no
+  video-node open: `/dev/media*` opens are documented side-effect free, a
+  capture entity owns pads, and the metadata sibling is registered
+  padless, so half of a UVC camera's nodes never open at all. Capture
+  nodes keep the ENUM_FMT probe on purpose: a descriptor-derived format
+  route was built and removed in review, because the blob cannot be
+  attributed to one of a function's possibly several streaming
+  interfaces, a userspace GUID table is a subset whose omissions change
+  the answer, and uvcvideo's per-device quirks rewrite the list the node
+  actually reports. On-hardware verification of the media-graph facts is
+  in `docs/research/2026-08-12-camera-session-measurements.md` (#428).
+
 ### Fixed
 
 - **The backlight-compensation tuning no longer outlives the session onto

@@ -26,6 +26,7 @@ pub mod emitter_journal;
 pub mod ir_dark;
 pub mod ir_emitter;
 mod ir_metadata;
+mod media_graph;
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code
 // path grows a reader of these files.
@@ -942,15 +943,57 @@ impl Unreadable {
     }
 }
 
-/// Classify a single `/dev/videoN` node by enumerating its pixel formats,
-/// keeping a failure to read the node apart from a node that read as neither
-/// kind. Defensive: enumerate FORMATS (safe), never `query_controls` (panics on
-/// some UVC drivers; a hard-won linhello lesson).
+/// The no-open half of classification (#428): the media graph says whether
+/// this is a UVC function's CAPTURE node or its metadata sibling, and
+/// opening `/dev/media*` is documented side-effect free where a video-node
+/// open on pre-6.16 kernels powers the camera up. A metadata node answers
+/// `Other` here, the same answer the open probe's EINVAL-at-ENUM_FMT arm
+/// gives it, without the open.
 ///
-/// `VIDIOC_QUERYCAP` runs first, because on an MC-centric node the format
-/// list is not evidence of anything (#425); see [`McCentric`].
+/// A CAPTURE node deliberately answers `None` and takes the open probe. A
+/// descriptor-derived format route was built and REMOVED in review: a video
+/// node's sysfs parent names the UVC control function, not which of that
+/// function's possibly several streaming interfaces backs this node, so the
+/// blob cannot be attributed per node; the kernel skips formats with GUIDs
+/// it does not know, so any userspace table is a subset whose omissions
+/// change the enumerated set; and uvcvideo applies per-device quirks
+/// (`UVC_QUIRK_FORCE_Y8` and kin) that rewrite the list the node actually
+/// reports. Until all three can be reproduced faithfully, ENUM_FMT on the
+/// node is the only sound format authority (Codex round on this PR).
+///
+/// Every other `None` is the same honest fall-through: loopback nodes have
+/// no USB parent, MC-centric platform stacks keep meeting the #425
+/// QUERYCAP gate, and a failed sysfs read proves nothing. One asymmetry is
+/// accepted: a PADLESS node on a non-UVC media stack answers `Other` here
+/// without reaching the MC-centric gate, which ignores it exactly as the
+/// gate would, minus doctor naming it.
+fn classify_without_open(device: &str) -> Option<NodeKind> {
+    if !media_graph::node_is_capture(device)? {
+        return Some(NodeKind::Camera(Role::Other));
+    }
+    None
+}
+
+/// Classify a single `/dev/videoN` node, keeping a failure to read the node
+/// apart from a node that read as neither kind.
+///
+/// The primary path is `classify_without_open` above: on UVC hardware the role
+/// is fully decidable from sysfs and the media graph, and a video-node open
+/// on kernels before 6.16 powers the camera up (uvcvideo moved power-up
+/// into the ioctl dispatcher in 6.16), which is a privacy-LED blink per
+/// scan. The open probe remains for everything the no-open path cannot
+/// decide.
+///
+/// On the open path, `VIDIOC_QUERYCAP` runs first, because on an MC-centric
+/// node the format list is not evidence of anything (#425); see
+/// [`McCentric`]. Defensive: enumerate FORMATS (safe), never
+/// `query_controls` (panics on some UVC drivers; a hard-won linhello
+/// lesson).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn classify_node(device: &str) -> Result<NodeKind, Unreadable> {
+    if let Some(kind) = classify_without_open(device) {
+        return Ok(kind);
+    }
     let unreadable = |at, e: std::io::Error| Unreadable {
         path: device.to_string(),
         at,

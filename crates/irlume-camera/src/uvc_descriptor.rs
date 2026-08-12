@@ -50,7 +50,6 @@ const DESC_CS_INTERFACE: u8 = 0x24;
 const SUBTYPE_EXTENSION_UNIT: u8 = 0x06;
 const CLASS_VIDEO: u8 = 0x0E;
 const SUBCLASS_VIDEOCONTROL: u8 = 0x01;
-
 /// One `VC_EXTENSION_UNIT` descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionUnit {
@@ -379,7 +378,7 @@ fn ancestor_with(start: &Path, marker: &str) -> Option<PathBuf> {
     None
 }
 
-fn interface_dir(video_device: &str) -> std::io::Result<PathBuf> {
+pub(crate) fn interface_dir(video_device: &str) -> std::io::Result<PathBuf> {
     let node = Path::new(video_device)
         .file_name()
         .ok_or_else(|| bad(format!("{video_device} is not a device node path")))?;
