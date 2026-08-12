@@ -7,6 +7,20 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **A capture now verifies the device still holds the negotiated format once
+  it claims the buffers.** The V4L2 format is per-device state gated only on
+  buffer ownership, and ownership begins at REQBUFS, so between irlume's
+  open-time S_FMT and a session's buffer claim another application could
+  retarget the device and the capture would decode frames against stale
+  assumptions. Every stream open (sessions, their recovery paths, the
+  frozen-stream restarts, probes and emitter setup) now reads G_FMT back
+  after claiming the queue, at which point the format can no longer move,
+  and refuses when ANY negotiated field changed, naming it and, when
+  visible, who holds the camera. Every field matters, not just geometry:
+  quantization names the clipping ceiling the exposure refusal reads, and a
+  changed stride decodes rows at the wrong offsets. Source audit:
+  `docs/research/2026-08-12-camera-handling-audit.md`, Q3 (#427).
+
 - **Media-controller video nodes no longer classify as cameras.** On Intel
   IPU6/IPU7 laptops the `isys` driver registers up to eight capture nodes per
   CSI-2 port that all enumerate YUYV from a static table regardless of the

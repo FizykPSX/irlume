@@ -330,22 +330,139 @@ pub fn no_progress() -> Progress {
 pub const CAPTURE_SILENT_WINDOW_WORST_MS: u64 =
     STREAM_DEQUEUE_TIMEOUT.as_millis() as u64 + WARMUP_GAP.as_millis() as u64;
 
+/// Whether the device's current format still matches what open negotiated,
+/// naming the first field that moved. Pure, so the comparison is testable
+/// without a second process to race against (#427).
+///
+/// EVERY field of the negotiated format is compared, not just the geometry
+/// the decoders read directly. The first version checked width, height and
+/// fourcc and argued quantization was derived from them; the Codex round
+/// refuted that from the kernel spec (a capture application can request
+/// colorimetry conversion where the driver offers
+/// `V4L2_PIX_FMT_FLAG_SET_CSC`), and quantization is authentication-relevant
+/// here: it names the clipping ceiling (235 versus 255 in
+/// `clipping_white_level`), so a racing format change that held the geometry
+/// but flipped the range would either false-clip legitimate frames or, in
+/// the inverse direction, suppress the exposure refusal that protects the
+/// liveness cues. Stride matters the same way: the decoders treat rows as
+/// tightly packed, so a changed `bytesperline` at the same geometry would
+/// decode every row at the wrong offset. Comparing the rest costs nothing
+/// and refuses only when the device state genuinely differs from what this
+/// caller negotiated.
+///
+/// The enum fields compare by their wire discriminant (`as u32`) because the
+/// pinned v4l crate derives no `PartialEq` for them.
+fn format_moved(expect: &v4l::Format, now: &v4l::Format) -> Option<String> {
+    if now.fourcc.repr != expect.fourcc.repr {
+        return Some(format!(
+            "fourcc is now {}, negotiated {}",
+            fourcc_str(&now.fourcc.repr),
+            fourcc_str(&expect.fourcc.repr)
+        ));
+    }
+    if (now.width, now.height) != (expect.width, expect.height) {
+        return Some(format!(
+            "size is now {}x{}, negotiated {}x{}",
+            now.width, now.height, expect.width, expect.height
+        ));
+    }
+    if now.stride != expect.stride {
+        return Some(format!(
+            "stride is now {}, negotiated {}",
+            now.stride, expect.stride
+        ));
+    }
+    if now.size != expect.size {
+        return Some(format!(
+            "image size is now {}, negotiated {}",
+            now.size, expect.size
+        ));
+    }
+    if now.field_order as u32 != expect.field_order as u32 {
+        return Some(format!(
+            "field order is now {:?}, negotiated {:?}",
+            now.field_order, expect.field_order
+        ));
+    }
+    if now.colorspace as u32 != expect.colorspace as u32 {
+        return Some(format!(
+            "colorspace is now {:?}, negotiated {:?}",
+            now.colorspace, expect.colorspace
+        ));
+    }
+    if now.quantization as u32 != expect.quantization as u32 {
+        return Some(format!(
+            "quantization is now {:?}, negotiated {:?}",
+            now.quantization, expect.quantization
+        ));
+    }
+    if now.transfer as u32 != expect.transfer as u32 {
+        return Some(format!(
+            "transfer function is now {:?}, negotiated {:?}",
+            now.transfer, expect.transfer
+        ));
+    }
+    if now.flags.bits() != expect.flags.bits() {
+        return Some(format!(
+            "format flags are now {:?}, negotiated {:?}",
+            now.flags, expect.flags
+        ));
+    }
+    None
+}
+
 impl<'a> SafeStream<'a> {
-    /// Open a stream on `dev` with the standard buffer ring.
+    /// Open a stream on `dev` with the standard buffer ring, and verify the
+    /// device still holds the format the caller negotiated.
+    ///
+    /// The verification exists because the negotiated format is per-device
+    /// state, not per-file-handle: uvcvideo writes S_FMT to the shared
+    /// streaming struct gated only on buffer ownership, and ownership begins
+    /// at REQBUFS, not at open (#427; the audit in
+    /// docs/research/2026-08-12-camera-handling-audit.md, Q3). Between the
+    /// caller's S_FMT and the REQBUFS here, any other process can retarget
+    /// the device, and the capture would then decode frames against stale
+    /// width, height and fourcc assumptions. Once `with_buffers` returns,
+    /// this handle owns the queue and S_FMT answers EBUSY to everyone, so a
+    /// G_FMT read taken HERE is stable for the stream's whole life; the same
+    /// window recurs at every reopen (recover, the frozen-stream restarts),
+    /// which is why the check lives in the one function they all call.
     ///
     /// A dequeue timeout is set explicitly. v4l leaves it unset, which polls
     /// with -1 and waits forever, so a camera that stops delivering frames
     /// without erroring blocks the caller indefinitely. That matters most
     /// during emitter setup: a stall there would hang with a control changed and
     /// the restore never reached. Every wait now ends.
-    fn open(device: &str, dev: &'a Device) -> irlume_common::Result<Self> {
+    fn open(device: &str, dev: &'a Device, expect: &v4l::Format) -> irlume_common::Result<Self> {
         let mut inner = v4l::io::mmap::Stream::with_buffers(dev, Type::VideoCapture, MMAP_BUFFERS)
             .map_err(|e| map_io(device, e))?;
         inner.set_timeout(STREAM_DEQUEUE_TIMEOUT);
-        Ok(Self {
+        // Constructed before the read-back so every error path below releases
+        // the queue through the guarded Drop (STREAMOFF + REQBUFS(0)), never
+        // through the v4l crate's panicking one.
+        let stream = Self {
             inner: Some(inner),
             device: device.to_string(),
-        })
+        };
+        let now = Capture::format(dev).map_err(|e| map_io(device, e))?;
+        if let Some(moved) = format_moved(expect, &now) {
+            // Refusing rather than renegotiating, for the same reason the
+            // emitter stands down under a foreign consumer (#169): a format
+            // that moved means another application is actively configuring
+            // this camera, and fighting it over shared state serves nobody.
+            // The cost is one refused capture, which degrades toward the
+            // password prompt.
+            let who = match camera_holder(device) {
+                Some(h) => format!(", likely {h}"),
+                None => String::new(),
+            };
+            return Err(Error::Hardware(format!(
+                "{device}: the stream format changed between negotiation and \
+                 buffer claim ({moved}). Another application is configuring \
+                 this camera{who}; refusing this capture"
+            )));
+        }
+        Ok(stream)
     }
 }
 
@@ -1489,6 +1606,11 @@ pub struct RgbCamera {
     chosen: [u8; 4],
     width: u32,
     height: u32,
+    /// The whole format the driver echoed at open, kept verbatim so sessions
+    /// can verify the device still holds every field of it when they claim
+    /// buffers (#427); see `format_moved` for why the geometry alone is not
+    /// enough.
+    negotiated: v4l::Format,
 }
 
 impl RgbCamera {
@@ -1524,6 +1646,7 @@ impl RgbCamera {
             chosen,
             width: fmt.width,
             height: fmt.height,
+            negotiated: fmt,
         })
     }
 
@@ -1555,7 +1678,7 @@ impl RgbCamera {
             id: V4L2_CID_BACKLIGHT_COMPENSATION,
             value: v4l::control::Value::Integer(2),
         });
-        let stream = SafeStream::open(&self.device, &self.dev)?;
+        let stream = SafeStream::open(&self.device, &self.dev, &self.negotiated)?;
         Ok(RgbSession {
             cam: self,
             stream: Some(stream),
@@ -1769,7 +1892,11 @@ impl<'a> RgbSession<'a> {
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn recover(&mut self) -> irlume_common::Result<()> {
         self.stream = None; // drop first: STREAMOFF + buffer release
-        self.stream = Some(SafeStream::open(&self.cam.device, &self.cam.dev)?);
+        self.stream = Some(SafeStream::open(
+            &self.cam.device,
+            &self.cam.dev,
+            &self.cam.negotiated,
+        )?);
         // The fresh stream's auto-exposure starts unsettled, like any new
         // session's.
         self.warmed = false;
@@ -2342,6 +2469,11 @@ pub struct IrCamera {
     /// The negotiated fourcc, kept for [`Self::spec`]: `pix` names how the
     /// bytes decode, not which of several fourccs mapped to it.
     fourcc: String,
+    /// The whole format the driver echoed at open, kept verbatim so sessions
+    /// can verify the device still holds every field of it when they claim
+    /// buffers (#427); see `format_moved` for why the geometry alone is not
+    /// enough.
+    negotiated: v4l::Format,
     width: u32,
     height: u32,
     card: String,
@@ -2365,6 +2497,7 @@ impl IrCamera {
             pix,
             quantization: fmt.quantization,
             fourcc: fourcc_str(&fmt.fourcc.repr),
+            negotiated: fmt,
             width: fmt.width,
             height: fmt.height,
             card,
@@ -2414,7 +2547,7 @@ impl IrCamera {
         // restore while the stream was still live, the very mid-stream write
         // this change removes. Assigned further down, once the stream exists.
         let mode;
-        let mut stream = SafeStream::open(&self.device, &self.dev)?;
+        let mut stream = SafeStream::open(&self.device, &self.dev, &self.negotiated)?;
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
         // 25s when video went first). `SafeStream::open` only allocates
@@ -2835,7 +2968,7 @@ impl IrSession<'_> {
     pub fn recover(&mut self) -> irlume_common::Result<()> {
         self.stream = None; // drop first: STREAMOFF + buffer release
         self.meta = None; // drop the metadata queue
-        let stream = SafeStream::open(&self.cam.device, &self.cam.dev)?;
+        let stream = SafeStream::open(&self.cam.device, &self.cam.dev, &self.cam.negotiated)?;
         let meta = ir_metadata::IlluminationLog::open(&self.cam.device);
         let mode = ir_emitter::enable(self.cam.dev.handle(), &self.cam.card, &self.cam.device);
         let lit = mode.lit();
@@ -3003,7 +3136,7 @@ pub mod ir_probe {
         // buffers; STREAMON happens on the first dequeue, so the set still
         // lands before streaming starts.
         let mode;
-        let mut stream = super::SafeStream::open(device, &dev)?;
+        let mut stream = super::SafeStream::open(device, &dev, &fmt)?;
         mode = ir_emitter::enable(dev.handle(), &card, device);
         // Bound, never read: held for its `Drop`, which restores the control.
         let _ = &mode;
@@ -3105,7 +3238,7 @@ pub fn capture_ir_streaming<B>(
     // buffers; STREAMON happens on the first dequeue, so the set still
     // lands before streaming starts.
     let mut mode;
-    let mut stream = SafeStream::open(device, &dev)?;
+    let mut stream = SafeStream::open(device, &dev, &fmt)?;
     mode = ir_emitter::enable(dev.handle(), &card, device);
     // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
     // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
@@ -3174,7 +3307,7 @@ pub fn capture_ir_streaming<B>(
                          a frozen stream: {e}"
                     ))
                 })?;
-                stream = SafeStream::open(device, &dev)?;
+                stream = SafeStream::open(device, &dev, &fmt)?;
                 mode = ir_emitter::enable(dev.handle(), &card, device);
             }
             continue;
@@ -3246,7 +3379,7 @@ pub fn capture_ir_sequence(
     // buffers; STREAMON happens on the first dequeue, so the set still
     // lands before streaming starts.
     let mut mode;
-    let mut stream = Some(SafeStream::open(device, &dev)?);
+    let mut stream = Some(SafeStream::open(device, &dev, &fmt)?);
     mode = ir_emitter::enable(dev.handle(), &card, device);
     // Set once above and not re-applied inside the loop. This path also carried
     // an every-eighth-frame re-fire; it went for the same reason, and with the
@@ -3316,7 +3449,7 @@ pub fn capture_ir_sequence(
                          a frozen stream: {e}"
                     ))
                 })?;
-                stream = Some(SafeStream::open(device, &dev)?);
+                stream = Some(SafeStream::open(device, &dev, &fmt)?);
                 mode = ir_emitter::enable(dev.handle(), &card, device);
             }
             continue;
@@ -4175,7 +4308,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = SafeStream::open(device, &dev)?;
+    let mut stream = SafeStream::open(device, &dev, &fmt)?;
     let fd = dev.handle().fd();
     for _ in 0..4 {
         let _ = stream.next(); // let the sensor settle before baseline
@@ -5453,6 +5586,60 @@ mod tests {
     fn fourcc_str_trims_padding() {
         assert_eq!(fourcc_str(b"YUYV"), "YUYV");
         assert_eq!(fourcc_str(b"Y8  "), "Y8");
+    }
+
+    /// The buffer-claim read-back's comparison (#427): a format another
+    /// process retargeted between the caller's S_FMT and this handle's
+    /// REQBUFS must be named field-by-field, and an unchanged one must pass.
+    /// The race itself needs a second process and real queue ownership, so
+    /// the DECISION is what carries the coverage. Quantization and stride
+    /// are asserted by name: the Codex round on this change showed a
+    /// same-geometry quantization flip moves the clipping ceiling that the
+    /// exposure refusal reads (235 versus 255), and a stride change decodes
+    /// every row at the wrong offset, so those two are the fields a
+    /// geometry-only guard would have waved through.
+    #[test]
+    fn format_moved_names_the_field_that_moved_and_passes_a_match() {
+        use v4l::{Format, FourCC};
+        let expect = Format::new(640, 400, FourCC::new(b"GREY"));
+        assert_eq!(format_moved(&expect, &expect), None);
+
+        let refourcc = format_moved(&expect, &Format::new(640, 400, FourCC::new(b"YUYV")))
+            .expect("a changed fourcc must refuse");
+        assert!(
+            refourcc.contains("YUYV") && refourcc.contains("GREY"),
+            "{refourcc}"
+        );
+
+        let resized = format_moved(&expect, &Format::new(1280, 720, FourCC::new(b"GREY")))
+            .expect("a changed size must refuse");
+        assert!(
+            resized.contains("1280x720") && resized.contains("640x400"),
+            "{resized}"
+        );
+
+        let mut requantized = expect;
+        requantized.quantization = v4l::format::quantization::Quantization::LimitedRange;
+        if requantized.quantization as u32 == expect.quantization as u32 {
+            requantized.quantization = v4l::format::quantization::Quantization::FullRange;
+        }
+        let msg = format_moved(&expect, &requantized)
+            .expect("a changed quantization must refuse: it moves the clipping ceiling");
+        assert!(msg.contains("quantization"), "{msg}");
+
+        let mut restrided = expect;
+        restrided.stride = expect.stride + 64;
+        let msg = format_moved(&expect, &restrided)
+            .expect("a changed stride must refuse: rows would decode at wrong offsets");
+        assert!(msg.contains("stride"), "{msg}");
+
+        let mut recolored = expect;
+        recolored.colorspace = v4l::format::colorspace::Colorspace::SRGB;
+        if recolored.colorspace as u32 == expect.colorspace as u32 {
+            recolored.colorspace = v4l::format::colorspace::Colorspace::Rec709;
+        }
+        let msg = format_moved(&expect, &recolored).expect("a changed colorspace must refuse");
+        assert!(msg.contains("colorspace"), "{msg}");
     }
 
     #[test]
