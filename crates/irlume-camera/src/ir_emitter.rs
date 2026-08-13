@@ -1471,7 +1471,9 @@ impl StreamMode {
     /// The ordinary outcome for hardware irlume does not drive, and the only
     /// safe representation of it. An `Option<StreamMode>` would let a caller
     /// write `let _ = ...` and silently discard a guard that DID hold a control.
-    fn inert() -> Self {
+    /// Crate-visible so `IrSession::recover` can park an already-restored guard
+    /// before its reopen.
+    pub(crate) fn inert() -> Self {
         StreamMode {
             handle: None,
             record: None,
@@ -1682,7 +1684,8 @@ impl Drop for StreamMode {
 /// while it lived inline. The gap was not theoretical. `enable` used to run the
 /// recovery pass, log that a camera must not be written to, and then apply the
 /// configured control to the very unit and selector the unresolved record named,
-/// at every stream open and every eighth frame of a burst.
+/// at every stream open (the per-frame re-apply is gone; see the removal
+/// notes in `lib.rs`).
 fn planned_action(
     recovery: &RecoveryOutcome,
     wanted: Option<EmitterControl>,
@@ -3240,7 +3243,7 @@ impl RecoveryOutcome {
     /// worse than never having checked. `enable` used to do exactly that: it
     /// logged "nothing further will be written to it" and then applied the
     /// configured control to that same unit and selector on the next line, at
-    /// every stream open and every eighth frame of a burst.
+    /// every stream open (and, before #168, every eighth frame of a burst).
     ///
     /// Refusing costs the IR emitter, so face authentication does not light and
     /// the user falls back to a password until a human resolves it. That is the

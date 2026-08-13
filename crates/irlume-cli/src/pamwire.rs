@@ -275,6 +275,25 @@ fn reconcile() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     };
+    // The marker records what `login enable` wired, and it can drift: a real
+    // install was found with an irlume-created /etc/pam.d/polkit-1 while its
+    // marker said with_polkit=false, so reconcile never maintained polkit and
+    // the pre-abort=die stanza would have survived every upgrade unmigrated.
+    // The FILE is the ground truth for "is this surface ours": adopt a wired
+    // surface the marker missed, the same reasoning as the no-marker adoption
+    // above, and record it so the next run agrees.
+    let file_sudo = Path::new(SUDO).exists() && file_has_module(Path::new(SUDO));
+    let file_polkit = polkit_wired() == Some(true);
+    let adopted = (file_sudo && !with_sudo) || (file_polkit && !with_polkit);
+    let with_sudo = with_sudo || file_sudo;
+    let with_polkit = with_polkit || file_polkit;
+    if adopted && effective_uid() == 0 {
+        write_wired_marker(true, with_sudo, with_polkit, with_lock);
+        eprintln!(
+            "[login] adopted wired surfaces the marker missed \
+             (sudo={with_sudo}, polkit={with_polkit})"
+        );
+    }
     if active_login_wired()
         && !lockscreen_regressed(with_lock)
         && !wired_surface_regressed(with_sudo, with_polkit)
@@ -372,6 +391,19 @@ fn path_regressed(etc: &Path) -> bool {
 ///
 /// Each surface is only maintained if the marker says we wired it, so a file
 /// that was never ours cannot make reconcile loop forever.
+/// Whether the polkit file carries the module on an OLD control that ignores
+/// PAM_ABORT. The current stanza is `[success=done new_authtok_reqd=done
+/// abort=die default=ignore]`; anything else with the module is a pre-#424
+/// wiring whose head-shake decline silently does nothing.
+fn polkit_stanza_stale(etc: &Path) -> bool {
+    std::fs::read_to_string(etc).is_ok_and(|c| {
+        c.lines().any(|l| {
+            let d = grammar::directive(l);
+            d.contains(stanzas::MODULE) && !d.contains("abort=die")
+        })
+    })
+}
+
 fn wired_surface_regressed(with_sudo: bool, with_polkit: bool) -> bool {
     let fp: Vec<&Path> = FP_GREETERS.iter().map(|s| Path::new(s.etc)).collect();
     surfaces_regressed(
@@ -394,7 +426,15 @@ fn surfaces_regressed(
     }
     // polkit is materialized from a vendor copy on Fedora, so a DELETED /etc
     // override is a regression there exactly as it is for the lock screen.
-    if polkit.is_some_and(|(etc, vendor)| lock_regressed(etc, vendor)) {
+    // A STALE stanza shape counts as regressed too: an older irlume wired
+    // polkit with a plain `sufficient` line, under which a head shake's
+    // PAM_ABORT is `default=ignore`d and the decline does nothing, while the
+    // line still contains the module so the presence test alone said "not
+    // regressed" and every packaging lane's post-upgrade `login reconcile`
+    // no-opped. Treating the old shape as a regression is what makes the
+    // upgrade migrate it automatically (wire_service strips first, then
+    // rewires with the abort=die control).
+    if polkit.is_some_and(|(etc, vendor)| lock_regressed(etc, vendor) || polkit_stanza_stale(etc)) {
         return true;
     }
     // The fingerprint-keyring line rides on a service the display manager owns;
@@ -1179,9 +1219,63 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
 /// The hung process is root and holds the lock exclusively, so every other
 /// irlume PAM operation blocked behind it too, and the unit's `Type=oneshot`
 /// default of `TimeoutStartUSec=infinity` meant systemd never killed it.
+/// Whether a wiring run may proceed on this capability reading.
+///
+/// Pure, so both directions are tested without a daemon. See the comment at
+/// the call site for why an unestablished reading must stop an ENABLE.
+fn enable_permitted(enable: bool, caps_established: bool) -> Result<(), &'static str> {
+    if enable && !caps_established {
+        return Err(
+            "[login] refusing: this machine's camera capabilities could not be \
+             established (the daemon did not answer and the failure does not \
+             prove it is absent), and enabling UNWIRES the surfaces that read \
+             as unsupported. Nothing was changed.",
+        );
+    }
+    Ok(())
+}
+
 fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCode {
     if !apply {
         println!("[login] DRY RUN: showing what `--apply` would change (nothing is written):");
+    }
+    // An enable UNWIRES what the hardware does not support, so it must not run
+    // on a capability answer nothing established. `caps()` falls back to
+    // `{ir_pair: false, rgb: false}` when the daemon cannot be reached and the
+    // failure does not prove it absent, which on a packaged install is the
+    // ORDINARY shape of a dead daemon: socket activation keeps the socket
+    // present, so the request times out rather than being refused. Acting on
+    // that guess removed the face line from every greeter and the lock screen
+    // and reported success, and the Repair row offering the fix sits on the
+    // screen the TUI drops you on when the daemon is down. A disable is the
+    // user asking for exactly that removal, so it needs no capabilities.
+    // The packaging scriptlets run reconcile right after `try-restart`, which
+    // lands inside the daemon's model-loading window (Ping answers
+    // Ok("starting"); 21s measured exec-to-serving on a ThinkPad X13). In that
+    // window capabilities cannot be established on a machine with no
+    // configured pair, and the guard below would refuse the very migration
+    // the scriptlet exists to run. A starting daemon is worth waiting for;
+    // a dead or unreachable one is not, so the wait watches the
+    // classification and stops the moment it is anything but Starting.
+    if enable {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while crate::commands::classify_reach(irlume_common::client::request_poll(
+            &irlume_common::Request::Ping,
+        )) == crate::commands::DaemonReach::Starting
+        {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+    if let Err(why) = enable_permitted(enable, crate::caps_established()) {
+        eprintln!("{why}");
+        eprintln!(
+            "        start the daemon and retry: sudo systemctl start irlumed   \
+             (or, if it will not start, `irlume doctor` says why)"
+        );
+        return ExitCode::FAILURE;
     }
     // Method + tier aware plan: wire exactly what the chosen method needs on
     // this hardware, and (on enable) UNWIRE what it doesn't, so switching method
@@ -1677,6 +1771,38 @@ fn selinux_pp() -> Option<String> {
     None
 }
 
+/// Settle `/run/irlume.sock`'s label after the policy module changes.
+///
+/// The already-bound socket keeps its pre-policy label; the greeter stays
+/// blocked until the daemon rebinds. Restart it now so face login works at
+/// the very next lock/login, not the next reboot. The restart alone is not
+/// enough under socket activation, where systemd owns the socket file and a
+/// service restart never recreates it, so the boot-time label survives;
+/// `restorecon` (backed by the irlume.fc entry) settles the label in that
+/// case and whenever the bind raced the policy commit. This lived only on
+/// the `login enable` path while the TUI Repair fix and `selinux load` each
+/// carried half of it, and the halves reported done for a relabel that had
+/// not happened; one function so the sequence cannot drift apart again.
+pub(crate) fn relabel_daemon_socket() -> Result<(), String> {
+    // Statuses are CHECKED, not discarded: this function exists because two
+    // surfaces reported a relabel they had not performed, and swallowing a
+    // missing restorecon or a failed restart would be the same false success
+    // one level down.
+    let run = |what: &str, cmd: &mut Command| match cmd.status() {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) => Err(format!("{what} exited {st}")),
+        Err(e) => Err(format!("could not run {what}: {e}")),
+    };
+    run(
+        "systemctl try-restart irlumed.service",
+        Command::new("systemctl").args(["try-restart", "irlumed.service"]),
+    )?;
+    run(
+        "restorecon /run/irlume.sock",
+        Command::new("restorecon").arg("/run/irlume.sock"),
+    )
+}
+
 fn selinux(enable: bool, apply: bool) -> Result<String, String> {
     if enable {
         if selinux_loaded() == Some(true) {
@@ -1696,15 +1822,9 @@ fn selinux(enable: bool, apply: bool) -> Result<String, String> {
             if !ok {
                 return Err("semodule -i irlume.pp failed".into());
             }
-            // The already-bound socket keeps its pre-policy label; the greeter
-            // stays blocked until the daemon rebinds. Restart it now so face
-            // login works at the very next lock/login, not the next reboot;
-            // restorecon (backed by the irlume.fc entry) settles the label even
-            // if the bind raced the policy commit.
-            let _ = Command::new("systemctl")
-                .args(["try-restart", "irlumed.service"])
-                .status();
-            let _ = Command::new("restorecon").arg("/run/irlume.sock").status();
+            relabel_daemon_socket().map_err(|e| {
+                format!("SELinux module loaded, but the socket relabel FAILED: {e}")
+            })?;
             Ok("✓ SELinux module loaded (daemon restarted to relabel its socket)".into())
         } else {
             Ok("→ would load the SELinux module (greeter→daemon socket)".into())
@@ -1827,6 +1947,32 @@ mod tests {
     }
 
     use super::*;
+
+    /// A wiring ENABLE must refuse a capability reading nothing established,
+    /// because enabling unwires whatever reads unsupported. Demonstrated on
+    /// the shipped 0.9.0 binary against an unanswering socket with no
+    /// configured pair: it planned `face login: off  face lock: off` and
+    /// exited 0, which with --apply strips the face line from every greeter.
+    /// A DISABLE needs no capabilities: removal is what the user asked for.
+    #[test]
+    fn enable_refuses_an_unestablished_capability_reading_and_disable_does_not() {
+        assert!(enable_permitted(true, true).is_ok(), "established: proceed");
+        assert!(
+            enable_permitted(false, false).is_ok(),
+            "a disable removes wiring on purpose and needs no capabilities"
+        );
+        assert!(
+            enable_permitted(false, true).is_ok(),
+            "a disable is unaffected by an established reading too"
+        );
+        let refused = enable_permitted(true, false)
+            .expect_err("an enable on a guessed capability must refuse");
+        assert!(
+            refused.contains("could not be") && refused.contains("Nothing was changed"),
+            "the refusal must say what was not established and that nothing changed: {refused}"
+        );
+    }
+
     // Reached through the submodule because the parent has no production use
     // for it; `use super::*` only carries what the parent itself imports.
     use super::report::label_of;
@@ -4055,9 +4201,20 @@ auth required pam_fprintd.so\n\
     fn every_wired_surface_counts_as_a_regression_not_just_the_greeter() {
         let dir = TestDir::new("surfaces");
         let wired = dir.0.join("wired");
+        let polkit_ok = dir.0.join("polkit_ok");
         let stripped = dir.0.join("stripped");
         let vendor = dir.0.join("vendor");
         std::fs::write(&wired, "auth sufficient pam_irlume.so\n").unwrap();
+        // polkit's INTACT shape is the abort=die stanza; a plain `sufficient`
+        // there is the pre-#424 wiring whose shake-decline does nothing.
+        std::fs::write(
+            &polkit_ok,
+            format!(
+                "{}\nauth include system-auth\n",
+                stanzas::POLKIT_VERIFY_STANZA
+            ),
+        )
+        .unwrap();
         std::fs::write(&stripped, "auth include system-auth\n").unwrap();
         std::fs::write(&vendor, "auth include system-auth\n").unwrap();
         let gone = dir.0.join("gone");
@@ -4067,12 +4224,21 @@ auth required pam_fprintd.so\n\
         // Intact surfaces are not regressions.
         assert!(!surfaces_regressed(
             Some(&wired),
-            Some((&wired, None)),
+            Some((&polkit_ok, None)),
             &[&wired]
         ));
         // Each surface on its own must trigger a repair.
         assert!(surfaces_regressed(Some(&stripped), None, &[]));
         assert!(surfaces_regressed(None, Some((&stripped, None)), &[]));
+        // The 0.9.0 polkit shape: module present on a plain `sufficient`.
+        // Presence alone said "not regressed", every packaging lane's
+        // post-upgrade reconcile no-opped, and the head-shake decline
+        // silently did nothing while doctor claimed it worked.
+        assert!(
+            surfaces_regressed(None, Some((&wired, None)), &[]),
+            "a pre-abort=die polkit stanza must count as regressed so the \
+             upgrade migrates it"
+        );
         assert!(surfaces_regressed(None, None, &[&stripped]));
         // polkit deleted while a vendor copy remains is re-materializable, so it
         // IS a regression; deleted with no vendor is not ours to restore.

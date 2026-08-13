@@ -7,8 +7,14 @@
 //! the daemon authenticates each peer with `SO_PEERCRED` before honoring
 //! privileged operations (enroll/delete).
 //!
-//! Single-threaded by design: the camera is a single shared resource, so
-//! requests are served one at a time.
+//! One WORKER owns the camera and the engine, because two threads driving
+//! V4L2 and ONNX over one device is not something to attempt on an
+//! authentication path. The process itself is not single-threaded:
+//! connections are read and parsed off the worker, what they parse into is
+//! queued through the `arbiter` (authentication first, other camera work
+//! refused rather than queued), and side tasks (the watchdog, journal
+//! flushes) run on their own threads. The serialization guarantee lives at
+//! the worker, not the process.
 
 use irlume_common::{Request, Response, SOCKET_PATH};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -498,9 +504,12 @@ fn main() {
             // the setting selects the shipped default as always. The VERIFIED
             // BYTES are retained and handed to the engine: re-reading the path
             // at load (or at a post-panic rebuild) would let a swap pair new
-            // weights with the threshold measured for the old ones. The stage
-            // gate refuses until Stage::Recognition opens, so today an
-            // explicit selection always refuses.
+            // weights with the threshold measured for the old ones. The
+            // recognition stage is OPEN (thirdparty::Stage::open, since
+            // 2026-08-05), so an explicit selection naming a Recognition
+            // catalog entry loads; a name absent from the catalog, naming
+            // another stage, or with missing or mismatched weights still
+            // refuses to start.
             let tp_rec: Option<(irlume_common::HashedModel, f32, String)> =
                 resolve_thirdparty_recognizer();
             let tp_det: Option<(Vec<u8>, f32, String)> = resolve_thirdparty_detector();
@@ -536,7 +545,39 @@ fn main() {
                 }
                     .map(|e| e.with_devices(&rgb_dev, &ir_dev))
                     .and_then(|e| e.with_ir_adapter(&adapter))
-                    .and_then(|e| e.with_mesh(&mesh))
+                    // A mesh that fails to LOAD degrades, it does not kill the
+                    // daemon. The mesh became a .tflite on a bundled runtime
+                    // (#295/#315), so every start now dlopens
+                    // libtensorflowlite_c.so, and treating that failure as
+                    // fatal turned "mesh-dependent gates off" into "face auth
+                    // entirely dead" on any host where the bundled runtime
+                    // does not load (a GLIBCXX below the .deb build's 3.4.30
+                    // floor, a failed unpack); 0.9.0 pointed the unit at the
+                    // ONNX mesh and started fine on the same host. The nod
+                    // path needs no mesh; the eye-closure gesture and the
+                    // rescue alignment are off and every consent prompt still
+                    // works by nod. IRLUME_MODELS_STRICT keeps the refusal
+                    // for operators who asked for it. An ABSENT mesh file was
+                    // already a silent no-op inside with_mesh.
+                    .and_then(|e| {
+                        if strict_requested(
+                            std::env::var("IRLUME_MODELS_STRICT").ok().as_deref(),
+                            std::io::stderr(),
+                        ) {
+                            return e.with_mesh(&mesh);
+                        }
+                        let (e, err) = e.with_mesh_degraded(&mesh);
+                        if let Some(err) = err {
+                            eprintln!(
+                                "irlumed: FaceMesh did not load ({err}); continuing WITHOUT \
+                                 the mesh: the eye-closure consent gesture and the \
+                                 detection-rescue alignment are off, the head nod still \
+                                 works. Fix the TFLite runtime (doctor: tflite-runtime) or \
+                                 set IRLUME_MESH_MODEL to the ONNX mesh."
+                            );
+                        }
+                        Ok(e)
+                    })
                     .and_then(|e| match &tp_det {
                         Some((bytes, thr, name)) => {
                             eprintln!(
@@ -822,6 +863,16 @@ fn main() {
                                     // was released once the first session owned
                                     // its copy, so this rebuild re-reads the
                                     // recognizer from disk (#346).
+                                    //
+                                    // Heartbeat around the rebuild: it re-reads
+                                    // the 260MB recognizer and rebuilds five
+                                    // ONNX sessions, tens of seconds on a cold
+                                    // cache, and nothing inside it drives the
+                                    // capture-loop heartbeat. Without this the
+                                    // watchdog (interval 45s) could read the
+                                    // recovery itself as a wedge and have
+                                    // systemd kill the daemon MID-REBUILD.
+                                    note_worker_progress();
                                     match build_engine(None) {
                                         Ok(fresh) => {
                                             // Back through `attach`, because a bare
@@ -960,18 +1011,31 @@ fn main() {
                 // A connection thread reads, parses and writes; it never touches
                 // the engine, so a panic in it is contained by the thread itself
                 // and the queued job (if any) is still completed and released by
-                // the worker.
+                // the worker. Contained does not mean free: the slot count must
+                // come back DOWN on a panic too. A trailing fetch_sub never ran
+                // when `serve` unwound, so 64 panics over the daemon's lifetime
+                // pinned `live_threads` at the ceiling and every later accept,
+                // root's included, answered "daemon busy" until a restart that
+                // nothing triggers (the watchdog measures the camera worker,
+                // which stays healthy). The guard decrements on unwind and on
+                // return alike.
+                struct SlotGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+                impl Drop for SlotGuard {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                let slot = SlotGuard(live);
                 if let Err(e) = std::thread::Builder::new()
                     .name("irlume-conn".into())
                     .spawn(move || {
+                        let _slot = slot;
                         if let Err(e) = serve(stream, &arbiter, &engine_ready) {
                             eprintln!("irlumed: connection error: {e}");
                         }
-                        live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     })
                 {
                     eprintln!("irlumed: could not start a connection thread: {e}");
-                    live_threads.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }
             Err(e) => eprintln!("irlumed: accept error: {e}"),
@@ -1802,34 +1866,46 @@ fn refusal_throttled(uid: u32) -> bool {
 fn inherited_listener() -> Option<UnixListener> {
     use std::os::fd::FromRawFd;
     const SD_LISTEN_FDS_START: i32 = 3;
-    if !socket_activated() {
+    let pid_is_ours = std::env::var("LISTEN_PID")
+        .ok()
+        .and_then(|p| p.parse::<u32>().ok())
+        == Some(std::process::id());
+    let fds: Option<i32> = std::env::var("LISTEN_FDS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    // The environment is consumed on EVERY path, not only on success. A child
+    // must not inherit it, and `socket_activated()` must answer from the
+    // latch, which records what actually happened. The old shape latched only
+    // on success but left the env alone on the refusal paths, so with
+    // LISTEN_FDS=2 (a second ListenStream= in an override) the daemon bound
+    // its OWN socket while `socket_activated()` still read the stale
+    // LISTEN_PID as true and skipped the 0666 chmod: the socket stayed at the
+    // 0750 the unit's UMask produces, and every non-root client, the lock
+    // screen included, got EACCES with nothing in any log.
+    std::env::remove_var("LISTEN_FDS");
+    std::env::remove_var("LISTEN_PID");
+    if !pid_is_ours {
         return None;
     }
-    let n: i32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
+    let n = fds?;
     if n != 1 {
         eprintln!("irlumed: LISTEN_FDS={n}, expected exactly 1; binding our own socket instead");
         return None;
     }
-    // The environment must not outlive this: a child that inherits it would
-    // believe the descriptors are its own.
     SOCKET_ACTIVATED.store(true, std::sync::atomic::Ordering::Relaxed);
-    std::env::remove_var("LISTEN_FDS");
-    std::env::remove_var("LISTEN_PID");
     // SAFETY: systemd guarantees fd 3 is an open listening socket when
     // LISTEN_PID names us and LISTEN_FDS is 1, and nothing else in this process
     // has taken it: this runs before any other socket is opened.
     Some(unsafe { UnixListener::from_raw_fd(SD_LISTEN_FDS_START) })
 }
 
-/// Whether systemd handed us the socket. Checked separately from taking the fd
-/// because the socket's MODE is systemd's business in that case, and that
-/// question outlives the one call that consumes the descriptor.
+/// Whether systemd handed us the socket, read from the latch alone: the fd
+/// either was taken from systemd or it was not, and the environment (which
+/// [`inherited_listener`] consumes on every path) can no longer contradict
+/// that. The socket's MODE is systemd's business only when the take really
+/// happened.
 fn socket_activated() -> bool {
-    std::env::var("LISTEN_PID")
-        .ok()
-        .and_then(|p| p.parse::<u32>().ok())
-        == Some(std::process::id())
-        || SOCKET_ACTIVATED.load(std::sync::atomic::Ordering::Relaxed)
+    SOCKET_ACTIVATED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Latched at the moment the descriptor is taken, because `inherited_listener`
@@ -4851,6 +4927,32 @@ mod tests {
     /// Exclusive. For a test that MUTATES the environment.
     fn env_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
         crate::test_support::env_write()
+    }
+
+    /// A refused inheritance must not leave the daemon believing it was
+    /// socket-activated. With LISTEN_FDS=2 (a second listener in a unit
+    /// override) the old shape returned None but left LISTEN_PID in the
+    /// environment, so `socket_activated()` stayed true, the self-bound
+    /// socket skipped its 0666 chmod, and under the unit's UMask every
+    /// non-root client (the lock screen included) got EACCES. The latch must
+    /// record what actually happened, and the environment must be consumed
+    /// on every path so no child inherits it.
+    #[test]
+    fn a_refused_fd_inheritance_does_not_read_as_socket_activation() {
+        let _env = env_lock();
+        std::env::set_var("LISTEN_PID", std::process::id().to_string());
+        std::env::set_var("LISTEN_FDS", "2");
+        let took = inherited_listener();
+        assert!(took.is_none(), "two fds must refuse the inheritance");
+        assert!(
+            !socket_activated(),
+            "a refused take must not read as activation: the self-bound socket \
+             would skip its chmod and refuse every non-root client"
+        );
+        assert!(
+            std::env::var_os("LISTEN_PID").is_none() && std::env::var_os("LISTEN_FDS").is_none(),
+            "the environment must be consumed on every path"
+        );
     }
 
     /// Shared. For a test that only reaches a passwd lookup, which reads

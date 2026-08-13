@@ -605,6 +605,13 @@ const NO: &str = "\u{2717}";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DaemonReach {
     Running,
+    /// Answering, but the engine is still loading models. The accept loop
+    /// runs from the moment systemd hands over the socket and Ping gets
+    /// `Response::Ok("starting")` until the engine is ready, so for a few
+    /// seconds after every (re)start the daemon is neither up nor down.
+    /// Reporting this as "down" sent users to restart a daemon that was
+    /// seconds from ready, reopening the same window.
+    Starting,
     /// The socket is there but this uid may not connect. Carries no information
     /// about whether the daemon is healthy, so never report it as "down".
     AccessDenied,
@@ -612,16 +619,27 @@ pub(crate) enum DaemonReach {
     Down,
 }
 
-/// Probe the daemon. Goes through the shared client directly rather than
-/// `daemon_request`, because the errno kind is the point here and the string
-/// conversion throws it away.
-pub(crate) fn daemon_reach() -> DaemonReach {
-    match irlume_common::client::request(&Request::Ping) {
+/// Classify one Ping outcome. Split from [`daemon_reach`] so the TUI can feed
+/// it the short-budget `request_poll` its refresh thread requires while the
+/// CLI keeps the full-budget `request`; both must read the answer the same
+/// way or the two surfaces disagree about the same daemon.
+pub(crate) fn classify_reach(r: std::io::Result<Response>) -> DaemonReach {
+    match r {
         Ok(Response::Pong) => DaemonReach::Running,
+        // Any non-Pong Ok means something speaking our protocol answered but
+        // is not ready; today that is only the startup accept loop.
+        Ok(Response::Ok(_)) => DaemonReach::Starting,
         Ok(_) => DaemonReach::Down,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => DaemonReach::AccessDenied,
         Err(_) => DaemonReach::Down,
     }
+}
+
+/// Probe the daemon. Goes through the shared client directly rather than
+/// `daemon_request`, because the errno kind is the point here and the string
+/// conversion throws it away.
+pub(crate) fn daemon_reach() -> DaemonReach {
+    classify_reach(irlume_common::client::request(&Request::Ping))
 }
 
 fn daemon_up() -> bool {
@@ -661,6 +679,7 @@ pub fn status(args: &[String]) -> ExitCode {
         "  daemon        : {}",
         match reach {
             DaemonReach::Running => format!("running {OK}"),
+            DaemonReach::Starting => format!("starting (loading models) {WARN}; retry shortly"),
             DaemonReach::AccessDenied => format!(
                 "running, but this user may not connect {WARN} (EACCES on {})",
                 irlume_common::client::socket_path().display()
@@ -716,7 +735,9 @@ pub fn status(args: &[String]) -> ExitCode {
             if let Some(0) = usable {
                 if scans > 0 {
                     println!(
-                        "                  {WARN} none of those scans belong to the recognizer                          that is loaded now, so no face can match: re-enable the model it was                          enrolled with, or run `irlume enroll` again"
+                        "                  {WARN} none of those scans belong to the recognizer \
+                         that is loaded now, so no face can match: re-enable the model it was \
+                         enrolled with, or run `irlume enroll` again"
                     );
                 }
             }
@@ -805,7 +826,11 @@ pub fn status(args: &[String]) -> ExitCode {
     // for the current state. Off is the default, not a warning.
     println!(
         "  keyring gate  : {}",
-        match irlume_common::config::credential_release_challenge_visible() {
+        // The EFFECTIVE rule (per-service override first, then the global
+        // gate), the same order the daemon applies; reading only the global
+        // key said "off (default)" to a user whose per-service key required
+        // the gesture.
+        match irlume_common::config::credential_release_gesture_required_visible() {
             Some(true) => format!("gesture required {OK} (opt-in)"),
             Some(false) =>
                 "off (default): the keyring releases after the face match with no nod".into(),
@@ -1089,11 +1114,19 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
             let pp = match std::env::var("IRLUME_SELINUX_PP") {
                 Ok(p) => std::path::Path::new(&p).exists().then_some(p),
                 Err(_) => [
-                    "packaging/selinux/irlume.pp",
                     // The irlume-selinux rpm's install location; without it a
                     // packaged install could not re-load after `login disable`.
                     "/usr/share/selinux/packages/irlume.pp",
                     "/usr/share/irlume/selinux/irlume.pp",
+                    // Dev builds: the repo's own build output, resolved at
+                    // COMPILE time. The old entry was the bare relative path
+                    // "packaging/selinux/irlume.pp", which made `sudo irlume
+                    // selinux load` install whatever .pp sat under the CALLER'S
+                    // working directory as system policy.
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../packaging/selinux/irlume.pp"
+                    ),
                 ]
                 .into_iter()
                 .find(|p| std::path::Path::new(p).exists())
@@ -1109,8 +1142,27 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
                 .status();
             match st {
                 Ok(s) if s.success() => {
-                    println!("[selinux] loaded {OK}; restart irlumed so the socket relabels");
-                    ExitCode::SUCCESS
+                    // Loading the module is half the job: the bound socket
+                    // keeps its old label until the daemon rebinds, and under
+                    // socket activation not even a restart relabels it. The
+                    // shared sequence restarts and restorecons so the check
+                    // that sent the user here passes afterwards; a failed
+                    // half is reported as exactly that, not as done.
+                    match crate::pamwire::relabel_daemon_socket() {
+                        Ok(()) => {
+                            println!(
+                                "[selinux] loaded {OK}; irlumed restarted and the socket relabeled"
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[selinux] module loaded, but the socket relabel FAILED: {e}; \
+                                 the greeter stays blocked until it succeeds"
+                            );
+                            ExitCode::FAILURE
+                        }
+                    }
                 }
                 Ok(s) => {
                     eprintln!("[selinux] semodule exited {s}");
@@ -1351,6 +1403,44 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
 /// fallback). Turning any gesture on adds a deliberate step; disabling it for a
 /// high-privilege escalation service (sudo, su, doas, polkit) asks for
 /// confirmation first.
+/// One service's effective consent-gesture line, shared by the all-services
+/// `status` and the per-service `<svc> status` so the two can never disagree.
+fn print_service_gesture_status(tag: &str, svc: &str) {
+    let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
+    match irlume_common::config::observe_kv("settings.conf", &key) {
+        // Per-service keys use `!falsy` (the daemon's `service_gesture`
+        // reading), NOT the global `truthy`, so the display agrees with
+        // what the engine does for this key.
+        irlume_common::config::KvObservation::Value(v) => {
+            if !irlume_common::config::falsy(&v) {
+                println!("{tag} {svc}: REQUIRED {OK} (explicit)");
+            } else {
+                println!("{tag} {svc}: off (explicit)");
+            }
+        }
+        irlume_common::config::KvObservation::Absent => {
+            let required = match svc {
+                // The keyring release falls back to the global gate,
+                // which now defaults OFF.
+                "credential_release" => irlume_common::config::credential_release_challenge(),
+                // Every PAM service through the shared helper, which
+                // knows polkit (AppConsent) defaults ON and that
+                // `polkit_gesture=0` turns that default off. The
+                // hardcoded `true` here could not see the second half.
+                _ => irlume_common::config::service_gesture_required(svc),
+            };
+            if required {
+                println!("{tag} {svc}: REQUIRED {OK} (default)");
+            } else {
+                println!("{tag} {svc}: off (default)");
+            }
+        }
+        irlume_common::config::KvObservation::Unknown(_) => {
+            println!("{tag} {svc}: root-only setting, re-run with sudo");
+        }
+    }
+}
+
 pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitCode {
     const TAG: &str = "[credential-release-challenge]";
     match sub {
@@ -1362,41 +1452,7 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
             // sees Unknown, not the value).
             let services = ["sudo", "su", "doas", "polkit-1", "credential_release"];
             for svc in services {
-                let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
-                match irlume_common::config::observe_kv("settings.conf", &key) {
-                    // Per-service keys use `!falsy` (the daemon's `service_gesture`
-                    // reading), NOT the global `truthy`, so the display agrees with
-                    // what the engine does for this key.
-                    irlume_common::config::KvObservation::Value(v) => {
-                        if !irlume_common::config::falsy(&v) {
-                            println!("{TAG} {svc}: REQUIRED {OK} (explicit)");
-                        } else {
-                            println!("{TAG} {svc}: off (explicit)");
-                        }
-                    }
-                    irlume_common::config::KvObservation::Absent => {
-                        let required = match svc {
-                            // The keyring release falls back to the global gate,
-                            // which now defaults OFF.
-                            "credential_release" => {
-                                irlume_common::config::credential_release_challenge()
-                            }
-                            // Every PAM service through the shared helper, which
-                            // knows polkit (AppConsent) defaults ON and that
-                            // `polkit_gesture=0` turns that default off. The
-                            // hardcoded `true` here could not see the second half.
-                            _ => irlume_common::config::service_gesture_required(svc),
-                        };
-                        if required {
-                            println!("{TAG} {svc}: REQUIRED {OK} (default)");
-                        } else {
-                            println!("{TAG} {svc}: off (default)");
-                        }
-                    }
-                    irlume_common::config::KvObservation::Unknown(_) => {
-                        println!("{TAG} {svc}: root-only setting, re-run with sudo");
-                    }
-                }
+                print_service_gesture_status(TAG, svc);
             }
             // Global credential-release-challenge fallback (DEFAULT OFF).
             match irlume_common::config::credential_release_challenge_visible() {
@@ -1427,6 +1483,16 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
             ExitCode::SUCCESS
         }
         // Service-specific toggle: irlume credential-release-challenge sudo on|off
+        // A flag mistyped before the verb is not a service: under root,
+        // `--yes off` used to write `service_gesture.--yes=0` into the
+        // root-only settings file, a junk key nothing reads. At 0.9.0 the
+        // same argv was a clean usage error; keep it one.
+        Some(svc) if svc.starts_with('-') => {
+            eprintln!(
+                "{TAG} usage: irlume credential-release-challenge [<service>] <on|off|status>"
+            );
+            ExitCode::from(2)
+        }
         Some(svc) if svc != "on" && svc != "off" => {
             // `args` is the whole argv minus the program name (main.rs skips 1
             // and passes the full vector), so args[0] is the subcommand name,
@@ -1497,6 +1563,14 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                             ExitCode::FAILURE
                         }
                     }
+                }
+                // The usage line has always promised `[<service>] <on|off|
+                // status>`, and the TUI, setup and doctor all teach the
+                // per-service status form, but this arm accepted only on/off:
+                // the exact command four surfaces recommended exited 2.
+                Some("status") => {
+                    print_service_gesture_status(TAG, svc);
+                    ExitCode::SUCCESS
                 }
                 _ => {
                     eprintln!("{TAG} usage: irlume credential-release-challenge [<service>] <on|off|status>");
@@ -2026,6 +2100,42 @@ MACHINE-READABLE OUTPUT (for desktop integrations; see docs/INTEGRATION.md)
 "
     );
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod reach_tests {
+    use super::{classify_reach, DaemonReach};
+    use irlume_common::Response;
+
+    /// The four Ping outcomes, each to its own state. The two that were
+    /// collapsed before: `Ok("starting")` (the accept loop answers while
+    /// models load) read as Down and earned a restart that reopened the
+    /// window, and EACCES read as "not reachable" about a daemon that was
+    /// running fine.
+    #[test]
+    fn ping_outcomes_classify_to_four_distinct_states() {
+        assert_eq!(classify_reach(Ok(Response::Pong)), DaemonReach::Running);
+        assert_eq!(
+            classify_reach(Ok(Response::Ok("starting".into()))),
+            DaemonReach::Starting
+        );
+        assert_eq!(
+            classify_reach(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            ))),
+            DaemonReach::AccessDenied
+        );
+        assert_eq!(
+            classify_reach(Err(std::io::Error::from(std::io::ErrorKind::TimedOut))),
+            DaemonReach::Down
+        );
+        // A reply that is neither Pong nor Ok is an unusable answer, not a
+        // starting daemon.
+        assert_eq!(
+            classify_reach(Ok(Response::Error("x".into()))),
+            DaemonReach::Down
+        );
+    }
 }
 
 #[cfg(test)]

@@ -662,9 +662,44 @@ pub(crate) fn lock_camera(id: &CameraIdentity) -> Result<Option<CameraLock>, Str
             .metadata()
             .map_err(|e| format!("stat {}: {e}", path.display()))?
             .permissions();
-        perms.set_mode(0o660);
-        file.set_permissions(perms)
-            .map_err(|e| format!("chmod {:o} {}: {e}", 0o660, path.display()))?;
+        // Fix the mode only when it is wrong AND this process can: fchmod on
+        // a root-owned file from a non-root caller is EPERM no matter what
+        // mode is requested, and failing the LOCK on it disabled the emitter
+        // for exactly the caller #392 exists to serve (the lock already
+        // exists as root:video 0660 after the daemon's first run, the video
+        // group member opens it through the group bit, and then the
+        // unconditional chmod errored). A wrong mode that cannot be fixed is
+        // reported by whoever cannot OPEN the file, with a better message
+        // than EPERM here.
+        let mode = perms.mode() & 0o777;
+        if mode != 0o660 {
+            perms.set_mode(0o660);
+            if let Err(e) = file.set_permissions(perms) {
+                // Whether an unfixable wrong mode is tolerable depends on
+                // WHICH way it is wrong. flock takes the lock on a read-only
+                // open, so any other-accessible bit lets an unprivileged
+                // process hold this camera's lock and keep the emitter dark
+                // for everyone; a lock that permissive cannot be trusted and
+                // the caller must refuse rather than authenticate behind it.
+                // A merely over-restrictive mode adds no holder who was not
+                // already root or group, so it degrades to a log the way the
+                // root-owned-0660 case does (the #392 caller this branch
+                // exists for).
+                if mode & 0o007 != 0 {
+                    return Err(format!(
+                        "emitter lock {} has mode {mode:o}, which any local user can \
+                         flock, and this process cannot correct it ({e}); refusing to \
+                         trust the lock. Fix it as root: chmod 660 {}",
+                        path.display(),
+                        path.display()
+                    ));
+                }
+                irlume_common::dlog!(
+                    "emitter lock {}: mode {mode:o} left as-is ({e}); a non-owner cannot chmod",
+                    path.display()
+                );
+            }
+        }
     }
     // Set the group to video so the lock is reachable by the same group that
     // already owns /dev/video*. The caller is root (the daemon), so fchown
@@ -983,6 +1018,75 @@ pub(crate) fn from_hex(text: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use crate::testenv::{env_lock, EnvGuard};
+
+    /// #392's own caller: the lock already exists as root:video 0660 from the
+    /// daemon's first run, and a non-root video-group member opens it through
+    /// the group bit. The unconditional `fchmod` then answered EPERM (a
+    /// non-owner cannot chmod, whatever mode it asks for), `lock_camera`
+    /// failed, and the emitter went dark for exactly the caller the change
+    /// was written for. The lock must succeed on a pre-existing lock this
+    /// process can open but cannot chmod.
+    ///
+    /// Ignored because the scenario needs a file owned by ANOTHER uid, which
+    /// a test cannot create; scripts/ orchestration (or a by-hand sudo) sets
+    /// IRLUME_EMITTER_LOCK_DIR and pre-creates the file as root. The test
+    /// PANICS rather than self-skips when the setup is absent: running an
+    /// ignored test is a request for the harness (#361).
+    #[test]
+    #[ignore = "needs a root-owned pre-created lock; set IRLUME_EMITTER_LOCK_DIR and pre-create the lock file as root:<caller-group> 0660"]
+    fn lock_succeeds_on_a_preexisting_lock_this_process_cannot_chmod() {
+        use std::os::unix::fs::MetadataExt as _;
+        let _env = env_lock();
+        let dir = std::env::var_os("IRLUME_EMITTER_LOCK_DIR")
+            .expect("IRLUME_EMITTER_LOCK_DIR is unset; this test is a request for the harness");
+        let id = identity();
+        let path = std::path::PathBuf::from(&dir)
+            .join(format!("irlume-emitter-{}.lock", synchronization_key(&id)));
+        let meta = std::fs::metadata(&path).expect("the harness pre-creates the lock file");
+        // SAFETY: geteuid reads this process's own credentials and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        assert_ne!(
+            meta.uid(),
+            me,
+            "the pre-created lock must belong to another uid or this test proves nothing"
+        );
+        let lock = lock_camera(&id).expect("a lock this process can open must be takeable");
+        assert!(lock.is_some(), "nobody else holds it in this harness");
+    }
+
+    /// An other-accessible lock this process cannot chmod must REFUSE: flock
+    /// takes the lock on a read-only open, so mode 0666 (or any o+r/o+w) lets
+    /// any local user hold this camera's lock and keep the emitter dark for
+    /// everyone. Trusting it would put authentication behind a lock an
+    /// unprivileged process can deny. Same harness as the 0660 test: the
+    /// file must belong to another uid, pre-created as root with mode 0666.
+    #[test]
+    #[ignore = "needs a root-owned 0666 pre-created lock; set IRLUME_EMITTER_LOCK_DIR and pre-create the lock file as root 0666"]
+    fn lock_refuses_an_other_accessible_lock_it_cannot_fix() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let _env = env_lock();
+        let dir = std::env::var_os("IRLUME_EMITTER_LOCK_DIR")
+            .expect("IRLUME_EMITTER_LOCK_DIR is unset; this test is a request for the harness");
+        let id = identity();
+        let path = std::path::PathBuf::from(&dir)
+            .join(format!("irlume-emitter-{}.lock", synchronization_key(&id)));
+        let meta = std::fs::metadata(&path).expect("the harness pre-creates the lock file");
+        // SAFETY: geteuid reads this process's own credentials and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        assert_ne!(meta.uid(), me, "the lock must belong to another uid");
+        assert_eq!(
+            meta.permissions().mode() & 0o007,
+            0o006,
+            "the harness pre-creates the lock world-accessible"
+        );
+        let err = lock_camera(&id)
+            .expect_err("a world-accessible lock this process cannot fix must refuse");
+        assert!(
+            err.contains("any local user can") && err.contains("chmod 660"),
+            "the refusal must say why and how to fix it: {err}"
+        );
+    }
 
     /// A camera identity backed by the real ASUS descriptor bytes, so these
     /// exercise the same parsing path production uses.

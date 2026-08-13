@@ -562,6 +562,8 @@ struct App {
     /// Live daemon reachability (a real Ping, refreshed each tick), not a
     /// hardcoded socket-path check.
     daemon_up: bool,
+    /// The four-way classification behind `daemon_up`; see `LightState::reach`.
+    daemon_reach: crate::commands::DaemonReach,
     /// Last ListProfiles error (corrupt enrollment / missing template key);
     /// distinguishes "file broken" from "no profiles" on the Repair tab.
     enroll_error: Option<String>,
@@ -807,6 +809,11 @@ impl Probes {
 /// what made the whole TUI feel wedged whenever the daemon was.
 struct LightState {
     daemon_up: bool,
+    /// The classified Ping outcome behind `daemon_up`. Kept alongside the
+    /// bool because Repair needs four answers where the gating logic needs
+    /// one: "starting" must not be offered a restart (it kills a daemon
+    /// seconds from ready) and EACCES must not read as "not reachable".
+    reach: crate::commands::DaemonReach,
     health: Option<HealthInfo>,
     keyring_armed: Option<bool>,
     keyring_policy: Option<String>,
@@ -820,7 +827,11 @@ impl LightState {
     /// it no longer enumerates cameras at all: the daemon answers Health for
     /// capabilities and ListCameras for the picker (#187).
     fn gather(user: &str, prev_armed: Option<bool>) -> Self {
-        let daemon_up = matches!(crate::daemon_poll(&Request::Ping), Ok(Response::Pong));
+        // The raw client call, not `daemon_poll`: classification needs the
+        // errno kind and daemon_poll flattens errors to String.
+        let reach =
+            crate::commands::classify_reach(irlume_common::client::request_poll(&Request::Ping));
+        let daemon_up = reach == crate::commands::DaemonReach::Running;
         // Classifying a node OPENS it. While the daemon is reachable it may
         // be streaming those same nodes, and a second opener is EBUSY on
         // strict UVC modules (#187). Gating on "is the daemon up" was not
@@ -831,6 +842,7 @@ impl LightState {
         // are serialized against captures on the daemon's side.
         let mut out = LightState {
             daemon_up,
+            reach,
             health: None,
             keyring_armed: prev_armed,
             keyring_policy: None,
@@ -1024,6 +1036,7 @@ impl App {
             heavy_at: std::time::Instant::now(),
             error: None,
             daemon_up: false,
+            daemon_reach: crate::commands::DaemonReach::Down,
             enroll_error: None,
             health: None,
             act_scroll: 0,
@@ -1243,6 +1256,7 @@ impl App {
     /// clamps the inline version used to apply.
     fn apply_light(&mut self, l: LightState) {
         self.daemon_up = l.daemon_up;
+        self.daemon_reach = l.reach;
         // Daemon down/unresponsive: show the down state; the local probes
         // still land via the heavy sweep so Repair can diagnose.
         self.health = l.health;
@@ -1422,26 +1436,43 @@ impl App {
         // 120s budget meant every heavy tick blocked the UI for the whole
         // arbiter queue whenever the daemon was busy (measured: ~9s per tab
         // press on a ThinkPad while a TPM-bound ListProfiles was in flight).
-        let up = self.daemon_up;
-        v.push(mk(
-            "Daemon (irlumed)",
-            if up { Sev::Ok } else { Sev::Fail },
-            if up {
-                "running, socket reachable".into()
-            } else {
+        {
+            use crate::commands::DaemonReach as R;
+            // Four answers, not two. "Starting" got told "not reachable" about
+            // a socket that had just answered, and its [f] restarted a daemon
+            // seconds from ready, reopening the same window. EACCES is the
+            // socket refusing THIS user (mode is 0666, so in practice a
+            // SELinux denial), which a restart does not change either.
+            let (sev, detail, fix) = match self.daemon_reach {
+                R::Running => (Sev::Ok, "running, socket reachable".into(), Fix::None),
+                R::Starting => (
+                    Sev::Warn,
+                    "starting (loading models); re-run checks with [r] in a few seconds".into(),
+                    Fix::None,
+                ),
+                R::AccessDenied => (
+                    Sev::Fail,
+                    format!(
+                        "running, but this user may not connect (EACCES on {})",
+                        irlume_common::client::socket_path().display()
+                    ),
+                    Fix::Manual(
+                        "see the SELinux policy row below; sudo irlume selinux status".into(),
+                    ),
+                ),
                 // Name the socket the ping actually used: with IRLUME_SOCKET
                 // set, "/run/irlume.sock" described a path nobody probed.
-                format!(
-                    "not reachable on {}",
-                    irlume_common::client::socket_path().display()
-                )
-            },
-            if up {
-                Fix::None
-            } else {
-                Fix::Root(RootFix::RestartDaemon)
-            },
-        ));
+                R::Down => (
+                    Sev::Fail,
+                    format!(
+                        "not reachable on {}",
+                        irlume_common::client::socket_path().display()
+                    ),
+                    Fix::Root(RootFix::RestartDaemon),
+                ),
+            };
+            v.push(mk("Daemon (irlumed)", sev, detail, fix));
+        }
 
         // ONNX Runtime + Models: the daemon is the ground truth: if it answers
         // Health it loaded both at startup (it exits otherwise). Static path
@@ -1463,6 +1494,32 @@ impl App {
                     if h.mesh { " + FaceMesh" } else { "" }
                 ),
                 Fix::None,
+            ));
+            // The mesh ships as a .tflite (#295) and the packaged unit points
+            // IRLUME_MESH_MODEL at it, so a running daemon reporting the mesh
+            // is the ground truth that the TFLite runtime loaded, the same way
+            // Health answers for ONNX. A daemon running WITHOUT the mesh is
+            // not fine: passive blink liveness and the eye-closure consent
+            // gesture are off, and with the release challenge on, a face
+            // login leaves the keyring locked.
+            v.push(mk(
+                "TFLite runtime",
+                if h.mesh { Sev::Ok } else { Sev::Warn },
+                if h.mesh {
+                    "loaded (the daemon reports FaceMesh, which ships as a .tflite)".into()
+                } else {
+                    "FaceMesh is not loaded: passive blink liveness and the eye-closure \
+                     consent gesture are off"
+                        .into()
+                },
+                if h.mesh {
+                    Fix::None
+                } else {
+                    Fix::Manual(
+                        "check IRLUME_MESH_MODEL in the irlumed unit, or reinstall the package"
+                            .into(),
+                    )
+                },
             ));
             // Camera row from the daemon's validated tier (never the raw fallback).
             let priv_on = self.pairs.iter().any(|p| p.privacy);
@@ -1503,6 +1560,12 @@ impl App {
                     .iter()
                     .any(|p| std::path::Path::new(p).exists());
             v.push(ort_fallback_check(ort));
+            v.push(tflite_fallback_check(
+                std::env::var(irlume_vision::tflite::TFLITE_LIB_ENV)
+                    .ok()
+                    .as_deref(),
+                |p| p.exists(),
+            ));
 
             // Resolve models the way the daemon does (env → /usr/share/irlume/models
             // → repo cwd), NOT just cwd-relative; a packaged install keeps them in
@@ -1955,7 +2018,12 @@ impl App {
         // refused PAD cue is silently OFF, a refused recognizer means the
         // daemon will not start with it selected. Only flag a stage the
         // daemon did not actually load (Health proves loaded weights fine).
-        if self.daemon_up {
+        //
+        // NOT gated on the daemon being up: a refused recognizer or detector
+        // EXITS the daemon at startup, so the gate switched this check off in
+        // exactly the state it exists to explain. With the daemon down,
+        // `health` is None, `loaded` is false, and the row is emitted.
+        {
             if let crate::models::TuiState::Enabled { entries } = &self.heavy.0 {
                 use irlume_common::thirdparty::{Stage, WeightState};
                 for entry in entries {
@@ -2915,22 +2983,19 @@ impl App {
                     "systemctl restart fprintd 2>/dev/null || pkill fprintd",
                 ],
             ),
-            // Load the policy AND restart the daemon so the socket relabels to
-            // irlume_runtime_t; otherwise the existing socket keeps its old label
-            // and the check would still fail.
+            // `selinux load` does the whole job: semodule -i, try-restart, and
+            // the restorecon that actually settles the label. The old command
+            // here appended its own `systemctl restart irlumed`, which under
+            // socket activation relabels nothing (systemd owns the socket file
+            // and a service restart never recreates it), so the step reported
+            // done while the row stayed red.
             Suspend::SelinuxLoad => {
-                // args[0] is "sh", so sudo_step's self-exe rewrite can't reach
-                // the embedded `irlume`; splice the running binary into the
-                // command ourselves so the rpm-path .pp lookup this build ships
-                // is the one that runs, not an older PATH `irlume`.
-                let exe = Self::self_exe();
+                // sudo_step resolves the leading "irlume" to the running
+                // binary, so the rpm-path .pp lookup this build ships is the
+                // one that runs, not an older PATH `irlume`.
                 self.sudo_step(
                     "load the SELinux module + relabel the socket",
-                    &[
-                        "sh",
-                        "-c",
-                        &format!("'{exe}' selinux load && systemctl restart irlumed"),
-                    ],
+                    &["irlume", "selinux", "load"],
                 );
             }
         }
@@ -3532,8 +3597,14 @@ impl App {
                 // CLI go through; this only avoids offering the user an action
                 // whose only outcome is an error modal.
                 if on {
-                    self.set_error(
-                        "require-eyes-open cannot be enabled: it refuses the user it exists                          to admit (measured 1 of 12 bare-eyed frames with eyes open, 0 of 12                          with glasses). See issue #386.",
+                    // The row no longer advertises enter while off, so this is
+                    // a bare keypress: a log line, not a modal. The wording
+                    // matches the daemon's own refusal at its choke point.
+                    self.log(
+                        '·',
+                        "require-eyes-open cannot be enabled: it refuses the user it \
+                         exists to admit (measured 1 of 12 bare-eyed frames with eyes \
+                         open, 0 of 12 with glasses). See issue #386.",
                     );
                     return;
                 }
@@ -3600,7 +3671,9 @@ impl App {
                     self.log(
                         '·',
                         format!(
-                            "the consent gesture for '{svc}' is a root-only setting;                              run the TUI with sudo, or check it with:                              sudo irlume credential-release-challenge {svc} status"
+                            "the consent gesture for '{svc}' is a root-only setting; \
+                             run the TUI with sudo, or check it with: \
+                             sudo irlume credential-release-challenge {svc} status"
                         ),
                     );
                     return;
@@ -4537,10 +4610,22 @@ impl App {
                     "  Never unlock unless both eyes read open (IR-glint heuristic).",
                     Style::new().dim(),
                 )),
-                Line::from(vec![
-                    Span::styled("  [enter]", Style::new().fg(th().accent)),
-                    Span::styled(" toggle", Style::new().dim()),
-                ]),
+                // OFF is this setting's terminal state: the daemon refuses to
+                // enable it (#386, it admits 1 of 12 bare-eyed eyes-open
+                // frames), so advertising "[enter] toggle" offered an action
+                // whose only outcome was an error modal. The hint appears only
+                // while there is something to do: turn a legacy ON back off.
+                if self.eyes_open {
+                    Line::from(vec![
+                        Span::styled("  [enter]", Style::new().fg(th().accent)),
+                        Span::styled(" turn off", Style::new().dim()),
+                    ])
+                } else {
+                    Line::from(Span::styled(
+                        "  Cannot be enabled: the gate refuses eyes-open users (#386).",
+                        Style::new().dim(),
+                    ))
+                },
                 Line::raw(""),
                 ];
                 v.extend(self.service_gesture_lines());
@@ -5025,17 +5110,28 @@ impl App {
         // Only claim a node as "active" if it exists; select_pair's fixed
         // fallback names devices that may be absent on this hardware.
         let ex = |d: &str| std::path::Path::new(d).exists();
-        let active = match (ex(&argb), ex(&air)) {
-            (true, true) => format!("{argb} + {air}"),
-            (true, false) => format!("{argb} (RGB only)"),
-            _ => "none (no camera hardware)".into(),
+        // "No camera hardware" is a claim about the MACHINE, so it needs an
+        // answer from the daemon to stand on. With health absent the paths
+        // above default to "", `ex("")` is false, and this line asserted no
+        // hardware on machines with four video nodes, contradicting the
+        // daemon row rendered above it. Unknown is not none.
+        let (active, active_style) = if self.health.is_none() {
+            (
+                "unknown (daemon not answering; see the Repair tab)".to_string(),
+                Style::new().dim(),
+            )
+        } else {
+            let ok = Style::new().fg(th().ok).add_modifier(Modifier::BOLD);
+            match (ex(&argb), ex(&air)) {
+                (true, true) => (format!("{argb} + {air}"), ok),
+                (true, false) => (format!("{argb} (RGB only)"), ok),
+                (false, true) => (format!("{air} (IR only)"), ok),
+                (false, false) => ("none (no camera hardware)".to_string(), Style::new().dim()),
+            }
         };
         let mut lines = vec![Line::from(vec![
             Span::styled("  active   ", Style::new().dim()),
-            Span::styled(
-                active,
-                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(active, active_style),
         ])];
         if let Some(p) = pairs.get(self.cam_sel) {
             if p.rgb != argb || p.ir != air {
@@ -6516,6 +6612,57 @@ fn ort_fallback_check(found: bool) -> Check {
     }
 }
 
+/// The TFLite mirror of [`ort_fallback_check`], with one extra state: an
+/// explicit `IRLUME_TFLITE_LIB` override is the WHOLE candidate list (the
+/// resolver refuses to fall through a broken override), so an override
+/// pointing at a missing file is an operator error this environment CAN see,
+/// and that one is a Fail rather than the not-seen Warn. Existence only, no
+/// dlopen: the TUI runs unconfined and a load that succeeds here can still
+/// fail under the daemon's AppArmor profile, so "found" is the strongest
+/// claim a local probe can honestly make.
+fn tflite_fallback_check(
+    env_override: Option<&str>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Check {
+    let candidates = irlume_vision::tflite::tflite_lib_candidates(env_override, &exists);
+    let (sev, detail, fix) = match (env_override, candidates.first()) {
+        (Some(_), Some(p)) if exists(p) => (
+            Sev::Ok,
+            format!("override found at {}", p.display()),
+            Fix::None,
+        ),
+        (Some(_), Some(p)) => (
+            Sev::Fail,
+            format!(
+                "IRLUME_TFLITE_LIB points at {}, which does not exist",
+                p.display()
+            ),
+            Fix::Manual("fix or unset IRLUME_TFLITE_LIB; the resolver refuses to fall through a broken override".into()),
+        ),
+        (None, Some(p)) => (
+            Sev::Ok,
+            format!("library found at {}", p.display()),
+            Fix::None,
+        ),
+        _ => (
+            Sev::Warn,
+            "not seen by a local probe; the daemon's unit may set its own path".into(),
+            Fix::Manual(
+                "install the irlume package's TFLite runtime (it ships at \
+                 /usr/share/irlume/tflite/libtensorflowlite_c.so), or set \
+                 IRLUME_TFLITE_LIB in the irlumed unit"
+                    .into(),
+            ),
+        ),
+    };
+    Check {
+        label: "TFLite runtime".into(),
+        sev,
+        detail,
+        fix,
+    }
+}
+
 // ---- async response mappers (Response -> (ok, message)) -------------------
 
 fn map_ok(resp: Response) -> (bool, String) {
@@ -6958,6 +7105,7 @@ mod tests {
             heavy_at: std::time::Instant::now(),
             error: None,
             daemon_up: false,
+            daemon_reach: crate::commands::DaemonReach::Down,
             enroll_error: None,
             health: None,
             act_scroll: 0,
@@ -8660,11 +8808,23 @@ mod tests {
             app.op.is_none(),
             "no request may be sent for an enable the daemon refuses"
         );
-        let err = app.error.as_deref().unwrap_or_default();
-        assert!(err.contains("cannot be enabled"), "{err}");
+        // The row no longer advertises Enter while off, so a bare keypress
+        // logs quietly instead of raising a modal about a hint nobody saw.
         assert!(
-            err.contains("#386"),
-            "the refusal must name the issue: {err}"
+            app.error.is_none(),
+            "no modal for an action the screen does not offer"
+        );
+        let logged = app.activity.last().map(|e| e.1.as_str()).unwrap_or("");
+        assert!(logged.contains("cannot be enabled"), "{logged}");
+        assert!(
+            logged.contains("#386"),
+            "the refusal must name the issue: {logged}"
+        );
+        // The old literal spanned continuation lines without `\`, burying
+        // 26-space runs mid-sentence in the rendered message.
+        assert!(
+            !logged.contains("  "),
+            "the message must not carry embedded space runs: {logged:?}"
         );
     }
 
@@ -9590,6 +9750,7 @@ mod tests {
         assert!(app.profiles_load.is_none());
         app.apply_light(LightState {
             daemon_up: true,
+            reach: crate::commands::DaemonReach::Running,
             health: None,
             keyring_armed: None,
             keyring_policy: None,
@@ -9875,6 +10036,27 @@ mod tests {
         let text = draw_text(&app);
         assert!(!text.contains("no camera found"), "{text}");
         assert!(text.contains("camera list is unknown"), "{text}");
+        // The ACTIVE line has the same rule: with health unanswered it used
+        // to default the paths to "" and assert "no camera hardware" from
+        // Path::new("").exists(), contradicting the list line above it.
+        assert!(!text.contains("no camera hardware"), "{text}");
+        assert!(text.contains("unknown (daemon not answering"), "{text}");
+        // The daemon answered but named no devices: now none IS the fact.
+        app.health = Some(HealthInfo {
+            tier: "none".into(),
+            rgb_dev: None,
+            ir_dev: None,
+            adapter: false,
+            mesh: false,
+            version: env!("CARGO_PKG_VERSION").into(),
+            apparmor: None,
+            third_party_pad: None,
+            third_party_recognizer: None,
+            third_party_detector: None,
+        });
+        let text = draw_text(&app);
+        assert!(text.contains("no camera hardware"), "{text}");
+        app.health = None;
         // The daemon ANSWERED with an empty list: now "none" is a fact.
         app.pairs_known = true;
         let text = draw_text(&app);
@@ -9944,6 +10126,16 @@ mod tests {
         let text = draw_text(&app);
         assert!(text.contains("Require eyes open"));
         assert!(text.contains("○ no"), "eyes-open starts off");
+        // OFF is terminal (#386): the section must say why instead of
+        // advertising a toggle whose only outcome used to be an error modal.
+        assert!(
+            text.contains("Cannot be enabled"),
+            "the off state must explain itself"
+        );
+        assert!(
+            !text.contains("turn off"),
+            "no turn-off hint while already off"
+        );
         assert!(text.contains("Biopolicy operation-class gate"));
         assert!(text.contains("Third-party models"));
         assert!(
@@ -9954,6 +10146,14 @@ mod tests {
         app.eyes_open = true;
         let text = draw_text(&app);
         assert!(text.contains("● yes"), "the toggled state must show");
+        assert!(
+            text.contains("turn off"),
+            "a legacy ON must offer the one action that works"
+        );
+        assert!(
+            !text.contains("Cannot be enabled"),
+            "the refusal note belongs to the off state only"
+        );
     }
 
     #[test]
@@ -10610,6 +10810,7 @@ mod tests {
         app.cam_sel = 9;
         app.apply_light(LightState {
             daemon_up: false,
+            reach: crate::commands::DaemonReach::Down,
             health: None,
             keyring_armed: None,
             keyring_policy: None,
@@ -10895,6 +11096,55 @@ mod tests {
         assert!(miss.detail.contains("local probe"), "{}", miss.detail);
         let hit = ort_fallback_check(true);
         assert!(hit.sev == Sev::Ok);
+    }
+
+    /// The four TFLite states, driven through the injected `exists` so no
+    /// test depends on what this machine has installed. The one that differs
+    /// from ONNX: a broken override is an operator error THIS environment can
+    /// see, so it is a Fail, not the not-seen Warn.
+    #[test]
+    fn tflite_fallback_check_distinguishes_override_packaged_and_absent() {
+        let ok_override = tflite_fallback_check(Some("/opt/x/libtensorflowlite_c.so"), |_| true);
+        assert!(ok_override.sev == Sev::Ok, "{}", ok_override.detail);
+        assert!(
+            ok_override.detail.contains("/opt/x/"),
+            "{}",
+            ok_override.detail
+        );
+
+        let bad_override = tflite_fallback_check(Some("/opt/x/libtensorflowlite_c.so"), |_| false);
+        assert!(
+            bad_override.sev == Sev::Fail,
+            "a set-but-missing override is not a guess: {}",
+            bad_override.detail
+        );
+        assert!(
+            bad_override.detail.contains("does not exist"),
+            "{}",
+            bad_override.detail
+        );
+
+        let packaged = tflite_fallback_check(None, |p| {
+            p == std::path::Path::new("/usr/share/irlume/tflite/libtensorflowlite_c.so")
+        });
+        assert!(packaged.sev == Sev::Ok, "{}", packaged.detail);
+        assert!(
+            packaged.detail.contains("/usr/share/irlume/tflite"),
+            "{}",
+            packaged.detail
+        );
+
+        let absent = tflite_fallback_check(None, |_| false);
+        assert!(
+            absent.sev == Sev::Warn,
+            "nothing seen is a guess about the daemon's env, same as ONNX: {}",
+            absent.detail
+        );
+        assert!(absent.detail.contains("local probe"), "{}", absent.detail);
+        assert!(
+            matches!(&absent.fix, Fix::Manual(m) if m.contains("IRLUME_TFLITE_LIB")),
+            "the fix must name both remedies"
+        );
     }
 
     #[test]

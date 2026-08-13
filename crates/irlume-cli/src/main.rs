@@ -1711,29 +1711,90 @@ pub(crate) fn user_arg(args: &[String]) -> String {
 /// call. Long-running surfaces that must notice a camera being plugged in
 /// (the TUI) refresh from Health on their own poll rather than from here.
 pub(crate) fn caps() -> irlume_camera::Caps {
-    static CAPS: std::sync::OnceLock<irlume_camera::Caps> = std::sync::OnceLock::new();
+    caps_reading().caps
+}
+
+/// Whether [`caps`] is an OBSERVATION or a fallback guess.
+///
+/// The two are not interchangeable and one caller must not confuse them:
+/// `pamwire` UNWIRES a surface whose capability reads false, so a guessed
+/// `false` removes face authentication from every greeter. See
+/// [`CapsReading`].
+pub(crate) fn caps_established() -> bool {
+    caps_reading().established
+}
+
+/// A capability answer and whether anything actually established it.
+///
+/// The third state is the one that matters. A daemon that ANSWERS gives an
+/// observation; a daemon PROVEN absent licenses the one permitted probe,
+/// which also observes. Everything else (a timeout, EACCES, a daemon busy
+/// mid-capture) establishes nothing, and on a packaged install that is the
+/// ORDINARY shape of a dead daemon rather than an exotic one: socket
+/// activation keeps `/run/irlume.sock` present from sockets.target onward,
+/// so a failed daemon answers with a timeout and never ECONNREFUSED.
+///
+/// Collapsing that into `{ir_pair: false, rgb: false}` made "could not ask"
+/// indistinguishable from "this machine has no camera", which is the same
+/// absence-versus-failure-to-observe collapse `control_read_failure_means_
+/// absent` and `NodeScan::listing_error` exist to prevent elsewhere.
+#[derive(Clone, Copy)]
+pub(crate) struct CapsReading {
+    pub(crate) caps: irlume_camera::Caps,
+    /// False when the fields above are a fallback guess. A caller that acts
+    /// DESTRUCTIVELY on a false capability must refuse instead.
+    pub(crate) established: bool,
+}
+
+fn caps_reading() -> CapsReading {
+    static CAPS: std::sync::OnceLock<CapsReading> = std::sync::OnceLock::new();
     *CAPS.get_or_init(|| {
         match irlume_common::client::request_poll(&irlume_common::Request::Health) {
-            Ok(irlume_common::Response::Health { tier, rgb_dev, .. }) => irlume_camera::Caps {
-                ir_pair: tier == "secure",
-                rgb: rgb_dev.is_some() || tier == "secure",
+            Ok(irlume_common::Response::Health { tier, rgb_dev, .. }) => CapsReading {
+                caps: irlume_camera::Caps {
+                    ir_pair: tier == "secure",
+                    rgb: rgb_dev.is_some() || tier == "secure",
+                },
+                established: true,
             },
             // Enumerating opens every node, so it needs POSITIVE evidence that no
             // daemon holds them. Only a failure that proves nobody is listening is
             // that evidence; a timeout is what a daemon busy mid-capture looks
             // like, which is the worst moment to probe.
-            Err(e) if daemon_proven_absent(&e) => irlume_camera::capabilities(), // the one permitted probe
-            // Ambiguous: answer from the configured pair's mere existence, which
-            // never opens anything, and assume the shipped shape when there is no
-            // configuration to read.
+            Err(e) if daemon_proven_absent(&e) => CapsReading {
+                caps: irlume_camera::capabilities(), // the one permitted probe
+                established: true,
+            },
+            // Ambiguous: answer from the configured pair's mere existence,
+            // which never opens anything. The rule is ASYMMETRIC on purpose:
+            // existence of both paths may establish a POSITIVE reading (a
+            // positive only ever WIRES, and wiring is non-destructive since
+            // the password stays the fallback even if a path turned into the
+            // wrong node), but a missing path must not establish a NEGATIVE
+            // one. Path-absence during a timeout is what a suspended,
+            // renumbered, or unplugged camera looks like on a machine that
+            // HAS one, and an established-false reading is precisely what
+            // authorizes the unwire this type exists to prevent. The first
+            // cut set established=true here unconditionally, which covered
+            // the no-config machine and left the configured one, the common
+            // upgrade case, unprotected (found in the PR review).
             _ => match irlume_camera::configured_pair_no_probe() {
-                Some((rgb, ir)) => irlume_camera::Caps {
-                    ir_pair: std::path::Path::new(&ir).exists(),
-                    rgb: std::path::Path::new(&rgb).exists(),
-                },
-                None => irlume_camera::Caps {
-                    ir_pair: false,
-                    rgb: false,
+                Some((rgb, ir)) => {
+                    let caps = irlume_camera::Caps {
+                        ir_pair: std::path::Path::new(&ir).exists(),
+                        rgb: std::path::Path::new(&rgb).exists(),
+                    };
+                    CapsReading {
+                        established: caps.ir_pair && caps.rgb,
+                        caps,
+                    }
+                }
+                None => CapsReading {
+                    caps: irlume_camera::Caps {
+                        ir_pair: false,
+                        rgb: false,
+                    },
+                    established: false,
                 },
             },
         }
@@ -3520,15 +3581,16 @@ pub(crate) fn tpm_device() -> Option<&'static str> {
 fn report_credential_release(
     report: &mut crate::doctor_report::Report,
     user: &str,
-    gesture_is_closure: bool,
+    gesture_mode: irlume_common::config::ConsentGesture,
     closure_calibrated: bool,
 ) {
     use crate::doctor_report::State;
+    let gesture_is_closure = gesture_mode == irlume_common::config::ConsentGesture::Closure;
     // Recorded from the same visibility the block below prints from, so the
     // machine answer cannot disagree with the human one.
     report.check(
         "credential-release-challenge",
-        match irlume_common::config::credential_release_challenge_visible() {
+        match irlume_common::config::credential_release_gesture_required_visible() {
             // Off is the DEFAULT (the keyring releases with no nod); on is an
             // opt-in extra. Neither is a problem, so neither warns.
             Some(_) => State::Pass,
@@ -3544,15 +3606,21 @@ fn report_credential_release(
     if !armed {
         return;
     }
-    match irlume_common::config::credential_release_challenge_visible() {
+    // The EFFECTIVE rule: the per-service `service_gesture.credential_release`
+    // override first, then the global gate, exactly as the daemon reads it.
+    // Reading only the global key told a user with the per-service key set
+    // that the gate was off, and asserted a gate the daemon does not apply
+    // when the per-service key disables it over a global on.
+    match irlume_common::config::credential_release_gesture_required_visible() {
         // The opt-in gate is on: fall through and check it can actually run.
         Some(true) => {}
         Some(false) => {
             dout!(
                 report,
-                "[doctor] credential-release challenge: off (default); the keyring \
-                 releases after the face match with no nod. Enable the extra step \
-                 with: sudo irlume credential-release-challenge on"
+                "[doctor] credential-release challenge: off; the keyring releases \
+                 after the face match with no nod. Enable the extra step with: sudo \
+                 irlume credential-release-challenge credential_release on (the \
+                 per-service key, which outranks the global gate in either state)"
             );
             return;
         }
@@ -3564,6 +3632,20 @@ fn report_credential_release(
             );
             return;
         }
+    }
+    // The dedicated consent-gesture warning above is the whole story for a
+    // Misconfigured mode; hand-writing "keep nodding" here contradicted it on
+    // the same screen while NO gesture was accepted and the keyring quietly
+    // fell back to the password. Mirrors the polkit block's arm.
+    if gesture_mode == irlume_common::config::ConsentGesture::Misconfigured {
+        dout!(
+            report,
+            "[doctor] credential-release challenge: required, but NO gesture is accepted \
+             while
+     `consent_gesture` is unreadable (see above); your keyring falls \
+             back to the typed password"
+        );
+        return;
     }
     // The gate is on. Whether it can RUN needs the mesh model (every consent frame
     // goes through FaceMesh) and, in closure-only mode, this user's EAR calibration.
@@ -4124,9 +4206,11 @@ fn doctor_run(
                  A record marked 'applied' is put back by authenticating while the \
                  control still holds irlume's value; if its restore attempts ran out, \
                  shut the machine down fully (not a reboot) or unplug an external \
-                 camera first. A record marked 'write may not have reached the camera', \
-                 or one that will not parse, is never restored automatically: after \
-                 the camera has fully lost power, remove that record file",
+                 camera first. A record marked 'write may not have reached the camera' \
+                 is never restored automatically, but stops blocking on its own once \
+                 the control no longer holds its bytes: shut down fully, then \
+                 authenticate once. A record that will not parse is the one case that \
+                 needs an administrator to remove the named file",
                 entries.len(),
                 entries.join("; ")
             );
@@ -4379,6 +4463,57 @@ fn doctor_run(
             }
         }
     }
+    // The TFLite runtime the mesh runs on, probed the same way the ONNX row
+    // is: a real load in this shell, naming what resolved. The mesh has been
+    // a .tflite since #295 and a packaged daemon refuses to start without
+    // the runtime, yet no surface reported it (found by the 2026-08-12
+    // release audit through the Repair tab's same gap). The caveat both
+    // rows share: this shell is unconfined, so a load that succeeds here
+    // can still fail under the daemon's AppArmor profile.
+    {
+        use irlume_vision::tflite::{tflite_lib_candidates, tflite_runtime, TfliteUnavailable};
+        match tflite_runtime() {
+            Ok(_) => {
+                let path = tflite_lib_candidates(
+                    std::env::var(irlume_vision::tflite::TFLITE_LIB_ENV)
+                        .ok()
+                        .as_deref(),
+                    |p| p.exists(),
+                )
+                .first()
+                .map_or_else(|| "resolved".to_string(), |p| p.display().to_string());
+                report.check_detail("tflite-runtime", State::Pass, &path);
+                dout!(report, "[doctor] TFLite runtime: {path} ✓");
+            }
+            // A visible override error is an operator mistake THIS shell can
+            // see: Fail. A plain not-found is a guess about the daemon's env
+            // (the unit may set IRLUME_TFLITE_LIB), so Warn, matching the
+            // ONNX fallback row's reasoning.
+            Err(
+                e @ (TfliteUnavailable::OverrideInvalid { .. }
+                | TfliteUnavailable::OverrideFailed { .. }),
+            ) => {
+                report.check_detail("tflite-runtime", State::Fail, e.to_string());
+                dout!(
+                    report,
+                    "[doctor] TFLite runtime: UNUSABLE ✗ ({e}); fix or unset \
+                     IRLUME_TFLITE_LIB (the resolver refuses to fall through a \
+                     broken override)"
+                );
+            }
+            Err(e @ TfliteUnavailable::NotFound { .. }) => {
+                report.check_detail("tflite-runtime", State::Warn, e.to_string());
+                dout!(
+                    report,
+                    "[doctor] TFLite runtime: not loadable from this shell ⚠ ({e}). \
+                     The mesh is a .tflite, so a daemon without it does not start; \
+                     install the irlume package's runtime \
+                     (/usr/share/irlume/tflite/libtensorflowlite_c.so) or set \
+                     IRLUME_TFLITE_LIB in the irlumed unit"
+                );
+            }
+        }
+    }
     // --- pipeline stages (#276) -----------------------------------------
     // Each stage's model CANDIDATE from this process's search order. A
     // candidate, not a claim about the daemon: the service unit (or a
@@ -4420,7 +4555,7 @@ fn doctor_run(
             ),
             None => (
                 State::Warn,
-                format!("{file} — not found; mesh-dependent gates (passive blink liveness, consent gesture) are disabled"),
+                format!("{file} — not found; the eye-closure consent gesture, its calibration, and the detection-rescue alignment are disabled"),
             ),
         };
         dout!(report, "  {}: {line}", s.stage);
@@ -4622,7 +4757,7 @@ fn doctor_run(
     // Reported before the polkit block because it shares the gesture-readiness
     // facts above: this is the same nod/closure gate, applied to the one operation
     // where a spoof yields a REUSABLE secret instead of one session.
-    report_credential_release(report, &user, gesture_is_closure, closure_calibrated);
+    report_credential_release(report, &user, gesture_mode, closure_calibrated);
 
     report.check(
         "polkit-app-prompts",
@@ -4639,10 +4774,20 @@ fn doctor_run(
         // The gesture can be turned off for polkit alone, and then no gesture is
         // asked for at all; saying "KEEP NODDING" there describes a prompt the
         // user will never see.
-        Some(true) if !irlume_common::config::service_gesture_required("polkit-1") => dout!(report,
+        // The VISIBLE read: settings.conf is 0600, and the plain read collapses
+        // "could not read" into the permissive default, so an unprivileged
+        // doctor asserted face-alone-approves about a policy it never saw.
+        // Unknown falls through to the gesture arms below, which describe the
+        // default-on behaviour that holds unless someone turned it off.
+        Some(true)
+            if irlume_common::config::service_gesture_required_visible("polkit-1")
+                == Some(false) =>
+        {
+            dout!(report,
             "[doctor] polkit app prompts: wired ✓ (face alone approves Bitwarden unlock, pkexec, …;\n     \
              the consent gesture is OFF for polkit: sudo irlume credential-release-challenge polkit-1 on)"
-        ),
+            )
+        }
         // A misconfigured `consent_gesture` accepts NEITHER gesture, so the
         // dedicated warning above is the whole story; repeating "keep nodding"
         // here would contradict it on the same screen.

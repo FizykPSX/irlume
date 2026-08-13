@@ -151,9 +151,11 @@ asked about.
 }
 ```
 
-`daemon` is one of `running`, `access-denied` or `unreachable`. An unreachable
-daemon is reported, not raised as an error, because the fields that do not need
-it are still worth having.
+`daemon` is one of `running`, `starting`, `access-denied` or `unreachable`.
+`starting` means the socket answered but the engine is still loading models,
+which lasts a few seconds after every daemon (re)start; retry shortly rather
+than restarting. An unreachable daemon is reported, not raised as an error,
+because the fields that do not need it are still worth having.
 
 Anything derived from the daemon carries `known`. **Unknown is not zero**: when
 `known` is false the counts are absent entirely rather than reported as `0`, so a
@@ -213,7 +215,7 @@ reused for a different meaning. The registry as of this contract:
 | `secure-boot` | Secure Boot enabled, disabled, or in setup mode |
 | `boot-mode` | the boot chain, which decides which PCR policy tier applies |
 | `emitter-undo-pending` | camera controls an interrupted `ir-setup` left changed and has not put back. `unknown` when the root-only record store cannot be read, which is any run that is not root |
-| `emitter-stream-pending` | per-stream emitter records not yet resolved. An `applied` record is restored by a later authentication; a record whose write may never have reached the camera is never claimed and needs an administrator to remove the named file. Either kind also refuses new stream writes, so this explains an emitter that stays dark. `unknown` when the root-only store cannot be read, which is any run that is not root |
+| `emitter-stream-pending` | per-stream emitter records not yet resolved. An `applied` record is restored by a later authentication; a record whose write may never have reached the camera is never claimed, and is replaced by the next capture once the control no longer holds its bytes (a full power-off does that); a record that will not parse blocks until an administrator removes the named file. Either kind also refuses new stream writes, so this explains an emitter that stays dark. `unknown` when the root-only store cannot be read, which is any run that is not root |
 | `capture-mode` | which capture strategy the active camera pair uses (concurrent or sequential) and whether it was measured for that pair, switched automatically after repeated concurrent-capture RGB losses during enrolment, forced by `IRLUME_SEQUENTIAL_CAPTURE`, or is the unmeasured sequential default. `info` in every measured, auto-switched, forced, default, or no-pinned-pair case, since a capture mode is a strategy and not a fault; `unknown` when the root-only `cameras.conf` cannot be read, which is any run that is not root AND any run where the file exists but is unreadable. An auto-switched verdict is reported as sequential with an origin stamp and age, never as a measurement, and `camera-tune` is named as the way to replace it. The override is read from the reporting process, so a value set only in the `irlumed` unit environment decides captures and is not visible here; and with no pinned pair the stored verdict cannot be looked up, so `info` there does not mean no mode is in force |
 | `signed-pcr-policy` | the systemd signed-PCR (Tier 1) policy for sealing |
 | `pcrlock` | the systemd-pcrlock (Tier 2) policy and its NV index |
@@ -222,10 +224,11 @@ reused for a different meaning. The registry as of this contract:
 | `rgb-stream-hello-minimum` | the negotiated RGB stream compared with the published Windows Hello RGB minimum (480x480@7.5fps). Same states as the IR check |
 | `models` | the ONNX weights irlume needs, present and checksummed |
 | `stage-detection-model` | the face-detection stage's model: the resolved file and whether it is shipped or an env override. `fail` when missing, because the daemon cannot start |
-| `stage-landmarks-model` | the landmarks (mesh) stage's model. `warn` when missing: mesh-dependent gates (passive blink liveness, consent gesture) are disabled |
+| `stage-landmarks-model` | the landmarks (mesh) stage's model. `warn` when missing: the mesh-dependent eye-closure consent gesture, its calibration, and the detection-rescue alignment are disabled |
 | `stage-recognition-model` | the recognizer stage's model. `fail` when missing, because the daemon cannot start |
 | `ort-dylib-path` | the `ORT_DYLIB_PATH` override, when one is set |
 | `onnxruntime` | the ONNX Runtime the resolver would load in this shell: the resolved path (or the system library) and its version. `fail` when that library is unloadable or below the API level irlume needs, because model loading cannot succeed against it (#187) |
+| `tflite-runtime` | the TFLite C runtime the mesh runs on, loaded in this shell. `fail` when an explicit `IRLUME_TFLITE_LIB` is set but invalid or unloadable (an operator mistake this shell can see); `warn` when nothing resolved, because the daemon's unit may set its own path this shell cannot observe |
 | `third-party-pad-model` | optional third-party presentation-attack weights, if installed |
 | `fingerprint-reader` | whether a fingerprint reader was found |
 | `templates` | face templates encrypted at rest for the account asked about |
@@ -324,8 +327,11 @@ needs root, so an ordinary caller gets `unknown`, which is not a synonym for
 
 Capability: `profiles-list-json`.
 
-Returns display names, scan display names, and the two per-user liveness policy
-flags. The current enrollment store identifies these records by mutable names,
+Returns display names, scan display names, and the per-user eyes-open policy
+flag. `require_challenge` is FROZEN at `false` for contract 1: the blink gate
+it reported was retired ([ADR-0002](adr/0002-challenge-response-liveness.md)),
+but the field was published in the contract-1 schema as required, so it keeps
+being emitted and leaves with contract 2. The current enrollment store identifies these records by mutable names,
 so this first read-only contract intentionally does not invent opaque IDs or
 advertise profile mutations. Mutation-safe IDs must originate in the engine
 store before a later capability can expose them.
