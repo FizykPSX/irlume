@@ -5,6 +5,32 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Camera discovery and opens now cross one process-owned backend boundary.**
+  The initial backend remains the existing direct V4L2/UVC implementation, so
+  probing, pairing, negotiation, privacy, emitter, and capture behavior remain
+  unchanged. A v1 evidence schema now fails closed on unknown versions and
+  fields (#452).
+- **The camera supervisor now owns process-scoped lifecycle identity.**
+  Distinct CSPRNG physical-camera identifiers and a transactional inventory keep
+  generations monotonic while continuity is proven; removal retires an incarnation
+  permanently, and rediscovery starts a fresh identifier at generation one. Stale,
+  forged, foreign-instance, duplicate, exhausted, and poisoned states fail closed.
+  Capture and hardware-control behavior remain unchanged (#455).
+- **Linux camera lifecycle changes now invalidate stale inventory tokens.**
+  A monitor-before-scan libudev adapter coalesces UVC and USB-parent events, detects
+  monitor socket errors, and rebuilds one authoritative sysfs snapshot without opening video
+  nodes. Monitor loss, overflow, unstable scans, and continuity loss retire stale
+  references before replacements become visible; capture and hardware-control behavior
+  remain unchanged (#456).
+- **Camera operations now share one descriptor-bound cooperative lease.**
+  Authentication and enrollment acquire RGB+IR atomically by physical camera identity;
+  diagnostics, preview, setup, raw controls, and legacy single-node opens use the same
+  authority. Lifecycle invalidation makes held permits stale before the next dequeue or
+  control, explicit operation scopes cross only opted-in worker threads, and drop/panic
+  paths release leases without path-only identity fallbacks (#461).
+
 ## [0.10.0] - 2026-08-12
 
 ### Added

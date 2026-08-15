@@ -1757,16 +1757,40 @@ impl Engine {
         self.mesh.is_some()
     }
 
+    fn run_camera_operation<T>(
+        operation: &irlume_camera::lease::CameraOperationSession,
+        task: impl FnOnce() -> irlume_common::Result<T>,
+    ) -> irlume_common::Result<T> {
+        operation
+            .run(task)
+            .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
+    }
+
     /// One capture: RGB+IR → liveness verdict + (if a face) its embedding.
     /// Capture + assess, choosing the path from the hardware: full cross-spectrum
     /// (RGB+IR) when an IR camera is present, else RGB-only (convenience).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn assess(&mut self) -> irlume_common::Result<Assessment> {
-        if self.ir_available {
-            self.assess_full()
+        let endpoints: Vec<&str> = if self.ir_available {
+            vec![self.rgb_dev.as_str(), self.ir_dev.as_str()]
         } else {
-            self.assess_rgb_only()
-        }
+            vec![self.rgb_dev.as_str()]
+        };
+        let operation = irlume_camera::lease::acquire_camera_operation(
+            &endpoints,
+            irlume_camera::lease::CameraOperationKind::Authentication,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+        operation
+            .run(|| {
+                if self.ir_available {
+                    self.assess_full(&operation)
+                } else {
+                    self.assess_rgb_only()
+                }
+            })
+            .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
     }
 
     /// RGB-only capture + algorithmic (no-IR) liveness, the convenience-tier
@@ -1862,8 +1886,11 @@ impl Engine {
     /// held across requests: an idle stream reserves the camera against other
     /// applications, keeps the capture LED lit, and would go stale across a
     /// suspend.
-    fn assess_full(&mut self) -> irlume_common::Result<Assessment> {
-        self.assess_full_with(None, None)
+    fn assess_full(
+        &mut self,
+        operation: &irlume_camera::lease::CameraOperationSession,
+    ) -> irlume_common::Result<Assessment> {
+        self.assess_full_with(None, None, operation)
     }
 
     /// [`Self::assess_full`], optionally reusing already-streaming cameras.
@@ -1874,6 +1901,7 @@ impl Engine {
             &mut irlume_camera::IrSession<'_>,
         )>,
         capture_mode: Option<(bool, &'static str)>,
+        operation: &irlume_camera::lease::CameraOperationSession,
     ) -> irlume_common::Result<Assessment> {
         // Median-denoise the RGB frame so a single blurry/over-exposed frame
         // can't false-reject a genuine user (IR is already brightest-of-burst).
@@ -1980,7 +2008,9 @@ impl Engine {
                 std::thread::scope(|s| {
                     let ir_thread = s.spawn(move || {
                         let t = std::time::Instant::now();
-                        (held_ir_capture(ir_s), t.elapsed().as_millis())
+                        let captured =
+                            Self::run_camera_operation(operation, || held_ir_capture(ir_s));
+                        (captured, t.elapsed().as_millis())
                     });
                     let t = std::time::Instant::now();
                     let rgb = held_rgb_capture(rgb_s);
@@ -2016,10 +2046,10 @@ impl Engine {
                 let ir_progress = progress.clone();
                 let ir_thread = s.spawn(move || {
                     let t = std::time::Instant::now();
-                    (
-                        irlume_camera::capture_ir_with_stats_and_progress(&ir_dev, &ir_progress),
-                        t.elapsed().as_millis(),
-                    )
+                    let captured = Self::run_camera_operation(operation, || {
+                        irlume_camera::capture_ir_with_stats_and_progress(&ir_dev, &ir_progress)
+                    });
+                    (captured, t.elapsed().as_millis())
                 });
                 let t = std::time::Instant::now();
                 let rgb =
@@ -3039,6 +3069,23 @@ impl Engine {
                 return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
         }
+        let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
+        let endpoints: Vec<&str> = if self.ir_available {
+            vec![rgb_dev.as_str(), ir_dev.as_str()]
+        } else {
+            vec![rgb_dev.as_str()]
+        };
+        // One authentication owns its physical camera set from the first
+        // consent frame through the final grace-window retry.  Keeping this
+        // lease across sequential fallbacks is deliberate: otherwise another
+        // operation can interleave between consent and matching.
+        let camera_operation = irlume_camera::lease::acquire_camera_operation(
+            &endpoints,
+            irlume_camera::lease::CameraOperationKind::Authentication,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+
         // Watch for the consent gesture BEFORE the first capture, so a user who
         // nods when the greeter asks is not ignored for the seconds it takes to
         // capture and match a face. Once per authentication, never per retry: a
@@ -3047,7 +3094,8 @@ impl Engine {
         self.gesture_seen_before_match = false;
         self.gesture_cancelled = false;
         if purpose.demands_gesture(service) {
-            self.gesture_seen_before_match = self.early_consent_watch(&enr)?;
+            self.gesture_seen_before_match =
+                Self::run_camera_operation(&camera_operation, || self.early_consent_watch(&enr))?;
             // A head-shake during the pre-match watch is an explicit decline.
             // Close the request now: do not spend the capture and match only to
             // deny after a second post-match watch, and do not let a later cue
@@ -3073,7 +3121,6 @@ impl Engine {
         // below tries to open the same device again, which is EBUSY on a
         // single-consumer camera and on any v4l2loopback node with a producer
         // attached.
-        let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
         let (sequential, _mode_source) = sequential_capture_selected(&rgb_dev, &ir_dev);
         // Declared in reverse drop order: the sessions borrow from `_cams`, so
         // Rust drops the sessions first and the cameras after.
@@ -3092,8 +3139,8 @@ impl Engine {
         let mut held_ir: Option<irlume_camera::IrSession<'_>> = None;
         if !sequential && self.ir_available {
             if let (Ok(r), Ok(i)) = (
-                irlume_camera::RgbCamera::open(&rgb_dev),
-                irlume_camera::IrCamera::open(&ir_dev),
+                camera_operation.open_rgb(&rgb_dev),
+                camera_operation.open_ir(&ir_dev),
             ) {
                 _cams = Some((r, i));
                 let progress = self.capture_progress();
@@ -3112,8 +3159,16 @@ impl Engine {
         let mut attempt = 0u32;
         let out = loop {
             attempt += 1;
-            let out =
-                self.authenticate_once(&enr, purpose, service, &mut held_rgb, &mut held_ir)?;
+            let out = Self::run_camera_operation(&camera_operation, || {
+                self.authenticate_once(
+                    &enr,
+                    purpose,
+                    service,
+                    &mut held_rgb,
+                    &mut held_ir,
+                    Some(&camera_operation),
+                )
+            })?;
             if !presence_retryable(&out) || std::time::Instant::now() >= deadline {
                 if attempt > 1 {
                     irlume_common::dlog!(
@@ -3147,9 +3202,16 @@ impl Engine {
         // `authenticate_for`.
         held_rgb: &mut Option<irlume_camera::RgbSession<'_>>,
         held_ir: &mut Option<irlume_camera::IrSession<'_>>,
+        operation: Option<&irlume_camera::lease::CameraOperationSession>,
     ) -> irlume_common::Result<Outcome> {
-        let a = if let (Some(rs), Some(is)) = (held_rgb.as_mut(), held_ir.as_mut()) {
-            self.assess_full_with(Some((rs, is)), None)?
+        let a = if !self.ir_available {
+            self.assess_rgb_only()?
+        } else if let (Some(rs), Some(is), Some(operation)) =
+            (held_rgb.as_mut(), held_ir.as_mut(), operation)
+        {
+            self.assess_full_with(Some((rs, is)), None, operation)?
+        } else if let Some(operation) = operation {
+            self.assess_full_with(None, None, operation)?
         } else {
             self.assess()?
         };
@@ -3677,11 +3739,19 @@ impl Engine {
             ));
         }
         let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
+        let endpoints: Vec<&str> = if self.ir_available {
+            vec![rgb_dev.as_str(), ir_dev.as_str()]
+        } else {
+            vec![rgb_dev.as_str()]
+        };
+        let operation = irlume_camera::lease::acquire_camera_operation(
+            &endpoints,
+            irlume_camera::lease::CameraOperationKind::Enrollment,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
         let cams = if self.ir_available {
-            match (
-                irlume_camera::RgbCamera::open(&rgb_dev),
-                irlume_camera::IrCamera::open(&ir_dev),
-            ) {
+            match (operation.open_rgb(&rgb_dev), operation.open_ir(&ir_dev)) {
                 (Ok(r), Ok(i)) => Some((r, i)),
                 _ => None,
             }
@@ -3717,6 +3787,7 @@ impl Engine {
                     pitch_neutral,
                     Some((&mut rs, &mut is)),
                     Some((sequential, mode_source)),
+                    &operation,
                     observed,
                 );
             }
@@ -3741,6 +3812,7 @@ impl Engine {
             pitch_neutral,
             None,
             Some((sequential, mode_source)),
+            &operation,
             observed,
         )
     }
@@ -3760,6 +3832,7 @@ impl Engine {
             &mut irlume_camera::IrSession<'_>,
         )>,
         capture_mode: Option<(bool, &'static str)>,
+        operation: &irlume_camera::lease::CameraOperationSession,
         observed: &mut CaptureShape,
     ) -> irlume_common::Result<Vec<CapturedScan>> {
         let mut out = Vec::new();
@@ -3784,10 +3857,11 @@ impl Engine {
                     "an authentication needed the camera; nothing was saved, please retry".into(),
                 ));
             }
-            let a = match &mut sessions {
-                Some((rs, is)) => self.assess_full_with(Some((rs, is)), capture_mode)?,
-                None => self.assess()?,
-            };
+            let a = Self::run_camera_operation(operation, || match &mut sessions {
+                Some((rs, is)) => self.assess_full_with(Some((rs, is)), capture_mode, operation),
+                None if self.ir_available => self.assess_full_with(None, capture_mode, operation),
+                None => self.assess_rgb_only(),
+            })?;
             observe_attempt(
                 &mut shape,
                 a.embedding.as_ref(),
@@ -3887,10 +3961,15 @@ impl Engine {
         if !self.ir_available {
             return false;
         }
-        let cams = match (
-            irlume_camera::RgbCamera::open(&rgb_dev),
-            irlume_camera::IrCamera::open(&ir_dev),
+        let operation = match irlume_camera::lease::acquire_camera_operation(
+            &[rgb_dev.as_str(), ir_dev.as_str()],
+            irlume_camera::lease::CameraOperationKind::Authentication,
+            std::time::Duration::from_secs(2),
         ) {
+            Ok(operation) => operation,
+            Err(_) => return false,
+        };
+        let cams = match (operation.open_rgb(&rgb_dev), operation.open_ir(&ir_dev)) {
             (Ok(r), Ok(i)) => (r, i),
             _ => return false,
         };
@@ -8760,8 +8839,14 @@ mod engine_tests {
     fn loopback_release_held_hands_the_camera_back() {
         let (rgb, ir) = loopback_pair();
         let _g = env_guard();
-        let cam = irlume_camera::IrCamera::open(&ir).expect("open the IR node");
-        let rgb_cam = irlume_camera::RgbCamera::open(&rgb).expect("open the RGB node");
+        let operation = irlume_camera::lease::acquire_camera_operation(
+            &[rgb.as_str(), ir.as_str()],
+            irlume_camera::lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire one RGB+IR operation");
+        let cam = operation.open_ir(&ir).expect("open the IR node");
+        let rgb_cam = operation.open_rgb(&rgb).expect("open the RGB node");
         let mut held_ir = Some(cam.session().expect("hold an IR session"));
         // BOTH halves must release: the review round noted the test proved
         // only the IR side, and release_held drops two owners.
@@ -8769,11 +8854,11 @@ mod engine_tests {
 
         // Control: with the session alive, a second stream on the same node
         // must be refused. If this passes, the rest proves nothing.
-        let busy =
-            irlume_camera::capture_ir_streaming(&ir, 2, |_| std::ops::ControlFlow::Break::<()>(()));
+        let busy_ir = cam.session();
+        let busy_rgb = rgb_cam.session();
         assert!(
-            busy.is_err(),
-            "control failed: a live IrSession must block a second stream, or this \
+            busy_ir.is_err() && busy_rgb.is_err(),
+            "control failed: live IR and RGB sessions must each block a second stream, or this \
              test cannot distinguish a real release from a camera nobody held"
         );
 
@@ -8783,20 +8868,22 @@ mod engine_tests {
             "the release must clear BOTH session slots"
         );
 
-        // The observation: the same call now succeeds, because the buffer queue
-        // went back when the session dropped.
-        let after =
-            irlume_camera::capture_ir_streaming(&ir, 2, |_| std::ops::ControlFlow::Break::<()>(()));
+        // The observation: the original cameras accept fresh sessions after
+        // release_held drops both owners and their per-camera slots reset.
+        let mut after = cam.session().expect("open IR session after release");
+        let after_capture = after.capture_with_stats();
         assert!(
-            after.is_ok(),
-            "after release the consent watch must be able to open its own \
+            after_capture.is_ok(),
+            "after release the consent watch must be able to capture from its own \
              stream, got {:?}",
-            after.err()
+            after_capture.err()
         );
-        // The RGB half too: a fresh capture on the released node must work.
+        drop(after);
+        // The RGB half too: the original camera's session slot must reopen.
+        let mut rgb_after = rgb_cam.session().expect("open RGB session after release");
         assert!(
-            irlume_camera::capture_rgb(&rgb).is_ok(),
-            "after release an RGB capture must be able to open the node"
+            rgb_after.frame().is_ok(),
+            "after release an RGB session must be able to capture a frame"
         );
     }
 

@@ -1,0 +1,617 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
+//! Crate-private capture-backend ownership and operation routing.
+
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+use crate::contracts::CameraDescriptor;
+use crate::inventory::{
+    CameraInventory, CameraInventoryError, CameraInventoryEvent, CameraObservation,
+};
+use crate::lease::{
+    CameraLease, CameraLeaseError, CameraOperationKind, CameraOperationSession, LeaseAuthority,
+};
+use crate::{CameraPair, IrCamera, NodeScan, RgbCamera, Role};
+
+/// One capture implementation owned by the process camera supervisor.
+trait CameraBackend: Send + Sync + 'static {
+    fn scan_nodes(&self) -> NodeScan;
+    fn discover_nodes(&self) -> Vec<(String, Role)>;
+    fn list_pairs(&self) -> Vec<CameraPair>;
+    fn open_rgb(&self, device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera>;
+    fn open_ir(&self, device: &str, lease: CameraLease) -> irlume_common::Result<IrCamera>;
+
+    #[cfg(test)]
+    fn has_exact_production_uvc_delegates(&self) -> bool {
+        false
+    }
+}
+
+/// Process component that owns camera backend instances and routes operations.
+///
+/// Inventory mutation is isolated from capture routing. Leases and hotplug event
+/// subscription remain later slices and therefore cannot alter behavior here.
+pub(crate) struct CameraSupervisor {
+    backend: Arc<dyn CameraBackend>,
+    inventory: Arc<Mutex<CameraInventory>>,
+    leases: Arc<LeaseAuthority>,
+}
+
+impl CameraSupervisor {
+    fn new(backend: impl CameraBackend) -> Self {
+        Self::from_arc(Arc::new(backend))
+    }
+
+    fn from_arc(backend: Arc<dyn CameraBackend>) -> Self {
+        Self {
+            backend,
+            inventory: Arc::new(Mutex::new(CameraInventory::new())),
+            leases: Arc::new(LeaseAuthority::default()),
+        }
+    }
+
+    pub(crate) fn reconcile_inventory(
+        &self,
+        observations: Vec<CameraObservation>,
+    ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
+        self.inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .reconcile(observations)
+    }
+
+    pub(crate) fn reconcile_inventory_guarded<F>(
+        &self,
+        observations: Vec<CameraObservation>,
+        quiet: F,
+    ) -> Result<(Vec<CameraInventoryEvent>, bool), CameraInventoryError>
+    where
+        F: FnMut() -> bool,
+    {
+        self.inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .reconcile_guarded(observations, quiet)
+    }
+
+    pub(crate) fn invalidate_inventory(&self) -> Result<(), CameraInventoryError> {
+        self.inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .invalidate_all();
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_inventory_topologies(
+        &self,
+        topologies: &std::collections::BTreeSet<String>,
+    ) -> Result<(), CameraInventoryError> {
+        self.inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .invalidate_topologies(topologies);
+        Ok(())
+    }
+
+    pub(crate) fn retire_inventory_topologies(
+        &self,
+        topologies: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
+        Ok(self
+            .inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .retire_topologies(topologies))
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "later frame and session slices validate descriptors"
+        )
+    )]
+    pub(crate) fn validate_descriptor(
+        &self,
+        descriptor: &CameraDescriptor,
+    ) -> Result<(), CameraInventoryError> {
+        self.inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .validate(descriptor)
+    }
+
+    pub(crate) fn acquire_operation(
+        &self,
+        endpoint_paths: &[&str],
+        operation: CameraOperationKind,
+        deadline: Instant,
+    ) -> Result<CameraOperationSession, CameraLeaseError> {
+        let reference = self
+            .inventory
+            .lock()
+            .map_err(|_| CameraLeaseError::Poisoned)?
+            .reference_for_endpoints(endpoint_paths)
+            .map_err(|error| match error {
+                CameraInventoryError::UnknownCamera => CameraLeaseError::UnknownEndpoint,
+                _ => CameraLeaseError::Stale,
+            })?;
+        let lease = CameraLease::acquire(
+            &self.leases,
+            self.inventory.clone(),
+            vec![reference],
+            operation,
+            deadline,
+        )?;
+        Ok(CameraOperationSession::new(lease))
+    }
+
+    fn scan_nodes(&self) -> NodeScan {
+        self.backend.scan_nodes()
+    }
+
+    fn discover_nodes(&self) -> Vec<(String, Role)> {
+        self.backend.discover_nodes()
+    }
+
+    fn list_pairs(&self) -> Vec<CameraPair> {
+        self.backend.list_pairs()
+    }
+
+    fn open_rgb(&self, device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera> {
+        self.backend.open_rgb(device, lease)
+    }
+
+    fn open_ir(&self, device: &str, lease: CameraLease) -> irlume_common::Result<IrCamera> {
+        self.backend.open_ir(device, lease)
+    }
+}
+
+/// Existing direct V4L2 backend for video-node-centric UVC cameras.
+///
+/// This delegates to the pre-existing direct functions without changing their
+/// probing, pairing, negotiation, privacy, or emitter behavior.
+type ScanNodes = fn() -> NodeScan;
+type DiscoverNodes = fn() -> Vec<(String, Role)>;
+type ListPairs = fn() -> Vec<CameraPair>;
+type OpenRgb = fn(&str, CameraLease) -> irlume_common::Result<RgbCamera>;
+type OpenIr = fn(&str, CameraLease) -> irlume_common::Result<IrCamera>;
+
+fn production_scan_nodes() -> NodeScan {
+    crate::uvc_scan(true)
+}
+
+fn production_discover_nodes() -> Vec<(String, Role)> {
+    crate::uvc_discover_nodes()
+}
+
+fn production_list_pairs() -> Vec<CameraPair> {
+    crate::uvc_list_pairs()
+}
+
+fn production_open_rgb(device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera> {
+    RgbCamera::open_uvc(device, lease)
+}
+
+fn production_open_ir(device: &str, lease: CameraLease) -> irlume_common::Result<IrCamera> {
+    IrCamera::open_uvc(device, lease)
+}
+
+#[derive(Clone, Copy)]
+struct UvcV4l2Backend {
+    scan_nodes: ScanNodes,
+    discover_nodes: DiscoverNodes,
+    list_pairs: ListPairs,
+    open_rgb: OpenRgb,
+    open_ir: OpenIr,
+}
+
+impl Default for UvcV4l2Backend {
+    fn default() -> Self {
+        Self {
+            scan_nodes: production_scan_nodes,
+            discover_nodes: production_discover_nodes,
+            list_pairs: production_list_pairs,
+            open_rgb: production_open_rgb,
+            open_ir: production_open_ir,
+        }
+    }
+}
+
+impl CameraBackend for UvcV4l2Backend {
+    fn scan_nodes(&self) -> NodeScan {
+        (self.scan_nodes)()
+    }
+
+    fn discover_nodes(&self) -> Vec<(String, Role)> {
+        (self.discover_nodes)()
+    }
+
+    fn list_pairs(&self) -> Vec<CameraPair> {
+        (self.list_pairs)()
+    }
+
+    fn open_rgb(&self, device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera> {
+        (self.open_rgb)(device, lease)
+    }
+
+    fn open_ir(&self, device: &str, lease: CameraLease) -> irlume_common::Result<IrCamera> {
+        (self.open_ir)(device, lease)
+    }
+
+    #[cfg(test)]
+    fn has_exact_production_uvc_delegates(&self) -> bool {
+        std::ptr::fn_addr_eq(self.scan_nodes, production_scan_nodes as ScanNodes)
+            && std::ptr::fn_addr_eq(
+                self.discover_nodes,
+                production_discover_nodes as DiscoverNodes,
+            )
+            && std::ptr::fn_addr_eq(self.list_pairs, production_list_pairs as ListPairs)
+            && std::ptr::fn_addr_eq(self.open_rgb, production_open_rgb as OpenRgb)
+            && std::ptr::fn_addr_eq(self.open_ir, production_open_ir as OpenIr)
+    }
+}
+
+static DEFAULT_CAMERA_SUPERVISOR: OnceLock<Arc<CameraSupervisor>> = OnceLock::new();
+
+pub(crate) fn default_camera_supervisor() -> &'static CameraSupervisor {
+    DEFAULT_CAMERA_SUPERVISOR
+        .get_or_init(|| {
+            let supervisor = Arc::new(CameraSupervisor::new(UvcV4l2Backend::default()));
+            if let Err(error) = crate::lifecycle::spawn(Arc::downgrade(&supervisor)) {
+                eprintln!("irlume: camera lifecycle monitor unavailable: {error}");
+            }
+            supervisor
+        })
+        .as_ref()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SUPERVISOR: std::cell::RefCell<Option<Arc<CameraSupervisor>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Route one compatibility operation through the process supervisor.
+pub(crate) fn with_camera_supervisor<T>(operation: impl FnOnce(&CameraSupervisor) -> T) -> T {
+    #[cfg(test)]
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return operation(&supervisor);
+    }
+
+    operation(default_camera_supervisor())
+}
+
+pub(crate) fn scan_nodes() -> NodeScan {
+    with_camera_supervisor(CameraSupervisor::scan_nodes)
+}
+
+pub(crate) fn discover_nodes() -> Vec<(String, Role)> {
+    with_camera_supervisor(CameraSupervisor::discover_nodes)
+}
+
+pub(crate) fn list_pairs() -> Vec<CameraPair> {
+    with_camera_supervisor(CameraSupervisor::list_pairs)
+}
+
+pub(crate) fn open_rgb(device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera> {
+    with_camera_supervisor(|supervisor| supervisor.open_rgb(device, lease))
+}
+
+pub(crate) fn open_ir(device: &str, lease: CameraLease) -> irlume_common::Result<IrCamera> {
+    with_camera_supervisor(|supervisor| supervisor.open_ir(device, lease))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::contracts::CameraInstanceId;
+    use crate::{FailedAt, McCentric, Unreadable};
+
+    struct TestBackendGuard(Option<Arc<CameraSupervisor>>);
+
+    impl Drop for TestBackendGuard {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            TEST_SUPERVISOR.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+
+    fn install_test_supervisor(supervisor: Arc<CameraSupervisor>) -> TestBackendGuard {
+        let previous = TEST_SUPERVISOR.with(|slot| slot.borrow_mut().replace(supervisor));
+        TestBackendGuard(previous)
+    }
+
+    fn seed_test_endpoints(supervisor: &CameraSupervisor, endpoints: &[&str]) {
+        supervisor
+            .reconcile_inventory(vec![
+                CameraObservation::with_lifecycle_evidence_and_endpoints(
+                    crate::contracts::BackendKind::UvcV4l2,
+                    crate::contracts::PhysicalCameraId::new("/devices/test/camera", None).unwrap(),
+                    crate::contracts::CameraCapabilities::default(),
+                    vec!["test-evidence".into()],
+                    endpoints.iter().map(|path| (*path).to_owned()).collect(),
+                ),
+            ])
+            .unwrap();
+    }
+
+    #[derive(Clone)]
+    struct RecordingBackend {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingBackend {
+        fn record(&self, call: impl Into<String>) {
+            self.calls
+                .lock()
+                .expect("recording lock poisoned")
+                .push(call.into());
+        }
+    }
+
+    impl CameraBackend for RecordingBackend {
+        fn scan_nodes(&self) -> NodeScan {
+            self.record("scan_nodes");
+            NodeScan {
+                classified: vec![("/dev/spy-scan".into(), Role::Rgb)],
+                ..NodeScan::default()
+            }
+        }
+
+        fn discover_nodes(&self) -> Vec<(String, Role)> {
+            self.record("discover_nodes");
+            vec![
+                ("/dev/spy-ir".into(), Role::Ir),
+                ("/dev/spy-rgb".into(), Role::Rgb),
+            ]
+        }
+
+        fn list_pairs(&self) -> Vec<CameraPair> {
+            self.record("list_pairs");
+            vec![CameraPair {
+                rgb: "/dev/spy-rgb".into(),
+                ir: "/dev/spy-ir".into(),
+                id: Some("1234:5678".into()),
+                fixed: true,
+            }]
+        }
+
+        fn open_rgb(&self, device: &str, _: CameraLease) -> irlume_common::Result<RgbCamera> {
+            self.record(format!("open_rgb:{device}"));
+            Err(irlume_common::Error::Hardware("spy RGB refusal".into()))
+        }
+
+        fn open_ir(&self, device: &str, _: CameraLease) -> irlume_common::Result<IrCamera> {
+            self.record(format!("open_ir:{device}"));
+            Err(irlume_common::Error::Hardware("spy IR refusal".into()))
+        }
+    }
+
+    fn fixture_scan_nodes() -> NodeScan {
+        NodeScan {
+            classified: vec![
+                ("/dev/fixture-rgb".into(), Role::Rgb),
+                ("/dev/fixture-ir".into(), Role::Ir),
+            ],
+            unreadable: vec![Unreadable {
+                path: "/dev/fixture-busy".into(),
+                at: FailedAt::Open,
+                errno: Some(libc::EBUSY),
+                holder: Some("fixture-holder".into()),
+            }],
+            mc_centric: vec![(
+                "/dev/fixture-mc".into(),
+                McCentric {
+                    driver: "fixture-driver".into(),
+                    io_mc: true,
+                    mplane_only: true,
+                },
+            )],
+            listing_error: Some("fixture listing warning".into()),
+        }
+    }
+
+    fn fixture_discover_nodes() -> Vec<(String, Role)> {
+        vec![
+            ("/dev/fixture-ir".into(), Role::Ir),
+            ("/dev/fixture-rgb".into(), Role::Rgb),
+        ]
+    }
+
+    fn fixture_list_pairs() -> Vec<CameraPair> {
+        vec![
+            CameraPair {
+                rgb: "/dev/fixed-rgb".into(),
+                ir: "/dev/fixed-ir".into(),
+                id: Some("1111:2222".into()),
+                fixed: true,
+            },
+            CameraPair {
+                rgb: "/dev/usb-rgb".into(),
+                ir: "/dev/usb-ir".into(),
+                id: None,
+                fixed: false,
+            },
+        ]
+    }
+
+    fn fixture_open_rgb(_: &str, _: CameraLease) -> irlume_common::Result<RgbCamera> {
+        Err(irlume_common::Error::Hardware("fixture RGB".into()))
+    }
+
+    fn fixture_open_ir(_: &str, _: CameraLease) -> irlume_common::Result<IrCamera> {
+        Err(irlume_common::Error::Hardware("fixture IR".into()))
+    }
+
+    #[test]
+    fn public_camera_entrypoints_route_through_one_supervisor_backend() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = Arc::new(CameraSupervisor::from_arc(Arc::new(RecordingBackend {
+            calls: Arc::clone(&calls),
+        })));
+        seed_test_endpoints(&supervisor, &["/dev/spy-rgb", "/dev/spy-ir"]);
+        let _guard = install_test_supervisor(Arc::clone(&supervisor));
+        with_camera_supervisor(|routed| assert!(std::ptr::eq(routed, supervisor.as_ref())));
+
+        assert_eq!(crate::scan_nodes().classified[0].0, "/dev/spy-scan");
+        assert_eq!(
+            crate::discover_nodes(),
+            vec![
+                ("/dev/spy-ir".into(), Role::Ir),
+                ("/dev/spy-rgb".into(), Role::Rgb),
+            ]
+        );
+        let pairs = crate::list_pairs();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].rgb, "/dev/spy-rgb");
+        assert_eq!(pairs[0].ir, "/dev/spy-ir");
+        assert_eq!(pairs[0].id.as_deref(), Some("1234:5678"));
+        assert!(pairs[0].fixed);
+        assert!(RgbCamera::open("/dev/spy-rgb")
+            .err()
+            .expect("spy RGB open must refuse")
+            .to_string()
+            .contains("spy RGB refusal"));
+        assert!(IrCamera::open("/dev/spy-ir")
+            .err()
+            .expect("spy IR open must refuse")
+            .to_string()
+            .contains("spy IR refusal"));
+
+        assert_eq!(
+            *calls.lock().expect("recording lock poisoned"),
+            [
+                "scan_nodes",
+                "discover_nodes",
+                "list_pairs",
+                "open_rgb:/dev/spy-rgb",
+                "open_ir:/dev/spy-ir",
+            ]
+        );
+    }
+
+    #[test]
+    fn uvc_adapter_preserves_complete_results_and_order() {
+        let backend = UvcV4l2Backend {
+            scan_nodes: fixture_scan_nodes,
+            discover_nodes: fixture_discover_nodes,
+            list_pairs: fixture_list_pairs,
+            open_rgb: fixture_open_rgb,
+            open_ir: fixture_open_ir,
+        };
+
+        let scan = backend.scan_nodes();
+        assert_eq!(
+            scan.classified,
+            vec![
+                ("/dev/fixture-rgb".into(), Role::Rgb),
+                ("/dev/fixture-ir".into(), Role::Ir),
+            ]
+        );
+        assert_eq!(scan.unreadable.len(), 1);
+        assert_eq!(scan.unreadable[0].path, "/dev/fixture-busy");
+        assert_eq!(scan.unreadable[0].at, FailedAt::Open);
+        assert_eq!(scan.unreadable[0].errno, Some(libc::EBUSY));
+        assert_eq!(scan.unreadable[0].holder.as_deref(), Some("fixture-holder"));
+        assert_eq!(
+            scan.mc_centric,
+            vec![(
+                "/dev/fixture-mc".into(),
+                McCentric {
+                    driver: "fixture-driver".into(),
+                    io_mc: true,
+                    mplane_only: true,
+                },
+            )]
+        );
+        assert_eq!(
+            scan.listing_error.as_deref(),
+            Some("fixture listing warning")
+        );
+        assert_eq!(backend.discover_nodes(), fixture_discover_nodes());
+
+        let pairs = backend.list_pairs();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].rgb, "/dev/fixed-rgb");
+        assert_eq!(pairs[0].ir, "/dev/fixed-ir");
+        assert_eq!(pairs[0].id.as_deref(), Some("1111:2222"));
+        assert!(pairs[0].fixed);
+        assert_eq!(pairs[1].rgb, "/dev/usb-rgb");
+        assert_eq!(pairs[1].ir, "/dev/usb-ir");
+        assert_eq!(pairs[1].id, None);
+        assert!(!pairs[1].fixed);
+    }
+
+    #[test]
+    fn known_invalidated_endpoint_cannot_take_the_discovery_bypass() {
+        let supervisor = Arc::new(CameraSupervisor::new(UvcV4l2Backend::default()));
+        seed_test_endpoints(&supervisor, &["/dev/video-test"]);
+        supervisor.invalidate_inventory().unwrap();
+        let _guard = install_test_supervisor(supervisor);
+        assert!(matches!(
+            crate::lease::permit_for_discovery(
+                "/dev/video-test",
+                std::time::Duration::from_millis(5)
+            ),
+            Err(CameraLeaseError::Stale)
+        ));
+    }
+
+    #[test]
+    fn supervisor_owns_and_validates_one_inventory_instance() {
+        let backend = Arc::new(RecordingBackend {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let supervisor = CameraSupervisor::from_arc(backend);
+        let observation = CameraObservation::new(
+            crate::contracts::BackendKind::UvcV4l2,
+            crate::contracts::PhysicalCameraId::new("/devices/pci/camera", None).unwrap(),
+            crate::contracts::CameraCapabilities::new(
+                vec![crate::contracts::StreamRole::Rgb],
+                Default::default(),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+
+        let added = supervisor.reconcile_inventory(vec![observation]).unwrap();
+        assert_eq!(added.len(), 1);
+        assert!(CameraInstanceId::new(added[0].descriptor().camera_instance_id().as_str()).is_ok());
+        assert!(supervisor
+            .validate_descriptor(added[0].descriptor())
+            .is_ok());
+    }
+
+    #[test]
+    fn supervisor_inventory_poison_fails_closed() {
+        let backend = Arc::new(RecordingBackend {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let supervisor = CameraSupervisor::from_arc(backend);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = supervisor.inventory.lock().unwrap();
+            panic!("poison inventory fixture");
+        }));
+
+        assert_eq!(
+            supervisor.reconcile_inventory(Vec::new()),
+            Err(CameraInventoryError::Poisoned)
+        );
+    }
+
+    #[test]
+    fn default_supervisor_is_process_wide_and_uses_exact_uvc_delegates() {
+        assert!(std::ptr::eq(
+            default_camera_supervisor(),
+            default_camera_supervisor()
+        ));
+        assert!(default_camera_supervisor()
+            .backend
+            .has_exact_production_uvc_delegates());
+    }
+}

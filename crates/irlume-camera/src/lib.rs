@@ -29,10 +29,16 @@
 //! RGB8. FOOTGUN: enumerate V4L2 controls defensively; naive control queries
 //! panic on some drivers. Probe, don't assume.
 
+mod backend;
+/// Versioned, backend-neutral camera data contracts.
+pub mod contracts;
 pub mod emitter_journal;
+mod inventory;
 pub mod ir_dark;
 pub mod ir_emitter;
 mod ir_metadata;
+pub mod lease;
+mod lifecycle;
 mod media_graph;
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code
@@ -326,6 +332,13 @@ impl Drop for BlcRestore<'_> {
         // and must not disturb an authentication's teardown.
         let read = self.cam.dev.control(V4L2_CID_BACKLIGHT_COMPENSATION);
         if let Some(put_back) = blc_restore_decision(self.displaced, read) {
+            if self.cam.lease.require_endpoint(&self.cam.device).is_err() {
+                irlume_common::dlog!(
+                    "{}: skipped backlight-compensation restore after lease invalidation",
+                    self.cam.device
+                );
+                return;
+            }
             let restored = self.cam.dev.set_control(v4l::control::Control {
                 id: V4L2_CID_BACKLIGHT_COMPENSATION,
                 value: v4l::control::Value::Integer(put_back),
@@ -352,6 +365,7 @@ impl Drop for BlcRestore<'_> {
 /// one thing known then is that irlume just changed the control.
 fn apply_blc(cam: &RgbCamera) -> Option<BlcRestore<'_>> {
     let displaced = blc_write_decision(cam.dev.control(V4L2_CID_BACKLIGHT_COMPENSATION))?;
+    cam.lease.require_endpoint(&cam.device).ok()?;
     cam.dev
         .set_control(v4l::control::Control {
             id: V4L2_CID_BACKLIGHT_COMPENSATION,
@@ -362,6 +376,7 @@ fn apply_blc(cam: &RgbCamera) -> Option<BlcRestore<'_>> {
     if blc_restore_decision(displaced, confirm).is_some() {
         Some(BlcRestore { cam, displaced })
     } else {
+        cam.lease.require_endpoint(&cam.device).ok()?;
         let _ = cam.dev.set_control(v4l::control::Control {
             id: V4L2_CID_BACKLIGHT_COMPENSATION,
             value: v4l::control::Value::Integer(displaced),
@@ -398,6 +413,8 @@ const MMAP_BUFFERS: u32 = 4;
 struct SafeStream<'a> {
     inner: Option<v4l::io::mmap::Stream<'a>>,
     device: String,
+    lease: lease::CameraLease,
+    lease_started: bool,
 }
 
 /// How long a single frame dequeue may block.
@@ -552,18 +569,32 @@ impl<'a> SafeStream<'a> {
     /// without erroring blocks the caller indefinitely. That matters most
     /// during emitter setup: a stall there would hang with a control changed and
     /// the restore never reached. Every wait now ends.
-    fn open(device: &str, dev: &'a Device, expect: &v4l::Format) -> irlume_common::Result<Self> {
+    fn open(
+        device: &str,
+        dev: &'a Device,
+        expect: &v4l::Format,
+        lease: lease::CameraLease,
+    ) -> irlume_common::Result<Self> {
+        lease
+            .require_endpoint(device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         let mut inner = v4l::io::mmap::Stream::with_buffers(dev, Type::VideoCapture, MMAP_BUFFERS)
             .map_err(|e| map_io(device, e))?;
         inner.set_timeout(STREAM_DEQUEUE_TIMEOUT);
         // Constructed before the read-back so every error path below releases
         // the queue through the guarded Drop (STREAMOFF + REQBUFS(0)), never
         // through the v4l crate's panicking one.
-        let stream = Self {
+        let mut stream = Self {
             inner: Some(inner),
             device: device.to_string(),
+            lease,
+            lease_started: false,
         };
         let now = Capture::format(dev).map_err(|e| map_io(device, e))?;
+        stream
+            .lease
+            .require_endpoint(device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         if let Some(moved) = format_moved(expect, &now) {
             // Refusing rather than renegotiating, for the same reason the
             // emitter stands down under a foreign consumer (#169): a format
@@ -581,7 +612,31 @@ impl<'a> SafeStream<'a> {
                  this camera{who}; refusing this capture"
             )));
         }
+        stream
+            .lease
+            .start_stream()
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        stream.lease_started = true;
         Ok(stream)
+    }
+
+    fn next(&mut self) -> std::io::Result<(&[u8], &v4l::buffer::Metadata)> {
+        let Self {
+            inner,
+            device,
+            lease,
+            ..
+        } = self;
+        lease
+            .require_endpoint(device)
+            .map_err(std::io::Error::other)?;
+        let frame = v4l::io::traits::CaptureStream::next(
+            inner.as_mut().expect("stream taken only in Drop"),
+        )?;
+        lease
+            .require_endpoint(device)
+            .map_err(std::io::Error::other)?;
+        Ok(frame)
     }
 }
 
@@ -606,6 +661,9 @@ impl Drop for SafeStream<'_> {
         let device = self.device.clone();
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(inner))).is_err() {
             irlume_common::dlog!("{device}: stream teardown failed (STREAMOFF); frames unaffected");
+        }
+        if self.lease_started {
+            self.lease.stop_stream();
         }
     }
 }
@@ -1025,6 +1083,8 @@ pub fn classify_node(device: &str) -> Result<NodeKind, Unreadable> {
         // isolation does not walk /proc.
         holder: None,
     };
+    let _permit = lease::permit_for_discovery(device, std::time::Duration::from_secs(2))
+        .map_err(|error| unreadable(FailedAt::Open, std::io::Error::other(error)))?;
     let dev = Device::with_path(device).map_err(|e| unreadable(FailedAt::Open, e))?;
     let caps = queried_caps(&dev).map_err(|e| unreadable(FailedAt::QueryCaps, e))?;
     if let Some(mc) = mc_centric_verdict(&caps) {
@@ -1283,7 +1343,7 @@ fn file_node(scan: &mut NodeScan, path: String, outcome: Result<NodeKind, Unread
 /// `with_holders` walks /proc for each busy node to name what holds it. That
 /// is worth a report a person reads and not worth it for the camera-picking
 /// callers, which run on the TUI's refresh path.
-fn scan(with_holders: bool) -> NodeScan {
+fn uvc_scan(with_holders: bool) -> NodeScan {
     let mut scan = NodeScan::default();
     let listing = video_node_paths();
     scan.listing_error = listing.error;
@@ -1299,15 +1359,19 @@ fn scan(with_holders: bool) -> NodeScan {
     scan
 }
 
+fn uvc_discover_nodes() -> Vec<(String, Role)> {
+    uvc_scan(false).classified
+}
+
 /// Classify every video node, keeping the failures and naming what holds a
 /// busy one. For reports; use `discover_nodes` to pick a camera.
 pub fn scan_nodes() -> NodeScan {
-    scan(true)
+    backend::scan_nodes()
 }
 
 /// Scan for each readable capture node, returning (path, role).
 pub fn discover_nodes() -> Vec<(String, Role)> {
-    scan(false).classified
+    backend::discover_nodes()
 }
 
 /// Whether a failed privacy-control read means the camera does not HAVE the
@@ -1345,6 +1409,17 @@ fn privacy_state(dev: &Device) -> std::io::Result<Option<bool>> {
 /// `setup_ir_emitter` deliberately does NOT use this: it writes to firmware,
 /// where an unknown shutter state must refuse — see `privacy_permits_setup`.
 pub fn privacy_engaged(device: &str) -> bool {
+    let Ok(_permit) = lease::permit_for_endpoint(
+        device,
+        lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    ) else {
+        return false;
+    };
+    privacy_engaged_with_permit(device)
+}
+
+fn privacy_engaged_with_permit(device: &str) -> bool {
     let Ok(dev) = Device::with_path(device) else {
         return false;
     };
@@ -1390,6 +1465,12 @@ fn backend_from_caps(driver: String, bus: &str) -> (String, bool) {
 /// diagnostic surface has to say "unknown" (#195 review).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn node_backend(device: &str) -> std::io::Result<(String, bool)> {
+    let _permit = lease::permit_for_endpoint(
+        device,
+        lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(std::io::Error::other)?;
     let dev = Device::with_path(device)?;
     let caps = dev.query_caps()?;
     Ok(backend_from_caps(caps.driver, &caps.bus))
@@ -1418,6 +1499,12 @@ fn find_attr_dir(start: &std::path::Path, attr: &str) -> Option<std::path::PathB
     }
 }
 
+pub(crate) fn virtual_camera_allowed(device: &str) -> bool {
+    std::env::var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA")
+        .map(|allow| allow.split(',').any(|allowed| allowed.trim() == device))
+        .unwrap_or(false)
+}
+
 /// Camera device-pinning: verify `/dev/videoN` is a real, physically-attached
 /// camera before any frame is read, defeating unprivileged software frame
 /// injection (v4l2loopback / OBS virtual camera). See docs/THREAT_MODEL.md.
@@ -1444,14 +1531,12 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
     // daemon's environment is root-controlled via its systemd unit, so an
     // unprivileged local user cannot set this for the auth path; every use is
     // logged loudly. See docs/THREAT_MODEL.md (camera injection).
-    if let Ok(allow) = std::env::var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA") {
-        if allow.split(',').any(|d| d.trim() == device) {
-            eprintln!(
-                "irlume: WARNING: {device} accepted without a physical-device pin \
-                 (IRLUME_TEST_ALLOW_VIRTUAL_CAMERA)"
-            );
-            return Ok(());
-        }
+    if virtual_camera_allowed(device) {
+        eprintln!(
+            "irlume: WARNING: {device} accepted without a physical-device pin \
+             (IRLUME_TEST_ALLOW_VIRTUAL_CAMERA)"
+        );
+        return Ok(());
     }
     let node = device.strip_prefix("/dev/").unwrap_or(device);
     let link = format!("/sys/class/video4linux/{node}/device");
@@ -1724,9 +1809,13 @@ pub struct CameraPair {
 /// Every physical camera that exposes both an RGB and an IR node (a Hello pair),
 /// sorted built-in first. Drives the TUI camera picker.
 pub fn list_pairs() -> Vec<CameraPair> {
+    backend::list_pairs()
+}
+
+fn uvc_list_pairs() -> Vec<CameraPair> {
     let mut groups: std::collections::BTreeMap<std::path::PathBuf, (Vec<String>, Vec<String>)> =
         Default::default();
-    for (path, role) in discover_nodes() {
+    for (path, role) in uvc_discover_nodes() {
         if let Some(id) = physical_device_id(&path) {
             let e = groups.entry(id).or_default();
             match role {
@@ -1759,6 +1848,31 @@ pub fn list_pairs() -> Vec<CameraPair> {
 /// that one blurry / over-exposed / transiently corrupt frame is outvoted.
 const RGB_BURST: usize = 5;
 
+struct SessionSlot<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> SessionSlot<'a> {
+    fn acquire(
+        active: &'a std::sync::atomic::AtomicBool,
+        device: &str,
+    ) -> irlume_common::Result<Self> {
+        active
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| Error::Hardware(format!("{device}: camera session already active")))?;
+        Ok(Self(active))
+    }
+}
+
+impl Drop for SessionSlot<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// An opened, format-negotiated RGB camera.
 ///
 /// Exists so a caller that captures REPEATEDLY can pay the open, control write,
@@ -1772,6 +1886,8 @@ const RGB_BURST: usize = 5;
 /// device; one struct owning both would be self-referential. The device is the
 /// long-lived half and the session is the streaming half.
 pub struct RgbCamera {
+    lease: lease::CameraLease,
+    session_active: std::sync::atomic::AtomicBool,
     device: String,
     dev: Device,
     chosen: [u8; 4],
@@ -1789,8 +1905,32 @@ impl RgbCamera {
     /// allocated and the capture LED stays off until a session is opened.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn open(device: &str) -> irlume_common::Result<Self> {
+        if let Some(permit) =
+            lease::active_permit(device).map_err(|error| Error::Hardware(error.to_string()))?
+        {
+            return backend::open_rgb(device, permit);
+        }
+        let operation = match lease::acquire_camera_operation(
+            &[device],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        ) {
+            Ok(operation) => operation,
+            Err(error @ lease::CameraLeaseError::Stale) => {
+                verify_pinned(device)?;
+                return Err(Error::Hardware(error.to_string()));
+            }
+            Err(error) => return Err(Error::Hardware(error.to_string())),
+        };
+        backend::open_rgb(device, operation.into_lease())
+    }
+
+    fn open_uvc(device: &str, lease: lease::CameraLease) -> irlume_common::Result<Self> {
+        lease
+            .require_endpoint(device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         verify_pinned(device)?;
-        if privacy_engaged(device) {
+        if privacy_engaged_with_permit(device) {
             return Err(Error::Hardware(format!(
                 "{device}: hardware privacy switch is ON"
             )));
@@ -1811,7 +1951,12 @@ impl RgbCamera {
                 fourcc_str(&chosen)
             )));
         }
+        lease
+            .require_endpoint(device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         Ok(Self {
+            lease,
+            session_active: std::sync::atomic::AtomicBool::new(false),
             device: device.to_string(),
             dev,
             chosen,
@@ -1838,6 +1983,10 @@ impl RgbCamera {
         &self,
         progress: &Progress,
     ) -> irlume_common::Result<RgbSession<'_>> {
+        self.lease
+            .require_endpoint(&self.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        let session_slot = SessionSlot::acquire(&self.session_active, &self.device)?;
         // Best-effort backlight/low-light correction: tell auto-exposure to
         // expose for the face, not a bright window behind it (NexiGo N930W:
         // verified face mean 49→124; this machine's ASUS: center mean
@@ -1855,13 +2004,22 @@ impl RgbCamera {
         // open that fails below must restore too, and the first version did
         // not (the Codex round's finding 1 on this PR).
         let blc_restore = apply_blc(self);
-        let stream = SafeStream::open(&self.device, &self.dev, &self.negotiated)?;
+        let stream = SafeStream::open(
+            &self.device,
+            &self.dev,
+            &self.negotiated,
+            self.lease.clone(),
+        )?;
+        self.lease
+            .require_endpoint(&self.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         Ok(RgbSession {
             cam: self,
             stream: Some(stream),
             warmed: false,
             progress: progress.clone(),
             _blc_restore: blc_restore,
+            _session_slot: session_slot,
         })
     }
 
@@ -1987,7 +2145,13 @@ fn try_format(dev: &Device, fmt: &Format) -> std::io::Result<Format> {
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn negotiated_stream(device: &str, role: Role) -> irlume_common::Result<StreamSpec> {
     verify_pinned(device)?;
-    if privacy_engaged(device) {
+    let _permit = lease::permit_for_endpoint(
+        device,
+        lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|error| Error::Hardware(error.to_string()))?;
+    if privacy_engaged_with_permit(device) {
         return Err(Error::Hardware(format!(
             "{device}: hardware privacy switch is ON"
         )));
@@ -2047,6 +2211,8 @@ pub struct RgbSession<'a> {
     /// drop order tears the stream down (STREAMOFF) before the control is
     /// put back.
     _blc_restore: Option<BlcRestore<'a>>,
+    /// Reset last, after STREAMOFF and control restoration have completed.
+    _session_slot: SessionSlot<'a>,
 }
 
 impl<'a> RgbSession<'a> {
@@ -2075,12 +2241,21 @@ impl<'a> RgbSession<'a> {
     /// one-shot path.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn recover(&mut self) -> irlume_common::Result<()> {
+        self.cam
+            .lease
+            .require_endpoint(&self.cam.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         self.stream = None; // drop first: STREAMOFF + buffer release
         self.stream = Some(SafeStream::open(
             &self.cam.device,
             &self.cam.dev,
             &self.cam.negotiated,
+            self.cam.lease.clone(),
         )?);
+        self.cam
+            .lease
+            .require_endpoint(&self.cam.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         // The fresh stream's auto-exposure starts unsettled, like any new
         // session's.
         self.warmed = false;
@@ -2091,6 +2266,10 @@ impl<'a> RgbSession<'a> {
     /// second capture on the same stream is already settled, and re-running the
     /// warm-up would throw away good frames to no purpose.
     fn warm_up(&mut self) -> irlume_common::Result<()> {
+        self.cam
+            .lease
+            .require_endpoint(&self.cam.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         if self.warmed {
             return Ok(());
         }
@@ -2098,6 +2277,10 @@ impl<'a> RgbSession<'a> {
         let progress = self.progress.clone();
         warm_up_stream(&device, self.stream()?, &progress)?;
         for _ in 0..AE_WARMUP {
+            self.cam
+                .lease
+                .require_endpoint(&device)
+                .map_err(|error| Error::Hardware(error.to_string()))?;
             self.stream()?.next().map_err(|e| map_io(&device, e))?; // discard while AE settles
         }
         self.warmed = true;
@@ -2107,18 +2290,30 @@ impl<'a> RgbSession<'a> {
     /// Capture `n` (≥1) frames. All share the same dimensions.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn burst(&mut self, n: usize) -> irlume_common::Result<Vec<Frame>> {
+        self.cam
+            .lease
+            .require_endpoint(&self.cam.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         self.warm_up()?;
         let (w, h) = (self.cam.width, self.cam.height);
         let device = self.cam.device.clone();
         let chosen = self.cam.chosen;
         let mut frames = Vec::with_capacity(n.max(1));
         for _ in 0..n.max(1) {
+            self.cam
+                .lease
+                .require_endpoint(&device)
+                .map_err(|error| Error::Hardware(error.to_string()))?;
             let (buf, _meta) = self.stream()?.next().map_err(|e| map_io(&device, e))?;
             let taken = std::time::Instant::now();
             let data = match &chosen {
                 b"NV12" => nv12_to_rgb(buf, w, h),
                 _ => yuyv_to_rgb(buf, w, h),
             };
+            self.cam
+                .lease
+                .require_endpoint(&device)
+                .map_err(|error| Error::Hardware(error.to_string()))?;
             frames.push(Frame {
                 width: w,
                 height: h,
@@ -2265,6 +2460,13 @@ fn ipu_generation_for_id(device_id: &str) -> Option<&'static str> {
 
 /// A node's advertised pixel formats (fourcc), for negotiation and `doctor`.
 pub fn rgb_node_formats(device: &str) -> Vec<[u8; 4]> {
+    let Ok(_permit) = lease::permit_for_endpoint(
+        device,
+        lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    ) else {
+        return Vec::new();
+    };
     let Ok(dev) = Device::with_path(device) else {
         return Vec::new();
     };
@@ -2644,6 +2846,8 @@ pub fn capture_ir_with_stats_and_progress(
 /// An opened, format-negotiated IR camera. The companion to [`RgbCamera`]; see
 /// there for why a device and a session are separate types.
 pub struct IrCamera {
+    lease: lease::CameraLease,
+    session_active: std::sync::atomic::AtomicBool,
     device: String,
     dev: Device,
     pix: IrPixel,
@@ -2666,8 +2870,32 @@ pub struct IrCamera {
 impl IrCamera {
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn open(device: &str) -> irlume_common::Result<Self> {
+        if let Some(permit) =
+            lease::active_permit(device).map_err(|error| Error::Hardware(error.to_string()))?
+        {
+            return backend::open_ir(device, permit);
+        }
+        let operation = match lease::acquire_camera_operation(
+            &[device],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        ) {
+            Ok(operation) => operation,
+            Err(error @ lease::CameraLeaseError::Stale) => {
+                verify_pinned(device)?;
+                return Err(Error::Hardware(error.to_string()));
+            }
+            Err(error) => return Err(Error::Hardware(error.to_string())),
+        };
+        backend::open_ir(device, operation.into_lease())
+    }
+
+    fn open_uvc(device: &str, lease: lease::CameraLease) -> irlume_common::Result<Self> {
+        lease
+            .require_endpoint(device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         verify_pinned(device)?;
-        if privacy_engaged(device) {
+        if privacy_engaged_with_permit(device) {
             return Err(Error::Hardware(format!(
                 "{device}: hardware privacy switch is ON"
             )));
@@ -2675,7 +2903,12 @@ impl IrCamera {
         let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
         let (fmt, pix) = negotiate_ir_format(device, &dev)?;
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
+        lease
+            .require_endpoint(device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         Ok(Self {
+            lease,
+            session_active: std::sync::atomic::AtomicBool::new(false),
             device: device.to_string(),
             dev,
             pix,
@@ -2725,13 +2958,22 @@ impl IrCamera {
         &self,
         progress: &Progress,
     ) -> irlume_common::Result<IrSession<'_>> {
+        self.lease
+            .require_endpoint(&self.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        let session_slot = SessionSlot::acquire(&self.session_active, &self.device)?;
         // DECLARED before the stream so it drops AFTER it. Locals drop in
         // reverse declaration order, and `warm_up_stream` below can fail: with
         // the guard declared second, that `?` dropped it first and sent the
         // restore while the stream was still live, the very mid-stream write
         // this change removes. Assigned further down, once the stream exists.
         let mode;
-        let mut stream = SafeStream::open(&self.device, &self.dev, &self.negotiated)?;
+        let mut stream = SafeStream::open(
+            &self.device,
+            &self.dev,
+            &self.negotiated,
+            self.lease.clone(),
+        )?;
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
         // 25s when video went first). `SafeStream::open` only allocates
@@ -2759,7 +3001,15 @@ impl IrCamera {
         // default in the ordinary case, another program's value where one was
         // deliberately set — which is the documented sequence's last step and
         // the half irlume never did.
-        mode = ir_emitter::enable(self.dev.handle(), &self.card, &self.device);
+        self.lease
+            .require_endpoint(&self.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        mode = ir_emitter::enable_with_lease(
+            self.dev.handle(),
+            &self.card,
+            &self.device,
+            self.lease.clone(),
+        );
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
         warm_up_stream(&self.device, &mut stream, progress)?;
@@ -2770,6 +3020,7 @@ impl IrCamera {
             lit: mode.lit(),
             _mode: mode,
             meta,
+            _session_slot: session_slot,
         })
     }
 }
@@ -2797,6 +3048,8 @@ pub struct IrSession<'a> {
     /// Never read. It is held for its `Drop`, which is the whole point, and the
     /// dead-code lint cannot see that.
     _mode: ir_emitter::StreamMode,
+    /// Reset last, after image/metadata STREAMOFF and emitter restoration.
+    _session_slot: SessionSlot<'a>,
 }
 
 impl IrSession<'_> {
@@ -2809,6 +3062,10 @@ impl IrSession<'_> {
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn capture_with_stats(&mut self) -> irlume_common::Result<(Frame, IrCaptureStats)> {
         let device = self.cam.device.as_str();
+        let lease = self.cam.lease.clone();
+        lease
+            .require_endpoint(device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         let (w, h) = (self.cam.width, self.cam.height);
         let card = &self.cam.card;
         let lit = self.lit;
@@ -2855,7 +3112,13 @@ impl IrSession<'_> {
         // camera answers that directly now, per frame, through the illumination
         // metadata added in #167, so the guess is not needed to know the answer.
         for _ in 0..IR_BURST {
+            lease
+                .require_endpoint(device)
+                .map_err(|error| Error::Hardware(error.to_string()))?;
             let (buf, bmeta) = stream.next().map_err(|e| map_io(device, e))?;
+            lease
+                .require_endpoint(device)
+                .map_err(|error| Error::Hardware(error.to_string()))?;
             stamps.push(bmeta.timestamp.sec * 1_000_000 + bmeta.timestamp.usec);
             taken.push(std::time::Instant::now());
             // Drain every iteration, not once at the end. The metadata ring is
@@ -3164,6 +3427,10 @@ impl IrSession<'_> {
     /// grace window returned dark IR frames.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn recover(&mut self) -> irlume_common::Result<()> {
+        self.cam
+            .lease
+            .require_endpoint(&self.cam.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         self.stream = None; // drop first: STREAMOFF + buffer release
         self.meta = None; // drop the metadata queue
                           // A restore failure PROPAGATES, mirroring the frozen-stream restart:
@@ -3176,15 +3443,33 @@ impl IrSession<'_> {
             ))
         })?;
         self._mode = ir_emitter::StreamMode::inert();
-        let stream = SafeStream::open(&self.cam.device, &self.cam.dev, &self.cam.negotiated)?;
+        let stream = SafeStream::open(
+            &self.cam.device,
+            &self.cam.dev,
+            &self.cam.negotiated,
+            self.cam.lease.clone(),
+        )?;
         let meta = ir_metadata::IlluminationLog::open(&self.cam.device);
-        let mode = ir_emitter::enable(self.cam.dev.handle(), &self.cam.card, &self.cam.device);
+        self.cam
+            .lease
+            .require_endpoint(&self.cam.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        let mode = ir_emitter::enable_with_lease(
+            self.cam.dev.handle(),
+            &self.cam.card,
+            &self.cam.device,
+            self.cam.lease.clone(),
+        );
         let lit = mode.lit();
         self.stream = Some(stream);
         self.meta = meta;
         self._mode = mode;
         self.dec = IrDecoder::new(self.cam.pix, self.cam.quantization);
         self.lit = lit;
+        self.cam
+            .lease
+            .require_endpoint(&self.cam.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
         Ok(())
     }
 }
@@ -3196,8 +3481,10 @@ impl IrSession<'_> {
 /// example and the capture path share one implementation.
 pub mod ir_probe {
     use super::negotiate_ir_format;
-    use super::{ir_emitter, map_io, privacy_engaged, verify_pinned, Error, Frame, Spectrum};
-    use super::{CaptureStream, Device};
+    use super::Device;
+    use super::{
+        ir_emitter, map_io, privacy_engaged_with_permit, verify_pinned, Error, Frame, Spectrum,
+    };
 
     /// Mean brightness of an 8-bit greyscale buffer.
     pub fn mean(data: &[u8]) -> f64 {
@@ -3320,7 +3607,13 @@ pub mod ir_probe {
         n: usize,
     ) -> irlume_common::Result<Vec<(Frame, f64)>> {
         verify_pinned(device)?;
-        if privacy_engaged(device) {
+        let permit = super::lease::permit_for_endpoint(
+            device,
+            super::lease::CameraOperationKind::Diagnostics,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+        if privacy_engaged_with_permit(device) {
             return Err(Error::Hardware(format!(
                 "{device}: hardware privacy switch is ON"
             )));
@@ -3344,8 +3637,8 @@ pub mod ir_probe {
         // buffers; STREAMON happens on the first dequeue, so the set still
         // lands before streaming starts.
         let mode;
-        let mut stream = super::SafeStream::open(device, &dev, &fmt)?;
-        mode = ir_emitter::enable(dev.handle(), &card, device);
+        let mut stream = super::SafeStream::open(device, &dev, &fmt, permit.clone())?;
+        mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
         // Bound, never read: held for its `Drop`, which restores the control.
         let _ = &mode;
         let mut out = Vec::with_capacity(n);
@@ -3422,7 +3715,13 @@ pub fn capture_ir_streaming<B>(
     mut on_frame: impl FnMut(IrStreamFrame) -> std::ops::ControlFlow<B>,
 ) -> irlume_common::Result<Option<B>> {
     verify_pinned(device)?;
-    if privacy_engaged(device) {
+    let permit = lease::permit_for_endpoint(
+        device,
+        lease::CameraOperationKind::Preview,
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|error| Error::Hardware(error.to_string()))?;
+    if privacy_engaged_with_permit(device) {
         return Err(Error::Hardware(format!(
             "{device}: hardware privacy switch is ON"
         )));
@@ -3446,8 +3745,8 @@ pub fn capture_ir_streaming<B>(
     // buffers; STREAMON happens on the first dequeue, so the set still
     // lands before streaming starts.
     let mut mode;
-    let mut stream = SafeStream::open(device, &dev, &fmt)?;
-    mode = ir_emitter::enable(dev.handle(), &card, device);
+    let mut stream = SafeStream::open(device, &dev, &fmt, permit.clone())?;
+    mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
     // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
     // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
     // constant mid-grey for the rest of the window); real sensor noise never
@@ -3517,8 +3816,8 @@ pub fn capture_ir_streaming<B>(
                          a frozen stream: {e}"
                     ))
                 })?;
-                stream = SafeStream::open(device, &dev, &fmt)?;
-                mode = ir_emitter::enable(dev.handle(), &card, device);
+                stream = SafeStream::open(device, &dev, &fmt, permit.clone())?;
+                mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
             }
             continue;
         }
@@ -3565,7 +3864,13 @@ pub fn capture_ir_sequence(
     burst: usize,
 ) -> irlume_common::Result<Vec<Frame>> {
     verify_pinned(device)?;
-    if privacy_engaged(device) {
+    let permit = lease::permit_for_endpoint(
+        device,
+        lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|error| Error::Hardware(error.to_string()))?;
+    if privacy_engaged_with_permit(device) {
         return Err(Error::Hardware(format!(
             "{device}: hardware privacy switch is ON"
         )));
@@ -3590,8 +3895,8 @@ pub fn capture_ir_sequence(
     // buffers; STREAMON happens on the first dequeue, so the set still
     // lands before streaming starts.
     let mut mode;
-    let mut stream = Some(SafeStream::open(device, &dev, &fmt)?);
-    mode = ir_emitter::enable(dev.handle(), &card, device);
+    let mut stream = Some(SafeStream::open(device, &dev, &fmt, permit.clone())?);
+    mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
     // Set once per stream, before it starts, and not per frame (the
     // frozen-stream restart below re-applies on its new stream). This path also carried
     // an every-eighth-frame re-fire; it went for the same reason, and with the
@@ -3661,8 +3966,8 @@ pub fn capture_ir_sequence(
                          a frozen stream: {e}"
                     ))
                 })?;
-                stream = Some(SafeStream::open(device, &dev, &fmt)?);
-                mode = ir_emitter::enable(dev.handle(), &card, device);
+                stream = Some(SafeStream::open(device, &dev, &fmt, permit.clone())?);
+                mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
             }
             continue;
         }
@@ -4057,8 +4362,25 @@ fn held_concurrent_arm<'d>(
     ir_dev: &'d str,
 ) -> impl FnOnce(usize, &Progress, &mut PairSample) -> irlume_common::Result<()> + 'd {
     move |rounds, progress, into| {
-        let held = RgbCamera::open(rgb_dev).and_then(|r| IrCamera::open(ir_dev).map(|i| (r, i)));
-        let (rgb_cam, ir_cam) = match held {
+        let operation = lease::acquire_camera_operation(
+            &[rgb_dev, ir_dev],
+            lease::CameraOperationKind::Diagnostics,
+            std::time::Duration::from_secs(2),
+        );
+        let held = operation.and_then(|operation| {
+            operation
+                .open_rgb(rgb_dev)
+                .map_err(|error| lease::CameraLeaseError::InvalidEndpoint(error.to_string()))
+                .and_then(|rgb| {
+                    operation
+                        .open_ir(ir_dev)
+                        .map(|ir| (operation, rgb, ir))
+                        .map_err(|error| {
+                            lease::CameraLeaseError::InvalidEndpoint(error.to_string())
+                        })
+                })
+        });
+        let (_operation, rgb_cam, ir_cam) = match held {
             Ok(pair) => pair,
             Err(e) => {
                 irlume_common::dlog!(
@@ -4494,6 +4816,12 @@ pub fn store_sequential_if_still_concurrent(
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     verify_pinned(device)?;
+    let permit = lease::permit_for_endpoint(
+        device,
+        lease::CameraOperationKind::Setup,
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|error| Error::Hardware(error.to_string()))?;
     // Open only long enough to read the standard V4L2 privacy control, and
     // refuse before format negotiation, streaming, or any extension-unit
     // write. An engaged shutter blanks the sensor to a flat frame (ASUS
@@ -4520,7 +4848,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = SafeStream::open(device, &dev, &fmt)?;
+    let mut stream = SafeStream::open(device, &dev, &fmt, permit.clone())?;
     let fd = dev.handle().fd();
     for _ in 0..4 {
         let _ = stream.next(); // let the sensor settle before baseline
@@ -4581,21 +4909,28 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     // SET_CUR, and the operator can engage the E-shutter anywhere in that
     // window (#193 review). The residual race is one syscall wide: V4L2 offers
     // no transaction spanning the privacy read and the extension-unit write.
-    let mut privacy_allows_write = || privacy_permits_setup(privacy_state(&dev));
-    match ir_emitter::discover(fd, &id, &mut measure, &mut privacy_allows_write) {
-        Ok(found) => {
-            let encoded = found.control().encode();
-            // Confirm, publish, release, in that order. The sequence lives in
-            // `finish` rather than here so it is reachable by a test.
-            found.finish(&id).map_err(Error::Hardware)?;
-            Ok(format!(
-                "IR emitter enabled: {encoded} on the camera's Microsoft camera-control unit, \
+    let mut privacy_allows_write = || {
+        permit
+            .require_endpoint(device)
+            .map_err(|error| error.to_string())?;
+        privacy_permits_setup(privacy_state(&dev))
+    };
+    permit.run_active(|| {
+        match ir_emitter::discover(fd, &id, &mut measure, &mut privacy_allows_write) {
+            Ok(found) => {
+                let encoded = found.control().encode();
+                // Confirm, publish, release, in that order. The sequence lives in
+                // `finish` rather than here so it is reachable by a test.
+                found.finish(&id).map_err(Error::Hardware)?;
+                Ok(format!(
+                    "IR emitter enabled: {encoded} on the camera's Microsoft camera-control unit, \
                  using a value built from what the camera reports about that control \
                  (saved; future captures rebuild it the same way)"
-            ))
+                ))
+            }
+            Err(e) => Err(Error::Hardware(e.to_string())),
         }
-        Err(e) => Err(Error::Hardware(e.to_string())),
-    }
+    })
 }
 
 /// What the IR camera's extension units are, for `ir-setup --dry-run`.
@@ -4771,6 +5106,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_slot_is_exclusive_and_reopens_after_drop() {
+        let active = std::sync::atomic::AtomicBool::new(false);
+        let first = SessionSlot::acquire(&active, "/dev/test-camera").unwrap();
+        assert!(SessionSlot::acquire(&active, "/dev/test-camera").is_err());
+        drop(first);
+        assert!(SessionSlot::acquire(&active, "/dev/test-camera").is_ok());
+
+        let active = std::sync::atomic::AtomicBool::new(false);
+        let _ = std::panic::catch_unwind(|| {
+            let _slot = SessionSlot::acquire(&active, "/dev/test-camera").unwrap();
+            panic!("synthetic session panic");
+        });
+        assert!(!active.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[test]
     fn a_rate_without_the_timeperframe_capability_is_unknown() {
