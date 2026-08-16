@@ -2389,7 +2389,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: user.as_deref(),
             enrollment: Reads,
         },
-        Ping | Health | Identify | ListCameras => RequestPosture {
+        Ping | Health | Identify | ListCameras | CameraDiagnostics => RequestPosture {
             privilege: AnyPeer,
             user: None,
             enrollment: Reads,
@@ -3730,6 +3730,14 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             match irlume_core::template_key::forget_recovery(&user) {
                 Ok(()) => Response::Ok(format!("recovery passphrase erased for '{user}'")),
                 Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Request::CameraDiagnostics => {
+            let rgb = engine.rgb_device();
+            let ir = engine.ir_available().then(|| engine.ir_device());
+            match irlume_auth::camera_rate_diagnostics(rgb, ir) {
+                Ok(report) => Response::CameraDiagnostics(Box::new(report)),
+                Err(error) => Response::Error(error.to_string()),
             }
         }
         Request::ListCameras => Response::Cameras(
@@ -5379,6 +5387,7 @@ mod tests {
         ListCameras => Request::ListCameras,
         Ping => Request::Ping,
         Health => Request::Health,
+        CameraDiagnostics => Request::CameraDiagnostics,
         // The user-bearing form, so the traversal walk covers it.
         PositionSample => Request::PositionSample { user: Some(u()) },
         SealPassword => Request::SealPassword {

@@ -42,6 +42,7 @@ mod ir_metadata;
 pub mod lease;
 mod lifecycle;
 mod media_graph;
+mod rate_gate;
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code
 // path grows a reader of these files.
@@ -184,6 +185,10 @@ impl Frame {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one immutable runtime-evidence bundle; the args are never confused"
+)]
 fn checked_single_evidence(
     binding: frame_provenance::FrameBinding,
     format: frame_provenance::ValidatedFormatIdentity,
@@ -192,6 +197,7 @@ fn checked_single_evidence(
     timestamp: frame_provenance::TimestampObservation,
     taken: std::time::Instant,
     illumination: contracts::IlluminationProvenance,
+    rate_evidence: frame_provenance::DeliveredRateEvidence,
 ) -> irlume_common::Result<frame_provenance::SingleFrameProvenance> {
     frame_provenance::SingleFrameProvenance::begin(
         binding,
@@ -200,11 +206,16 @@ fn checked_single_evidence(
         sequence,
         timestamp,
         CaptureWindow::at(taken),
+        rate_evidence,
     )
     .and_then(|pending| pending.finalize_illumination(illumination))
     .map_err(|error| Error::Hardware(format!("invalid runtime frame provenance: {error}")))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one immutable runtime-evidence bundle; the args are never confused"
+)]
 fn checked_single_provenance(
     binding: frame_provenance::FrameBinding,
     format: frame_provenance::ValidatedFormatIdentity,
@@ -213,6 +224,7 @@ fn checked_single_provenance(
     timestamp: frame_provenance::TimestampObservation,
     taken: std::time::Instant,
     illumination: contracts::IlluminationProvenance,
+    rate_evidence: frame_provenance::DeliveredRateEvidence,
 ) -> irlume_common::Result<frame_provenance::RuntimeFrameProvenance> {
     checked_single_evidence(
         binding,
@@ -222,6 +234,7 @@ fn checked_single_provenance(
         timestamp,
         taken,
         illumination,
+        rate_evidence,
     )
     .map(frame_provenance::RuntimeFrameProvenance::Single)
 }
@@ -1252,10 +1265,98 @@ impl<S: CameraState> ValidatedStream for CameraStateStream<'_, S> {
 }
 
 /// Continuity state whose lifetime is independent of its replaceable mmap stream.
+/// Typed delivery failure from [`TrackedStream::next`].
+///
+/// Splits the existing dequeue/continuity I/O errors from the new below-floor
+/// refusal, so callers can map the latter to
+/// [`irlume_common::Error::DeliveredRate`] without parsing prose.
+#[derive(Debug)]
+enum DeliveryError {
+    /// Existing dequeue/validation/continuity error (retains current behavior).
+    Io(std::io::Error),
+    /// The measured delivered rate is below the exact floor; carries the
+    /// machine-readable evidence so callers act on the rate, not a message.
+    BelowFloor(Box<irlume_common::CameraStreamRateEvidence>),
+}
+
+impl std::fmt::Display for DeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(io) => io.fmt(f),
+            Self::BelowFloor(_) => f.write_str("delivered rate below floor"),
+        }
+    }
+}
+
+/// Map a [`DeliveryError`] to the crate-wide error, preserving the existing
+/// `map_io` behavior for I/O and emitting the typed rate error otherwise.
+fn map_delivery(device: &str, error: DeliveryError) -> Error {
+    match error {
+        DeliveryError::Io(io) => map_io(device, io),
+        DeliveryError::BelowFloor(evidence) => Error::DeliveredRate(evidence),
+    }
+}
+
+/// Convert camera-crate delivered-rate evidence to the common serializable DTO.
+fn rate_evidence_to_common(
+    evidence: &frame_provenance::DeliveredRateEvidence,
+) -> irlume_common::CameraStreamRateEvidence {
+    use frame_provenance::{TimestampClock, TimestampSource};
+    let (requested_num, requested_den) = evidence.requested();
+    let (accepted_num, accepted_den) = evidence.accepted();
+    let (floor_num, floor_den) = evidence.floor();
+    let (delivered_num, delivered_den) = evidence.delivered();
+    irlume_common::CameraStreamRateEvidence {
+        role: match evidence.role() {
+            contracts::StreamRole::Rgb => "rgb".to_string(),
+            contracts::StreamRole::Ir => "ir".to_string(),
+        },
+        requested_num,
+        requested_den,
+        accepted_num,
+        accepted_den,
+        floor_num,
+        floor_den,
+        tolerance_percent: evidence.tolerance_percent(),
+        window_count: evidence.window_count(),
+        window_span_us: evidence.window_span_us(),
+        delivered_num,
+        delivered_den,
+        meets_floor: evidence.meets_floor(),
+        sequence_gap: evidence.sequence_gap(),
+        cumulative_drops: evidence.cumulative_drops(),
+        clock: match evidence.clock() {
+            TimestampClock::Monotonic => "monotonic".to_string(),
+            TimestampClock::Copy => "copy".to_string(),
+            TimestampClock::Unknown => "unknown".to_string(),
+        },
+        source: match evidence.source() {
+            TimestampSource::EndOfFrame => "end_of_frame".to_string(),
+            TimestampSource::StartOfExposure => "start_of_exposure".to_string(),
+        },
+        latest_timestamp_us: evidence.latest_timestamp_us(),
+        stream_epoch: evidence.stream_epoch(),
+    }
+}
+
+/// Maximum additional dequeue attempts for the bounded rate-evidence fill in
+/// [`TrackedStream::next`]. Nominal is 31 successful dequeues (one seed plus
+/// 30 deltas, ~2 s at 15 fps); 64 gives >2x headroom for timeouts and corrupt frames.
+const MAX_RATE_FILL_ATTEMPTS: usize = 64;
+
+/// Frames discarded before the rate window is measured. The first window after
+/// STREAMON spans the driver's initial buffer delivery, whose sequence gaps
+/// make a healthy 15 fps stream read ~7 fps (measured: 32 gaps on the ASUS IR).
+/// Flushing one window's worth of frames before resetting and measuring keeps
+/// the gate from rejecting a settled stream for its startup transient.
+const RATE_STARTUP_FLUSH: usize = 30;
+
 struct TrackedStream<S> {
     stream: Option<S>,
     sequence: frame_provenance::SequenceTracker,
     timestamp: frame_provenance::TimestampTracker,
+    rate_window: rate_gate::RateWindow,
+    rate_config: rate_gate::StreamRateConfig,
     observations: u64,
     discarded_observations: u64,
     sequence_span_sum: u64,
@@ -1263,11 +1364,13 @@ struct TrackedStream<S> {
 }
 
 impl<S> TrackedStream<S> {
-    fn new(stream: S) -> Self {
+    fn new(stream: S, rate_config: rate_gate::StreamRateConfig) -> Self {
         Self {
             stream: Some(stream),
             sequence: frame_provenance::SequenceTracker::new(),
             timestamp: frame_provenance::TimestampTracker::new(),
+            rate_window: rate_gate::RateWindow::with_capacity(rate_config.policy().window()),
+            rate_config,
             observations: 0,
             discarded_observations: 0,
             sequence_span_sum: 0,
@@ -1300,6 +1403,16 @@ impl<S> TrackedStream<S> {
         }
         self.stream = Some(stream);
         self.recovery_epoch_pending = true;
+        // Drop the pre-recovery rate window immediately. The recovered stream
+        // has its own STREAMON transient and its timestamps may move to a new
+        // domain (the recovery epoch resets both trackers), so a stale "ready"
+        // window would make `fill_rate_evidence` early-return and skip the
+        // re-establishment — leaving the recovered stream to re-fill serially
+        // on its first `next()` and starve its twin (measured: RGB 5.26 fps,
+        // 236 drops after an IR-only recovery). Clearing it here forces the
+        // fill to re-run, which is where `begin_recovered_continuity_epoch`
+        // then re-seeds the baseline in the new epoch.
+        self.rate_window.reset();
         Ok(())
     }
 }
@@ -1411,6 +1524,7 @@ fn begin_recovered_continuity_epoch(
     pending: &mut bool,
     sequence: &mut frame_provenance::SequenceTracker,
     timestamp: &mut frame_provenance::TimestampTracker,
+    rate_window: &mut rate_gate::RateWindow,
 ) -> std::io::Result<()> {
     if !*pending {
         return Ok(());
@@ -1427,6 +1541,7 @@ fn begin_recovered_continuity_epoch(
     }
     *sequence = next_sequence;
     *timestamp = next_timestamp;
+    rate_window.reset();
     *pending = false;
     Ok(())
 }
@@ -1437,21 +1552,28 @@ impl<S: ValidatedStream> TrackedStream<S> {
             stream,
             sequence,
             timestamp,
+            rate_window,
             observations,
             discarded_observations,
             sequence_span_sum,
             recovery_epoch_pending,
+            ..
         } = self;
         let dequeued = stream
             .as_mut()
             .ok_or_else(|| std::io::Error::other("capture stream missing after recovery"))?
             .next_validated();
-        let facts = match dequeued {
+        let (facts, delivered) = match dequeued {
             Ok((_, facts)) => {
-                begin_recovered_continuity_epoch(recovery_epoch_pending, sequence, timestamp)?;
-                facts
+                begin_recovered_continuity_epoch(
+                    recovery_epoch_pending,
+                    sequence,
+                    timestamp,
+                    rate_window,
+                )?;
+                (facts, true)
             }
-            Err(ValidatedDequeueError::Corrupt(facts)) => facts,
+            Err(ValidatedDequeueError::Corrupt(facts)) => (facts, false),
             Err(error) => {
                 if error.invalidates_timestamp_epoch() {
                     timestamp.fail_current_epoch();
@@ -1468,21 +1590,60 @@ impl<S: ValidatedStream> TrackedStream<S> {
             &facts,
             true,
         )?;
+        if delivered {
+            rate_window
+                .observe_success(facts.timestamp_micros())
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    /// Boundedly establish the 30-delta window before the next delivered frame.
+    fn fill_rate_evidence(&mut self) -> std::io::Result<()> {
+        if self.rate_window.ready() {
+            return Ok(());
+        }
+        // First fill: flush the STREAMON transient before measuring. The first
+        // window spans the driver's initial buffer delivery, whose sequence
+        // gaps would poison a settled stream's measurement. Reset before
+        // measuring so the startup deltas do not count against the floor.
+        for _ in 0..RATE_STARTUP_FLUSH {
+            self.next_discarded()?;
+        }
+        self.rate_window.reset();
+        let mut attempts = 0;
+        while !self.rate_window.ready() && attempts < MAX_RATE_FILL_ATTEMPTS {
+            self.next_discarded()?;
+            attempts += 1;
+        }
+        if !self.rate_window.ready() {
+            return Err(std::io::Error::other(
+                "could not establish delivered-rate evidence within the bounded fill",
+            ));
+        }
         Ok(())
     }
 
     fn next(
         &mut self,
-    ) -> std::io::Result<(
-        &[u8],
-        frame_provenance::DequeuedBufferFacts,
-        frame_provenance::SequenceObservation,
-        frame_provenance::TimestampObservation,
-    )> {
+    ) -> Result<
+        (
+            &[u8],
+            frame_provenance::DequeuedBufferFacts,
+            frame_provenance::SequenceObservation,
+            frame_provenance::TimestampObservation,
+            frame_provenance::DeliveredRateEvidence,
+        ),
+        DeliveryError,
+    > {
+        self.fill_rate_evidence().map_err(DeliveryError::Io)?;
+
         let Self {
             stream,
             sequence,
             timestamp,
+            rate_window,
+            rate_config,
             observations,
             discarded_observations,
             sequence_span_sum,
@@ -1490,7 +1651,8 @@ impl<S: ValidatedStream> TrackedStream<S> {
         } = self;
         let dequeued = stream
             .as_mut()
-            .ok_or_else(|| std::io::Error::other("capture stream missing after recovery"))?
+            .ok_or_else(|| std::io::Error::other("capture stream missing after recovery"))
+            .map_err(DeliveryError::Io)?
             .next_validated();
         let (payload, facts) = match dequeued {
             Ok(frame) => frame,
@@ -1503,17 +1665,21 @@ impl<S: ValidatedStream> TrackedStream<S> {
                     sequence_span_sum,
                     &facts,
                     true,
-                )?;
-                return Err(ValidatedDequeueError::Corrupt(facts).into_io());
+                )
+                .map_err(DeliveryError::Io)?;
+                return Err(DeliveryError::Io(
+                    ValidatedDequeueError::Corrupt(facts).into_io(),
+                ));
             }
             Err(error) => {
                 if error.invalidates_timestamp_epoch() {
                     timestamp.fail_current_epoch();
                 }
-                return Err(error.into_io());
+                return Err(DeliveryError::Io(error.into_io()));
             }
         };
-        begin_recovered_continuity_epoch(recovery_epoch_pending, sequence, timestamp)?;
+        begin_recovered_continuity_epoch(recovery_epoch_pending, sequence, timestamp, rate_window)
+            .map_err(DeliveryError::Io)?;
         let (sequence_observation, timestamp_observation) = observe_continuity_facts(
             sequence,
             timestamp,
@@ -1522,9 +1688,134 @@ impl<S: ValidatedStream> TrackedStream<S> {
             sequence_span_sum,
             &facts,
             false,
-        )?;
-        Ok((payload, facts, sequence_observation, timestamp_observation))
+        )
+        .map_err(DeliveryError::Io)?;
+
+        rate_window
+            .observe_success(facts.timestamp_micros())
+            .map_err(|error| DeliveryError::Io(std::io::Error::other(error)))?;
+
+        let policy = rate_config.policy();
+        let meets_floor = rate_window.meets_floor(
+            policy.floor_num(),
+            policy.floor_den(),
+            policy.tolerance_percent(),
+        );
+        let (requested_num, requested_den) = rate_config.requested().parts();
+        let (accepted_num, accepted_den) = rate_config.accepted().parts();
+        let rate_evidence = frame_provenance::DeliveredRateEvidence::new(
+            rate_config.role(),
+            (requested_num, requested_den),
+            (accepted_num, accepted_den),
+            (policy.floor_num(), policy.floor_den()),
+            policy.tolerance_percent(),
+            rate_window.count() as u32,
+            rate_window.span_us(),
+            rate_window.delivered_rate(),
+            meets_floor,
+            &sequence_observation,
+            &timestamp_observation,
+        );
+        if !meets_floor {
+            return Err(DeliveryError::BelowFloor(Box::new(
+                rate_evidence_to_common(&rate_evidence),
+            )));
+        }
+        Ok((
+            payload,
+            facts,
+            sequence_observation,
+            timestamp_observation,
+            rate_evidence,
+        ))
     }
+}
+
+/// Establish the delivered-rate window for TWO streams by filling each one on
+/// its own thread, so the two fills run CONCURRENTLY rather than one after the
+/// other.
+///
+/// A single-threaded round-robin throttles the faster stream to the slower
+/// stream's rate: on the ASUS dual the RGB stream runs 30 fps and IR 15 fps,
+/// so a round-robin dequeues RGB at 15 fps, its V4L2 buffer overflows, and the
+/// shared-USB contention drops IR frames, pushing IR's measured rate below the
+/// floor (measured 14.5 Hz vs the 14.7 Hz floor). The 98 % tolerance was
+/// calibrated against a CONCURRENT probe measuring 14.714 Hz (see
+/// `DEFAULT_TOLERANCE_PERCENT`), so the fill must be concurrent — the same
+/// schedule production uses. Each stream's own serial fill is naturally paced
+/// by its frame arrival (a blocking DQBUF cannot outrun the camera), so two
+/// threads filling in parallel cannot starve each other the way one thread
+/// alternating between them does.
+///
+/// After this returns, each stream's `next()` sees a ready window and its own
+/// fill no-ops, so the capture loop measures only the settled rate.
+fn establish_concurrent_rate<A: ValidatedStream + Send, B: ValidatedStream + Send>(
+    primary: &mut TrackedStream<A>,
+    secondary: &mut TrackedStream<B>,
+) -> std::io::Result<()> {
+    if primary.rate_window.ready() && secondary.rate_window.ready() {
+        return Ok(());
+    }
+    let ready_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        let a = {
+            let count = std::sync::Arc::clone(&ready_count);
+            scope.spawn(move || drain_until_both_ready(primary, &count))
+        };
+        let b = {
+            let count = std::sync::Arc::clone(&ready_count);
+            scope.spawn(move || drain_until_both_ready(secondary, &count))
+        };
+        // A panic in a fill thread is a software defect, never a camera
+        // verdict: re-raise it (mirrors the capture-mode probe's rule, #263).
+        let a = a
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        let b = b
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        a?;
+        b?;
+        Ok(())
+    })
+}
+
+/// Fill one stream's delivered-rate window and keep discarding until BOTH
+/// streams are ready. The trailing discards are the point: the faster stream
+/// finishes its own fill first, and if it stopped there it would sit idle
+/// overflowing its V4L2 queue (dropping frames) while the slower twin finishes.
+/// Those dropped frames showed up as a >1 s timestamp gap on the next delivered
+/// frame, tripping the continuity ceiling. So once this stream is ready it
+/// keeps dequeuing (the window merely slides) until the other reports ready.
+fn drain_until_both_ready<S: ValidatedStream>(
+    stream: &mut TrackedStream<S>,
+    ready_count: &std::sync::atomic::AtomicUsize,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+    // Flush the STREAMON transient; its sequence gaps would poison the window.
+    for _ in 0..RATE_STARTUP_FLUSH {
+        stream.next_discarded()?;
+    }
+    stream.rate_window.reset();
+    let mut reported = false;
+    let mut attempts = 0usize;
+    // Fill (bounded) plus the trailing drain while the twin finishes, itself
+    // bounded by the twin's worst-case fill.
+    let budget = MAX_RATE_FILL_ATTEMPTS + MAX_RATE_FILL_ATTEMPTS;
+    while ready_count.load(Ordering::Acquire) < 2 && attempts < budget {
+        stream.next_discarded()?;
+        if !reported && stream.rate_window.ready() {
+            ready_count.fetch_add(1, Ordering::AcqRel);
+            reported = true;
+        }
+        attempts += 1;
+    }
+    if !stream.rate_window.ready() {
+        return Err(std::io::Error::other(
+            "could not establish delivered-rate evidence within the bounded fill",
+        ));
+    }
+    Ok(())
 }
 
 fn install_recovered_resources<S, M, G, E>(
@@ -2710,6 +3001,96 @@ pub fn list_pairs() -> Vec<CameraPair> {
     backend::list_pairs()
 }
 
+/// Run one bounded, gated diagnostic capture on an RGB node and return the
+/// exact delivered-rate evidence. The gated session fills its rolling window
+/// before the first delivery, so a single requested frame carries a complete
+/// 30-delta measurement; a stream that cannot fill it fails closed.
+fn diagnose_rgb_rate(
+    device: &str,
+) -> irlume_common::Result<irlume_common::CameraStreamRateEvidence> {
+    let camera = RgbCamera::open(device)?;
+    let mut session = camera.session()?;
+    let frames = session.burst(1)?;
+    let frame = frames
+        .first()
+        .ok_or_else(|| Error::Hardware("diagnostic captured no frame".into()))?;
+    let evidence = frame.provenance().rate_evidence();
+    Ok(rate_evidence_to_common(&evidence))
+}
+
+/// One bounded, gated diagnostic capture on an IR node.
+fn diagnose_ir_rate(
+    device: &str,
+) -> irlume_common::Result<irlume_common::CameraStreamRateEvidence> {
+    let camera = IrCamera::open(device)?;
+    let mut session = camera.session()?;
+    let (frame, _stats) = session.capture_with_stats()?;
+    let evidence = frame.provenance().rate_evidence();
+    Ok(rate_evidence_to_common(&evidence))
+}
+
+fn role_diagnostic(
+    known: bool,
+    result: irlume_common::Result<irlume_common::CameraStreamRateEvidence>,
+) -> irlume_common::CameraRoleDiagnostic {
+    match result {
+        Ok(evidence) => irlume_common::CameraRoleDiagnostic {
+            known,
+            state: if evidence.meets_floor {
+                "measured"
+            } else {
+                "fail"
+            }
+            .into(),
+            evidence: Some(evidence),
+        },
+        Err(_) => irlume_common::CameraRoleDiagnostic {
+            known,
+            state: "unknown".into(),
+            evidence: None,
+        },
+    }
+}
+
+/// Machine-readable delivered-rate diagnostics for a camera pair (issue #462).
+///
+/// Runs the ordinary gated capture session per present role and reports the
+/// measured evidence: an under-rate stream is a measured `fail`, never
+/// degraded to prose. `ir` is `None` on an RGB-only device. No device path,
+/// account identity, or template data is exposed.
+///
+/// # Errors
+///
+/// Returns [`Error::Hardware`] when a role cannot be opened or its bounded
+/// capture cannot establish delivered-rate evidence; the per-role `state` is
+/// then `unknown` rather than the whole request failing.
+pub fn camera_rate_diagnostics(
+    rgb: &str,
+    ir: Option<&str>,
+) -> irlume_common::Result<irlume_common::CameraDiagnosticsReport> {
+    let rgb_diag = role_diagnostic(true, diagnose_rgb_rate(rgb));
+    let ir_diag = match ir {
+        Some(node) => role_diagnostic(true, diagnose_ir_rate(node)),
+        None => irlume_common::CameraRoleDiagnostic {
+            known: false,
+            state: "missing".into(),
+            evidence: None,
+        },
+    };
+    let skew_us = match (&rgb_diag.evidence, &ir_diag.evidence) {
+        (Some(r), Some(i)) if r.clock == i.clock && r.source == i.source => {
+            Some(i.latest_timestamp_us - r.latest_timestamp_us)
+        }
+        _ => None,
+    };
+    Ok(irlume_common::CameraDiagnosticsReport {
+        rgb: rgb_diag,
+        ir: ir_diag,
+        skew_us,
+        capture_strategy: "burst".into(),
+    })
+}
+
 fn uvc_list_pairs() -> Vec<CameraPair> {
     let mut groups: std::collections::BTreeMap<std::path::PathBuf, (Vec<String>, Vec<String>)> =
         Default::default();
@@ -2796,10 +3177,7 @@ pub struct RgbCamera {
     /// buffers (#427); see `format_moved` for why the geometry alone is not
     /// enough.
     negotiated: v4l::Format,
-    #[expect(
-        dead_code,
-        reason = "immutable negotiation evidence is published by the delivered-rate slice"
-    )]
+    /// Immutable negotiation evidence published by the delivered-rate slice.
     requested_interval: frame_interval::FrameInterval,
     accepted_interval: frame_interval::FrameInterval,
 }
@@ -2926,7 +3304,14 @@ impl RgbCamera {
             .map_err(|error| Error::Hardware(error.to_string()))?;
         Ok(RgbSession {
             cam: self,
-            stream: TrackedStream::new(stream),
+            stream: TrackedStream::new(
+                stream,
+                rate_gate::StreamRateConfig::new(
+                    contracts::StreamRole::Rgb,
+                    self.requested_interval,
+                    self.accepted_interval,
+                ),
+            ),
             warmed: false,
             progress: progress.clone(),
             _blc_restore: blc_restore,
@@ -3224,8 +3609,10 @@ impl<'a> RgbSession<'a> {
                 .lease
                 .require_endpoint(&device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            let (buf, facts, sequence, timestamp) =
-                self.stream.next().map_err(|error| map_io(&device, error))?;
+            let (buf, facts, sequence, timestamp, rate_evidence) = self
+                .stream
+                .next()
+                .map_err(|error| map_delivery(&device, error))?;
             let taken = std::time::Instant::now();
             let data = match &chosen {
                 b"NV12" => nv12_to_rgb(buf, w, h),
@@ -3243,6 +3630,7 @@ impl<'a> RgbSession<'a> {
                 timestamp,
                 taken,
                 contracts::IlluminationProvenance::Unknown,
+                rate_evidence,
             )?;
             frames.push(Frame::from_provenance(
                 w,
@@ -3801,10 +4189,7 @@ pub struct IrCamera {
     /// buffers (#427); see `format_moved` for why the geometry alone is not
     /// enough.
     negotiated: v4l::Format,
-    #[expect(
-        dead_code,
-        reason = "immutable negotiation evidence is published by the delivered-rate slice"
-    )]
+    /// Immutable negotiation evidence published by the delivered-rate slice.
     requested_interval: frame_interval::FrameInterval,
     accepted_interval: frame_interval::FrameInterval,
     width: u32,
@@ -3914,16 +4299,23 @@ impl IrCamera {
         // restore while the stream was still live, the very mid-stream write
         // this change removes. Assigned further down, once the stream exists.
         let mode;
-        let mut stream = TrackedStream::new(SafeStream::open(
-            V4l2CameraState::with_interval(
+        let mut stream = TrackedStream::new(
+            SafeStream::open(
+                V4l2CameraState::with_interval(
+                    &self.device,
+                    self.lease.clone(),
+                    self.accepted_interval,
+                ),
                 &self.device,
-                self.lease.clone(),
+                &self.dev,
+                &self.negotiated,
+            )?,
+            rate_gate::StreamRateConfig::new(
+                contracts::StreamRole::Ir,
+                self.requested_interval,
                 self.accepted_interval,
             ),
-            &self.device,
-            &self.dev,
-            &self.negotiated,
-        )?);
+        );
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
         // 25s when video went first). `SafeStream::open` only allocates
@@ -4073,15 +4465,15 @@ impl IrSession<'_> {
             lease
                 .require_endpoint(device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            let (buf, bmeta, sequence, timestamp) =
-                stream.next().map_err(|error| map_io(device, error))?;
+            let (buf, bmeta, sequence, timestamp, rate_evidence) =
+                stream.next().map_err(|error| map_delivery(device, error))?;
             lease
                 .require_endpoint(device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
             stamps.push(bmeta.timestamp_micros());
             let frame_taken = std::time::Instant::now();
             taken.push(frame_taken);
-            dequeue_evidence.push((bmeta, sequence, timestamp, frame_taken));
+            dequeue_evidence.push((bmeta, sequence, timestamp, frame_taken, rate_evidence));
             // Drain every iteration, not once at the end. The metadata ring is
             // smaller than a burst, so a single drain afterwards silently loses
             // the earliest frames' records: measured 7 of 10 frames classified
@@ -4345,7 +4737,7 @@ impl IrSession<'_> {
             .into_iter()
             .zip(flags.iter().copied())
             .map(
-                |((facts, sequence, timestamp, frame_taken), illumination)| {
+                |((facts, sequence, timestamp, frame_taken, rate_evidence), illumination)| {
                     let illumination = match illumination {
                         Some(ir_metadata::Illumination::Lit) => {
                             contracts::IlluminationProvenance::ActiveIr
@@ -4363,6 +4755,7 @@ impl IrSession<'_> {
                         timestamp,
                         frame_taken,
                         illumination,
+                        rate_evidence,
                     )
                 },
             )
@@ -4471,6 +4864,25 @@ impl IrSession<'_> {
     }
 }
 
+/// Establish the delivered-rate evidence for a held RGB+IR pair by draining
+/// both streams concurrently until each holds a full window. See the
+/// module-level concurrent fill for why the fill must not be serial.
+///
+/// Called once per held session, before the capture loop, so the per-frame
+/// `next()` fills no-op on a ready window. Best-effort by contract: a failure
+/// is reported so the caller can log it, but the session stays usable — the
+/// per-stream serial fill in `next()` re-attempts establishment (and fails
+/// closed) on the first capture, preserving the existing error/retry shape.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+pub fn establish_pair_rate(
+    rgb: &mut RgbSession<'_>,
+    ir: &mut IrSession<'_>,
+) -> irlume_common::Result<()> {
+    let device = rgb.cam.device.clone();
+    establish_concurrent_rate(&mut rgb.stream, &mut ir.stream)
+        .map_err(|error| map_io(&device, error))
+}
+
 /// Ambient-subtraction helpers (Windows-Hello-style illuminated minus ambient).
 /// `subtract` is used by `capture_ir` when `IRLUME_IR_AMBIENT_SUBTRACT=1`
 /// (experimental, off by default); `capture_raw_burst`/`center_border_ratio`
@@ -4480,7 +4892,8 @@ pub mod ir_probe {
     use super::negotiate_ir_format_and_interval;
     use super::Device;
     use super::{
-        ir_emitter, map_io, privacy_engaged_with_permit, verify_pinned, Error, Frame, Spectrum,
+        ir_emitter, map_delivery, map_io, privacy_engaged_with_permit, verify_pinned, Error, Frame,
+        Spectrum,
     };
 
     /// Mean brightness of an 8-bit greyscale buffer.
@@ -4644,15 +5057,22 @@ pub mod ir_probe {
             &dev,
             &fmt,
         )?;
-        let mut stream = super::TrackedStream::new(stream);
+        let mut stream = super::TrackedStream::new(
+            stream,
+            super::rate_gate::StreamRateConfig::new(
+                super::contracts::StreamRole::Ir,
+                interval.requested,
+                interval.accepted,
+            ),
+        );
         mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
         // Bound, never read: held for its `Drop`, which restores the control.
         let _ = &mode;
         let mut out = Vec::with_capacity(n);
         let t0 = std::time::Instant::now();
         for _ in 0..n {
-            let (buf, facts, sequence, timestamp) =
-                stream.next().map_err(|error| map_io(device, error))?;
+            let (buf, facts, sequence, timestamp, rate_evidence) =
+                stream.next().map_err(|error| map_delivery(device, error))?;
             let taken = std::time::Instant::now();
             let provenance = super::checked_single_provenance(
                 binding.clone(),
@@ -4662,6 +5082,7 @@ pub mod ir_probe {
                 timestamp,
                 taken,
                 super::contracts::IlluminationProvenance::Unknown,
+                rate_evidence,
             )?;
             out.push((
                 Frame::from_provenance(w, h, Spectrum::Ir, dec.decode(buf, w, h), provenance)?,
@@ -4766,7 +5187,14 @@ pub fn capture_ir_streaming<B>(
         &dev,
         &fmt,
     )?;
-    let mut stream = TrackedStream::new(stream);
+    let mut stream = TrackedStream::new(
+        stream,
+        rate_gate::StreamRateConfig::new(
+            contracts::StreamRole::Ir,
+            interval.requested,
+            interval.accepted,
+        ),
+    );
     mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
     // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
     // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
@@ -4799,8 +5227,8 @@ pub fn capture_ir_streaming<B>(
     // user a password fallback. Reading the metadata queue here is how that gets
     // closed, and it is not done.
     for _ in 0..max_frames {
-        let (buf, facts, sequence, timestamp) =
-            stream.next().map_err(|error| map_io(device, error))?;
+        let (buf, facts, sequence, timestamp, rate_evidence) =
+            stream.next().map_err(|error| map_delivery(device, error))?;
         let taken = std::time::Instant::now();
         let data = dec.decode(buf, w, h);
         let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
@@ -4871,6 +5299,7 @@ pub fn capture_ir_streaming<B>(
             timestamp,
             taken,
             contracts::IlluminationProvenance::Unknown,
+            rate_evidence,
         )?;
         let frame = Frame::from_provenance(w, h, Spectrum::Ir, data, provenance)?;
         if let std::ops::ControlFlow::Break(b) = on_frame(IrStreamFrame { frame, mean }) {
@@ -4945,7 +5374,14 @@ pub fn capture_ir_sequence(
         &dev,
         &fmt,
     )?;
-    let mut stream = TrackedStream::new(stream);
+    let mut stream = TrackedStream::new(
+        stream,
+        rate_gate::StreamRateConfig::new(
+            contracts::StreamRole::Ir,
+            interval.requested,
+            interval.accepted,
+        ),
+    );
     mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
     // Set once per stream, before it starts, and not per frame (the
     // frozen-stream restart below re-applies on its new stream). This path also carried
@@ -4966,8 +5402,8 @@ pub fn capture_ir_sequence(
         let mut best_index = 0;
         let mut contributors = Vec::with_capacity(burst);
         for _ in 0..burst {
-            let (buf, facts, sequence, timestamp) =
-                stream.next().map_err(|error| map_io(device, error))?;
+            let (buf, facts, sequence, timestamp, rate_evidence) =
+                stream.next().map_err(|error| map_delivery(device, error))?;
             let at = std::time::Instant::now();
             let data = dec.decode(buf, w, h);
             let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
@@ -4979,6 +5415,7 @@ pub fn capture_ir_sequence(
                 timestamp,
                 at,
                 contracts::IlluminationProvenance::Unknown,
+                rate_evidence,
             )?);
             if mean > best_mean {
                 best_mean = mean;
@@ -5488,6 +5925,15 @@ fn held_concurrent_arm<'d>(
                 return Ok(());
             }
         };
+        // Establish the delivered-rate windows before measuring, draining both
+        // streams concurrently so the serial fill cannot starve one and skew
+        // the concurrent brightness this probe exists to measure.
+        if let Err(error) = establish_pair_rate(&mut rs, &mut is) {
+            irlume_common::dlog!(
+                "capture-mode probe: could not establish delivered-rate evidence \
+                 ({error}); the per-frame fill will retry"
+            );
+        }
         for _ in 0..rounds {
             progress();
             let t0 = std::time::Instant::now();
@@ -6194,6 +6640,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_rate_config(role: contracts::StreamRole) -> rate_gate::StreamRateConfig {
+        // Zero window: a "no gate" config for continuity/provenance fixtures so
+        // the 30-delta delivered-rate fill does not consume the frames those
+        // tests observe. Rate gating is exercised in rate_gate's own unit tests.
+        rate_gate::StreamRateConfig::with_window(
+            role,
+            frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+            frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+            0,
+        )
+    }
 
     type CallLog = std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>;
 
@@ -7137,10 +7595,13 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(2, 0),
             ..v4l::buffer::Metadata::default()
         };
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata,
-        });
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata,
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.observations = u64::MAX;
         let sequence_state = capture.sequence.continuity_state_for_test();
         let timestamp_state = capture.timestamp.continuity_state_for_test();
@@ -7233,10 +7694,13 @@ mod tests {
         let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
         let corrupt = continuity_metadata(1, 1, monotonic | v4l::buffer::Flags::ERROR);
         let valid = continuity_metadata(2, 2, monotonic);
-        let mut tracked = TrackedStream::new(QueuedContinuityFixture {
-            payload: [7],
-            metadata: [corrupt, valid].into(),
-        });
+        let mut tracked = TrackedStream::new(
+            QueuedContinuityFixture {
+                payload: [7],
+                metadata: [corrupt, valid].into(),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
 
         warm_up_with(
             "fixture",
@@ -7247,7 +7711,7 @@ mod tests {
         .expect("metadata-valid corruption is a discarded warm-up observation");
         assert_eq!(tracked.accounting(), (1, 1, 0));
 
-        let (payload, _, sequence, timestamp) =
+        let (payload, _, sequence, timestamp, _) =
             tracked.next().expect("next payload remains usable");
         assert_eq!(payload, &[7]);
         assert_eq!(sequence.raw(), 2);
@@ -7261,10 +7725,13 @@ mod tests {
         let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
         let corrupt = continuity_metadata(10, 10, monotonic | v4l::buffer::Flags::ERROR);
         let valid = continuity_metadata(11, 11, monotonic);
-        let mut tracked = TrackedStream::new(QueuedContinuityFixture {
-            payload: [9],
-            metadata: [corrupt, valid].into(),
-        });
+        let mut tracked = TrackedStream::new(
+            QueuedContinuityFixture {
+                payload: [9],
+                metadata: [corrupt, valid].into(),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
 
         let error = tracked
             .next()
@@ -7272,7 +7739,7 @@ mod tests {
         assert!(error.to_string().contains("corrupt"));
         assert_eq!(tracked.accounting(), (1, 1, 0));
 
-        let (payload, _, sequence, timestamp) =
+        let (payload, _, sequence, timestamp, _) =
             tracked.next().expect("next payload remains usable");
         assert_eq!(payload, &[9]);
         assert_eq!(sequence.raw(), 11);
@@ -7289,10 +7756,13 @@ mod tests {
             ..continuity_metadata(1, 1, monotonic | v4l::buffer::Flags::ERROR)
         };
         let valid = continuity_metadata(2, 2, monotonic);
-        let mut tracked = TrackedStream::new(QueuedContinuityFixture {
-            payload: [3],
-            metadata: [corrupt_invalid, valid].into(),
-        });
+        let mut tracked = TrackedStream::new(
+            QueuedContinuityFixture {
+                payload: [3],
+                metadata: [corrupt_invalid, valid].into(),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
 
         assert!(tracked.next_discarded().is_err());
         assert_eq!(tracked.accounting(), (0, 0, 0));
@@ -7327,10 +7797,13 @@ mod tests {
             let baseline = continuity_metadata(1, 1, monotonic);
             let corrupt = continuity_metadata(sequence, seconds, flags);
             let valid = continuity_metadata(3, 3, monotonic);
-            let mut tracked = TrackedStream::new(QueuedContinuityFixture {
-                payload: [5],
-                metadata: [baseline, corrupt, valid].into(),
-            });
+            let mut tracked = TrackedStream::new(
+                QueuedContinuityFixture {
+                    payload: [5],
+                    metadata: [baseline, corrupt, valid].into(),
+                },
+                test_rate_config(contracts::StreamRole::Ir),
+            );
 
             tracked.next().expect("baseline delivery");
             assert!(
@@ -7358,13 +7831,16 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(1, 0),
             ..v4l::buffer::Metadata::default()
         };
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: v4l::buffer::Metadata {
-                timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
-                ..valid
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: v4l::buffer::Metadata {
+                    timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
+                    ..valid
+                },
             },
-        });
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         assert!(capture.next_discarded().is_err());
         capture.stream_mut().expect("stream").metadata = valid;
         assert!(capture.next().is_err(), "discarded invalid evidence healed");
@@ -7396,18 +7872,21 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(2, 0),
             ..v4l::buffer::Metadata::default()
         };
-        let mut tracked = TrackedStream::new(WarmupFixture {
-            payload: [1],
-            metadata: [
-                v4l::buffer::Metadata {
-                    sequence: 1,
-                    timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
-                    ..valid
-                },
-                valid,
-            ]
-            .into(),
-        });
+        let mut tracked = TrackedStream::new(
+            WarmupFixture {
+                payload: [1],
+                metadata: [
+                    v4l::buffer::Metadata {
+                        sequence: 1,
+                        timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
+                        ..valid
+                    },
+                    valid,
+                ]
+                .into(),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         let result = warm_up_with(
             "fixture",
             || tracked.next_discarded(),
@@ -7434,10 +7913,13 @@ mod tests {
                 timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
                 ..v4l::buffer::Metadata::default()
             };
-            let mut capture = TrackedStream::new(ContinuityFixture {
-                payload: [1],
-                metadata: metadata(1, 1, monotonic),
-            });
+            let mut capture = TrackedStream::new(
+                ContinuityFixture {
+                    payload: [1],
+                    metadata: metadata(1, 1, monotonic),
+                },
+                test_rate_config(contracts::StreamRole::Ir),
+            );
             capture.next().expect("baseline");
             capture.stream_mut().expect("stream").metadata = metadata(2, seconds, flags);
             assert!(capture.next_discarded().is_err());
@@ -7481,8 +7963,9 @@ mod tests {
             payload: [7],
             sequences: sequences.iter().copied().collect(),
         };
-        let mut capture = TrackedStream::new(fixture(&[41]));
-        let (_, _, baseline_sequence, baseline_timestamp) =
+        let mut capture =
+            TrackedStream::new(fixture(&[41]), test_rate_config(contracts::StreamRole::Ir));
+        let (_, _, baseline_sequence, baseline_timestamp, _) =
             capture.next().expect("baseline delivery");
         assert!(!baseline_sequence.discontinuity());
         assert!(!baseline_timestamp.discontinuity());
@@ -7494,7 +7977,7 @@ mod tests {
             .expect("representable recovery epoch");
         capture.next_discarded().expect("discarded warm-up dequeue");
 
-        let (_, _, restarted_sequence, restarted_timestamp) =
+        let (_, _, restarted_sequence, restarted_timestamp, _) =
             capture.next().expect("first delivered recovery frame");
         assert_eq!(restarted_sequence.raw(), 501);
         assert_eq!(restarted_sequence.gap(), 0);
@@ -7516,10 +7999,13 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
             ..v4l::buffer::Metadata::default()
         };
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: metadata(1, 1),
-        });
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: metadata(1, 1),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         let sequence_state = capture.sequence.continuity_state_for_test();
         let timestamp_state = capture.timestamp.continuity_state_for_test();
@@ -7549,7 +8035,7 @@ mod tests {
             .expect("recovery");
         capture.next_discarded().expect("recovered warm-up frame");
         capture.stream_mut().expect("stream").metadata = metadata(11, 11);
-        let (_, _, sequence, timestamp) = capture.next().expect("recovered delivered frame");
+        let (_, _, sequence, timestamp, _) = capture.next().expect("recovered delivered frame");
         assert_eq!(sequence.stream_epoch(), timestamp.stream_epoch());
         assert!(sequence.discontinuity());
         assert!(timestamp.discontinuity());
@@ -7564,10 +8050,13 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
             ..v4l::buffer::Metadata::default()
         };
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: metadata(1, 1),
-        });
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: metadata(1, 1),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         let sequence_state = capture.sequence.continuity_state_for_test();
         let timestamp_state = capture.timestamp.continuity_state_for_test();
@@ -7595,7 +8084,7 @@ mod tests {
                 metadata: metadata(10, 10),
             })
             .expect("recovery");
-        let (_, _, sequence, timestamp) = capture.next().expect("recovered frame");
+        let (_, _, sequence, timestamp, _) = capture.next().expect("recovered frame");
         assert_eq!(sequence.stream_epoch(), timestamp.stream_epoch());
         assert!(sequence.discontinuity());
         assert!(timestamp.discontinuity());
@@ -7611,10 +8100,13 @@ mod tests {
             ..v4l::buffer::Metadata::default()
         };
         let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: metadata(1, 1, monotonic),
-        });
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: metadata(1, 1, monotonic),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         capture.stream_mut().expect("stream").metadata =
             metadata(5, 2, v4l::buffer::Flags::TIMESTAMP_UNKNOWN);
@@ -7627,7 +8119,7 @@ mod tests {
                 metadata: metadata(10, 1, monotonic),
             })
             .expect("recovery");
-        let (_, _, sequence, timestamp) = capture.next().expect("recovered frame");
+        let (_, _, sequence, timestamp, _) = capture.next().expect("recovered frame");
         assert_eq!(sequence.cumulative_drops(), 0);
         assert!(sequence.discontinuity());
         assert!(timestamp.discontinuity());
@@ -7642,7 +8134,8 @@ mod tests {
             calls: calls.clone(),
             fail_validation,
         };
-        let mut capture = TrackedStream::new(fixture(false));
+        let mut capture =
+            TrackedStream::new(fixture(false), test_rate_config(contracts::StreamRole::Ir));
         capture.sequence.force_stream_epoch_overflow_on_recovery();
         assert!(capture.take().is_some());
         capture
@@ -7652,12 +8145,15 @@ mod tests {
         assert_eq!(calls.get(), 1, "replacement was not validated first");
 
         let failed_calls = std::rc::Rc::new(std::cell::Cell::new(0));
-        let mut validation_failure = TrackedStream::new(RecoveryValidationFixture {
-            payload: [1],
-            metadata: v4l::buffer::Metadata::default(),
-            calls: failed_calls.clone(),
-            fail_validation: false,
-        });
+        let mut validation_failure = TrackedStream::new(
+            RecoveryValidationFixture {
+                payload: [1],
+                metadata: v4l::buffer::Metadata::default(),
+                calls: failed_calls.clone(),
+                fail_validation: false,
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         let sequence_state = validation_failure.sequence.continuity_state_for_test();
         let timestamp_state = validation_failure.timestamp.continuity_state_for_test();
         assert!(validation_failure.take().is_some());
@@ -7688,7 +8184,8 @@ mod tests {
             metadata: v4l::buffer::Metadata::default(),
         };
 
-        let mut sequence_failure = TrackedStream::new(fixture());
+        let mut sequence_failure =
+            TrackedStream::new(fixture(), test_rate_config(contracts::StreamRole::Ir));
         sequence_failure
             .sequence
             .force_stream_epoch_overflow_on_recovery();
@@ -7702,7 +8199,8 @@ mod tests {
         assert!(!sequence_failure.timestamp.failed_for_test());
         assert_eq!(sequence_failure.timestamp.stream_epoch_for_test(), 0);
 
-        let mut timestamp_failure = TrackedStream::new(fixture());
+        let mut timestamp_failure =
+            TrackedStream::new(fixture(), test_rate_config(contracts::StreamRole::Ir));
         timestamp_failure
             .timestamp
             .force_stream_epoch_overflow_on_recovery();
@@ -7719,16 +8217,19 @@ mod tests {
 
     #[test]
     fn discarded_timestamp_failure_does_not_advance_sequence_state() {
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: v4l::buffer::Metadata {
-                bytesused: 1,
-                sequence: 1,
-                flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
-                timestamp: v4l::timestamp::Timestamp::new(1, 0),
-                ..v4l::buffer::Metadata::default()
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: v4l::buffer::Metadata {
+                    bytesused: 1,
+                    sequence: 1,
+                    flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                    timestamp: v4l::timestamp::Timestamp::new(1, 0),
+                    ..v4l::buffer::Metadata::default()
+                },
             },
-        });
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         let stream = capture.stream_mut().expect("stream");
         stream.metadata.sequence = 5;
@@ -7740,16 +8241,19 @@ mod tests {
 
     #[test]
     fn discarded_sequence_failure_does_not_advance_timestamp_state() {
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: v4l::buffer::Metadata {
-                bytesused: 1,
-                sequence: 1,
-                flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
-                timestamp: v4l::timestamp::Timestamp::new(1, 0),
-                ..v4l::buffer::Metadata::default()
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: v4l::buffer::Metadata {
+                    bytesused: 1,
+                    sequence: 1,
+                    flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                    timestamp: v4l::timestamp::Timestamp::new(1, 0),
+                    ..v4l::buffer::Metadata::default()
+                },
             },
-        });
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         capture.sequence.force_drop_overflow_on_next_gap();
         let stream = capture.stream_mut().expect("stream");
@@ -7761,16 +8265,19 @@ mod tests {
 
     #[test]
     fn sequence_failure_does_not_advance_timestamp_state() {
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: v4l::buffer::Metadata {
-                bytesused: 1,
-                sequence: 1,
-                flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
-                timestamp: v4l::timestamp::Timestamp::new(1, 0),
-                ..v4l::buffer::Metadata::default()
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: v4l::buffer::Metadata {
+                    bytesused: 1,
+                    sequence: 1,
+                    flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                    timestamp: v4l::timestamp::Timestamp::new(1, 0),
+                    ..v4l::buffer::Metadata::default()
+                },
             },
-        });
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         capture.sequence.force_drop_overflow_on_next_gap();
         let stream = capture.stream_mut().expect("stream");
@@ -7789,10 +8296,13 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(1, 0),
             ..v4l::buffer::Metadata::default()
         };
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: valid,
-        });
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: valid,
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         let stream = capture.stream_mut().expect("stream");
         stream.metadata.timestamp = v4l::timestamp::Timestamp::new(2, 1_000_000);
@@ -7820,10 +8330,13 @@ mod tests {
                 timestamp: v4l::timestamp::Timestamp::new(1, 0),
                 ..v4l::buffer::Metadata::default()
             };
-            let mut capture = TrackedStream::new(ContinuityFixture {
-                payload: [1],
-                metadata: valid,
-            });
+            let mut capture = TrackedStream::new(
+                ContinuityFixture {
+                    payload: [1],
+                    metadata: valid,
+                },
+                test_rate_config(contracts::StreamRole::Ir),
+            );
             capture.next().expect("baseline");
             let stream = capture.stream_mut().expect("stream");
             stream.metadata.flags = v4l::buffer::Flags::from_bits_truncate(bits);
@@ -8238,6 +8751,19 @@ mod tests {
             timestamp,
             at,
             contracts::IlluminationProvenance::Unknown,
+            frame_provenance::DeliveredRateEvidence::new(
+                contracts::StreamRole::Rgb,
+                (15, 2),
+                (15, 2),
+                (15, 2),
+                98,
+                30,
+                2_000_000,
+                (15, 2),
+                true,
+                &sequence,
+                &timestamp,
+            ),
         )
         .expect("test runtime provenance");
         Frame::from_provenance(
@@ -10202,6 +10728,27 @@ mod tests {
             .transpose()
             .expect("open IR session");
         rgb_session.warm_up().expect("initial RGB warm-up");
+        // Establish the delivered-rate windows for the held pair UP FRONT by
+        // draining both streams concurrently, exactly as the production held
+        // session does before its capture loop. The loop below runs RGB and IR
+        // concurrently too, but the FIRST `next()` on each stream would
+        // otherwise run the serial fill (30 flush + 30 fill) and starve the
+        // twin's V4L2 queue into dropping frames, so the twin's own fill then
+        // measures a false low rate (ping-pong starvation, measured on the ASUS
+        // dual). Establishing both windows first makes every loop `next()`
+        // no-op its fill and measure only the settled rate.
+        if let Some(ir) = ir_session.as_mut() {
+            establish_pair_rate(&mut rgb_session, ir).expect("establish initial pair rate");
+        } else {
+            // RGB-only: establish the single window up front too, so the first
+            // next() does not run a lazy serial fill inside the loop (which
+            // would shift the first delivered frame's timestamp ~5 s and make
+            // the global timestamp span undershoot the measured duration).
+            rgb_session
+                .stream
+                .fill_rate_evidence()
+                .expect("establish initial RGB rate");
+        }
         let started = std::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(seconds);
         let recovery_at = started + std::time::Duration::from_secs(seconds / 2);
@@ -10212,25 +10759,44 @@ mod tests {
         let mut expect_rgb_discontinuity = false;
         let mut expect_ir_discontinuity = false;
         while std::time::Instant::now() < deadline {
-            let (_, _, sequence, timestamp) =
-                rgb_session.stream.next().expect("RGB tracked dequeue");
+            // Concurrent capture, matching production's schedule: IR dequeues
+            // on a worker thread while RGB dequeues on this thread. A
+            // single-threaded round-robin throttles the 30 fps RGB stream to
+            // the 15 fps IR rate, overflowing RGB's queue and dropping IR
+            // frames (measured 14.5 vs 14.7 Hz), so the loop must run both
+            // streams concurrently rather than alternately.
+            let ((rgb_sequence, rgb_timestamp), ir_obs) = std::thread::scope(|scope| {
+                let ir_thread = ir_session.as_mut().map(|session| {
+                    scope.spawn(move || {
+                        let (_, _, sequence, timestamp, _) =
+                            session.stream.next().expect("IR tracked dequeue");
+                        if let Some(log) = session.meta.as_mut() {
+                            log.begin_burst();
+                            log.drain();
+                        }
+                        (sequence, timestamp)
+                    })
+                });
+                let (_, _, rgb_sequence, rgb_timestamp, _) =
+                    rgb_session.stream.next().expect("RGB tracked dequeue");
+                let ir_obs = ir_thread.map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+                });
+                ((rgb_sequence, rgb_timestamp), ir_obs)
+            });
             if expect_rgb_discontinuity {
-                assert!(sequence.discontinuity(), "RGB recovery marker missing");
+                assert!(rgb_sequence.discontinuity(), "RGB recovery marker missing");
                 expect_rgb_discontinuity = false;
             }
-            rgb_stats.record(sequence, timestamp);
-            if let Some(session) = &mut ir_session {
-                let (_, _, sequence, timestamp) =
-                    session.stream.next().expect("IR tracked dequeue");
-                if let Some(log) = session.meta.as_mut() {
-                    log.begin_burst();
-                    log.drain();
-                }
+            rgb_stats.record(rgb_sequence, rgb_timestamp);
+            if let Some((ir_sequence, ir_timestamp)) = ir_obs {
                 if expect_ir_discontinuity {
-                    assert!(sequence.discontinuity(), "IR recovery marker missing");
+                    assert!(ir_sequence.discontinuity(), "IR recovery marker missing");
                     expect_ir_discontinuity = false;
                 }
-                ir_stats.record(sequence, timestamp);
+                ir_stats.record(ir_sequence, ir_timestamp);
             }
             if !recovered && std::time::Instant::now() >= recovery_at {
                 let recovery_started = std::time::Instant::now();
@@ -10241,6 +10807,27 @@ mod tests {
                     session.recover().expect("IR recovery");
                     expect_ir_discontinuity = true;
                 }
+                // Re-establish the delivered-rate window(s) up front so the
+                // first post-recovery next() does not add a serial-fill gap
+                // outside the measured recovery duration: concurrently for the
+                // dual pair, serially for an RGB-only camera (single stream,
+                // nothing to starve). The recovery discontinuity markers
+                // survive these discarded dequeues (both trackers re-arm the
+                // pending marker on a discarded observation), so the assertions
+                // above still see them on the next delivered frame.
+                if let Some(ir) = ir_session.as_mut() {
+                    establish_pair_rate(&mut rgb_session, ir)
+                        .expect("re-establish pair rate after recovery");
+                } else {
+                    rgb_session
+                        .stream
+                        .fill_rate_evidence()
+                        .expect("re-establish RGB rate after recovery");
+                }
+                // The recovery duration spans teardown, re-arm, AND the rate
+                // re-establishment, so it matches the timestamp gap the
+                // evidence records between the last pre-recovery and first
+                // post-recovery delivered frame.
                 recovery_duration = Some(recovery_started.elapsed());
                 recovered = true;
             }
@@ -11026,6 +11613,98 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_rate_fill_drains_both_streams_in_parallel() {
+        // The fill must drive both streams on two threads SIMULTANEOUSLY. A
+        // serial (round-robin) fill throttles the faster stream to the slower
+        // one's rate, overflowing its V4L2 queue and dropping frames (measured
+        // on the ASUS dual: RGB 30 fps, IR 15 fps). Each fixture rendezvouses
+        // on a barrier on its FIRST dequeue: concurrent threads both arrive and
+        // pass; a serial fill deadlocks on it, which the watchdog below turns
+        // into a clean failure instead of a hung test.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        struct RendezvousFixture {
+            payload: [u8; 1],
+            first: bool,
+            next_sequence: u32,
+            next_seconds: i64,
+            barrier: std::sync::Arc<std::sync::Barrier>,
+        }
+
+        impl ValidatedStream for RendezvousFixture {
+            fn next_validated(
+                &mut self,
+            ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError>
+            {
+                if self.first {
+                    self.first = false;
+                    self.barrier.wait();
+                }
+                let metadata = v4l::buffer::Metadata {
+                    bytesused: 1,
+                    sequence: self.next_sequence,
+                    flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                    timestamp: v4l::timestamp::Timestamp::new(self.next_seconds, 0),
+                    ..v4l::buffer::Metadata::default()
+                };
+                self.next_sequence += 1;
+                self.next_seconds += 1;
+                let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, 1)
+                    .map_err(ValidatedDequeueError::Facts)?;
+                Ok((&self.payload, facts))
+            }
+        }
+
+        let small = |role| {
+            rate_gate::StreamRateConfig::with_window(
+                role,
+                frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+                frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+                4,
+            )
+        };
+        let mut rgb = TrackedStream::new(
+            RendezvousFixture {
+                payload: [1],
+                first: true,
+                next_sequence: 1,
+                next_seconds: 1,
+                barrier: barrier.clone(),
+            },
+            small(contracts::StreamRole::Rgb),
+        );
+        let mut ir = TrackedStream::new(
+            RendezvousFixture {
+                payload: [2],
+                first: true,
+                next_sequence: 1,
+                next_seconds: 1,
+                barrier: barrier.clone(),
+            },
+            small(contracts::StreamRole::Ir),
+        );
+
+        let (done, ready) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = establish_concurrent_rate(&mut rgb, &mut ir);
+            let _ = done.send(result.map(|()| (rgb.rate_window.ready(), ir.rate_window.ready())));
+        });
+        match ready.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok((rgb_ready, ir_ready))) => {
+                assert!(rgb_ready, "rgb window must be ready");
+                assert!(ir_ready, "ir window must be ready");
+            }
+            Ok(Err(error)) => panic!("concurrent fill errored: {error}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("concurrent fill deadlocked (serial fill stuck on the rendezvous)")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("concurrent fill thread panicked")
+            }
+        }
     }
 }
 
