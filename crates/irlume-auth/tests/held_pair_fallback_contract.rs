@@ -56,3 +56,44 @@ fn enrollment_fallback_restarts_without_held_sessions() {
     assert!(capture.contains("drop(rs)"));
     assert!(capture.contains("drop(is)"));
 }
+
+#[test]
+fn support_probe_runs_every_dual_camera_assessment_inside_its_operation() {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read auth source");
+    let probe = function(
+        &source,
+        "    pub fn support_probe(",
+        "\n    /// RGB-only capture",
+    );
+
+    assert_eq!(
+        probe.matches("self.assess_full_with_operation(").count(),
+        2,
+        "the concurrent and sequential probe paths must both install the held operation"
+    );
+    assert!(
+        !probe.contains("self.assess_full_with("),
+        "a raw dual-camera assessment reacquires the probe's own lease and times out"
+    );
+}
+
+#[test]
+fn support_probe_publishes_and_traces_the_rgb_only_camera() {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read auth source");
+    let probe = function(
+        &source,
+        "    pub fn support_probe(",
+        "\n    /// RGB-only capture",
+    );
+
+    assert!(probe.contains("rgb.diagnostic_camera_context()"));
+    assert!(probe.contains("publish_rgb_only_support_context("));
+    assert!(probe.contains("TraceEventKind::StreamContract"));
+    assert!(probe.contains("self.assess_rgb_only_with_diagnostics(&probe_sink)"));
+    assert!(
+        !probe.contains("irlume_camera::capture_rgb_denoised_with_progress("),
+        "the bare RGB capture omits detector, liveness, and stage trace evidence"
+    );
+}

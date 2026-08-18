@@ -89,9 +89,16 @@ pub fn classify(req: &Request) -> Class {
         // stays serialized. KeyringInfo is NOT here: its PCR diagnosis is a
         // TPM command, and the TPM executes one command at a time, so it
         // serves from the worker with the other TPM users.
-        Ping | Health | HasSealedPassword { .. } | RecoveryStatus { .. } | ListProfiles { .. } => {
-            Class::Status
-        }
+        Ping
+        | Health
+        | HasSealedPassword { .. }
+        | RecoveryStatus { .. }
+        | ListProfiles { .. }
+        | SupportSnapshot { .. }
+        // Served directly by its connection thread before this classification
+        // is consulted; Status documents that it never belongs to the camera
+        // worker if a caller reaches this seam independently.
+        | TraceSubscribe { .. } => Class::Status,
         PositionSample { .. }
         | Identify
         | Enroll { .. }
@@ -102,6 +109,7 @@ pub fn classify(req: &Request) -> Class {
         | CaptureModeStatus
         | SelfTest { .. }
         | CameraDiagnostics
+        | SupportProbe { .. }
         // Enumeration OPENS every node, so it belongs to the camera class
         // even though it captures nothing (#187).
         | ListCameras => Class::Camera,
@@ -567,6 +575,14 @@ mod tests {
             Class::Status
         );
         assert_eq!(classify(&Request::Ping), Class::Status);
+        assert_eq!(
+            classify(&Request::SupportSnapshot { since_ms: 60_000 }),
+            Class::Status
+        );
+        assert_eq!(
+            classify(&Request::SupportProbe { since_ms: 60_000 }),
+            Class::Camera
+        );
         // A secret-carrying management request is not camera work.
         assert_eq!(
             classify(&Request::SealPassword {

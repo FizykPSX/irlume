@@ -3382,6 +3382,29 @@ impl RgbCamera {
             )?,
         ))
     }
+
+    /// Project this exact live RGB endpoint into the structurally share-safe
+    /// support schema without retaining a device path or serial value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a hardware error when fd identity, lifecycle generation, or the
+    /// bounded diagnostic projection cannot be proven.
+    pub fn diagnostic_camera_context(
+        &self,
+    ) -> irlume_common::Result<irlume_common::diagnostics::SanitizedCameraContext> {
+        let (endpoint, stream) = self
+            .qualification_facts()
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        let generation = self
+            .lease
+            .frame_binding(&self.device, contracts::StreamRole::Rgb)
+            .map_err(|error| Error::Hardware(error.to_string()))?
+            .generation()
+            .get();
+        capture_qualification::diagnostic_camera_context(&endpoint, &stream, generation, None)
+            .map_err(|error| Error::Hardware(error.to_string()))
+    }
 }
 
 /// The negotiated stream of a camera, for the doctor report (#223).
@@ -6303,6 +6326,34 @@ impl RuntimePairContract {
         &self.runtime_key
     }
 
+    /// Current RGB camera incarnation captured by this contract.
+    #[must_use]
+    pub const fn rgb_generation(&self) -> u64 {
+        self.rgb_binding.generation().get()
+    }
+
+    /// Current IR camera incarnation captured by this contract.
+    #[must_use]
+    pub const fn ir_generation(&self) -> u64 {
+        self.ir_binding.generation().get()
+    }
+
+    /// Structurally share-safe camera/topology facts for support snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the live topology cannot be represented by the
+    /// bounded diagnostic schema.
+    pub fn diagnostic_camera_contexts(
+        &self,
+    ) -> Result<
+        [irlume_common::diagnostics::SanitizedCameraContext; 2],
+        irlume_common::diagnostics::InvalidDiagnosticValue,
+    > {
+        self.context
+            .diagnostic_camera_contexts(self.rgb_generation(), self.ir_generation())
+    }
+
     /// Validate a delivered concurrent pair before either frame reaches recognition.
     ///
     /// # Errors
@@ -6339,6 +6390,103 @@ impl RuntimePairContract {
         }
         Ok(())
     }
+
+    /// Trace-only facts for a pair that satisfies this exact runtime license.
+    /// The same validator remains authoritative; no diagnostic event is
+    /// returned for a pair recognition itself must reject.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`RuntimePairViolation`] when either frame does not
+    /// satisfy the licensed generation, stream contract, delivered-rate,
+    /// continuity, or active-IR provenance requirements.
+    pub fn diagnostic_trace_events(
+        &self,
+        rgb: &Frame,
+        ir: &Frame,
+    ) -> std::result::Result<Vec<irlume_common::diagnostics::TraceEventKind>, RuntimePairViolation>
+    {
+        use irlume_common::diagnostics::{CameraRoleLabel, EmitterTraceOutcome, TraceEventKind};
+
+        self.validate_pair(rgb, ir)?;
+        let mut events = Vec::with_capacity(5);
+        for (role, contract) in [
+            (CameraRoleLabel::Rgb, self.context.rgb_stream()),
+            (CameraRoleLabel::Ir, self.context.ir_stream()),
+        ] {
+            if let Ok((requested, accepted)) = contract.diagnostic_contracts() {
+                events.push(TraceEventKind::StreamContract {
+                    role,
+                    requested,
+                    accepted,
+                });
+            }
+        }
+        for (role, frame, active_ir) in [
+            (CameraRoleLabel::Rgb, rgb, None),
+            (
+                CameraRoleLabel::Ir,
+                ir,
+                Some(ir.provenance().illumination() == contracts::IlluminationProvenance::ActiveIr),
+            ),
+        ] {
+            if let Some(event) = diagnostic_stream_evidence_for(frame, role, active_ir) {
+                events.push(event);
+            }
+        }
+        events.push(TraceEventKind::Emitter {
+            // ActiveIr proves an emitter-lit capture, but not whether irlume
+            // displaced a control or the camera supplied its default. Do not
+            // overclaim `Applied`; that owner-specific fact remains inside the
+            // emitter guard.
+            outcome: EmitterTraceOutcome::AlreadyActive,
+        });
+        Ok(events)
+    }
+}
+
+/// Trace-only delivered-rate and continuity facts for one captured frame.
+/// This projection does not confer or validate a concurrent pair license; it
+/// exists so sequential and RGB-only diagnostics retain the same evidence.
+#[must_use]
+pub fn diagnostic_stream_evidence(
+    frame: &Frame,
+) -> Option<irlume_common::diagnostics::TraceEventKind> {
+    use irlume_common::diagnostics::CameraRoleLabel;
+
+    let role = match frame.provenance().binding().stream_role() {
+        contracts::StreamRole::Rgb => CameraRoleLabel::Rgb,
+        contracts::StreamRole::Ir => CameraRoleLabel::Ir,
+    };
+    let active_ir = (role == CameraRoleLabel::Ir).then_some(
+        frame.provenance().illumination() == contracts::IlluminationProvenance::ActiveIr,
+    );
+    diagnostic_stream_evidence_for(frame, role, active_ir)
+}
+
+fn diagnostic_stream_evidence_for(
+    frame: &Frame,
+    role: irlume_common::diagnostics::CameraRoleLabel,
+    active_ir: Option<bool>,
+) -> Option<irlume_common::diagnostics::TraceEventKind> {
+    use irlume_common::diagnostics::{ExactFraction, TraceEventKind};
+
+    let evidence = frame.provenance().rate_evidence();
+    let (delivered_num, delivered_den) = evidence.delivered();
+    let (floor_num, floor_den) = evidence.floor();
+    let delivered = u32::try_from(delivered_num)
+        .ok()
+        .zip(u32::try_from(delivered_den).ok())
+        .and_then(|(num, den)| ExactFraction::new(num, den).ok())?;
+    let minimum = ExactFraction::new(floor_num, floor_den).ok()?;
+    Some(TraceEventKind::StreamEvidence {
+        role,
+        delivered,
+        minimum,
+        dropped_frames: evidence.cumulative_drops(),
+        continuity_epoch: evidence.stream_epoch(),
+        active_ir,
+    })
 }
 
 /// Why a concurrent pair no longer satisfies its exact live license.
@@ -9905,6 +10053,8 @@ mod tests {
     fn runtime_pair_gate_accepts_only_the_exact_live_provenance_contract() {
         use contracts::{IlluminationProvenance, StreamRole};
         let contract = runtime_gate_contract();
+        assert_eq!(contract.rgb_generation(), 1);
+        assert_eq!(contract.ir_generation(), 1);
         let rgb = || {
             runtime_gate_frame(
                 StreamRole::Rgb,
@@ -10028,6 +10178,107 @@ mod tests {
             ),
             Err(RuntimePairViolation::ActiveIr)
         );
+    }
+
+    #[test]
+    fn diagnostic_trace_reports_exact_contract_rate_continuity_and_active_ir() {
+        use contracts::{IlluminationProvenance, StreamRole};
+        use irlume_common::diagnostics::{CameraRoleLabel, EmitterTraceOutcome, TraceEventKind};
+
+        let contract = runtime_gate_contract();
+        let rgb = runtime_gate_frame(
+            StreamRole::Rgb,
+            Spectrum::Rgb,
+            IlluminationProvenance::Unknown,
+            'a',
+            1,
+            *b"RGB3",
+            true,
+            false,
+        );
+        let ir = runtime_gate_frame(
+            StreamRole::Ir,
+            Spectrum::Ir,
+            IlluminationProvenance::ActiveIr,
+            'a',
+            1,
+            *b"GREY",
+            true,
+            false,
+        );
+        let events = contract.diagnostic_trace_events(&rgb, &ir).unwrap();
+        assert_eq!(events.len(), 5);
+        assert!(matches!(
+            &events[0],
+            TraceEventKind::StreamContract {
+                role: CameraRoleLabel::Rgb,
+                requested,
+                accepted,
+            } if requested.width == 4
+                && requested.height == 1
+                && requested.fourcc.as_bytes() == b"RGB3"
+                && accepted.interval.numerator.get() == 2
+                && accepted.interval.denominator.get() == 15
+        ));
+        assert!(matches!(
+            &events[3],
+            TraceEventKind::StreamEvidence {
+                role: CameraRoleLabel::Ir,
+                dropped_frames: 0,
+                continuity_epoch: 0,
+                active_ir: Some(true),
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[4],
+            TraceEventKind::Emitter {
+                outcome: EmitterTraceOutcome::AlreadyActive
+            }
+        ));
+
+        let wrong_generation = runtime_gate_frame(
+            StreamRole::Ir,
+            Spectrum::Ir,
+            IlluminationProvenance::ActiveIr,
+            'a',
+            2,
+            *b"GREY",
+            true,
+            false,
+        );
+        assert_eq!(
+            contract.diagnostic_trace_events(&rgb, &wrong_generation),
+            Err(RuntimePairViolation::CameraGeneration)
+        );
+    }
+
+    #[test]
+    fn diagnostic_stream_evidence_does_not_require_a_pair_license() {
+        use contracts::{IlluminationProvenance, StreamRole};
+        use irlume_common::diagnostics::{CameraRoleLabel, TraceEventKind};
+
+        let rgb = runtime_gate_frame(
+            StreamRole::Rgb,
+            Spectrum::Rgb,
+            IlluminationProvenance::Unknown,
+            'a',
+            1,
+            *b"RGB3",
+            true,
+            false,
+        );
+
+        assert!(matches!(
+            diagnostic_stream_evidence(&rgb),
+            Some(TraceEventKind::StreamEvidence {
+                role: CameraRoleLabel::Rgb,
+                dropped_frames: 0,
+                continuity_epoch: 0,
+                active_ir: None,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub(crate) mod test_support {
 }
 
 mod arbiter;
+mod diagnostics;
 mod users;
 
 /// Release checksums of the bundled models (models/SHA256SUMS, committed next
@@ -391,6 +392,7 @@ fn main() {
     // starting and falls through to the password.
     let engine_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+    let diagnostic_state = std::sync::Arc::new(diagnostics::DiagnosticState::default());
     {
         let arbiter = std::sync::Arc::clone(&arbiter);
         let engine_ready = std::sync::Arc::clone(&engine_ready);
@@ -815,12 +817,16 @@ fn main() {
                                 peer,
                                 reply,
                                 link,
+                                scope,
                             } = job.payload;
                             // The client left while this sat in the queue: never open
                             // the camera for an answer nobody is waiting for. Release
                             // the slot first, exactly as the normal path does, so the
                             // uid is not locked out of the camera.
                             if !link.claim() {
+                                scope.finish(
+                                    irlume_common::diagnostics::CategoricalOutcome::Cancelled,
+                                );
                                 arbiter.finish(job.class, job.uid);
                                 irlume_common::dlog!(
                                     "queued request dropped: its client disconnected first"
@@ -835,7 +841,7 @@ fn main() {
                             // unwind out of the worker and take down all face auth for
                             // every user.
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                dispatch(req, &peer, &mut engine)
+                                dispatch_scoped(req, &peer, &mut engine, &scope)
                             }));
                             // Release the slot before anything else can fail, so a
                             // panicking request cannot lock its uid out of the camera
@@ -892,6 +898,7 @@ fn main() {
                                     Response::Error("request failed".into())
                                 }
                             };
+                            scope.finish(categorical_outcome(&resp));
                             // The client may already be gone; its thread owns that.
                             let _ = reply.send(resp);
                             // Back to waiting for work: idle is healthy, and leaving the
@@ -1010,6 +1017,7 @@ fn main() {
                 }
                 let arbiter = std::sync::Arc::clone(&arbiter);
                 let engine_ready = std::sync::Arc::clone(&engine_ready);
+                let diagnostic_state = std::sync::Arc::clone(&diagnostic_state);
                 // A connection thread reads, parses and writes; it never touches
                 // the engine, so a panic in it is contained by the thread itself
                 // and the queued job (if any) is still completed and released by
@@ -1032,7 +1040,7 @@ fn main() {
                     .name("irlume-conn".into())
                     .spawn(move || {
                         let _slot = slot;
-                        if let Err(e) = serve(stream, &arbiter, &engine_ready) {
+                        if let Err(e) = serve(stream, &arbiter, &engine_ready, &diagnostic_state) {
                             eprintln!("irlumed: connection error: {e}");
                         }
                     })
@@ -1366,6 +1374,7 @@ struct Queued {
     reply: std::sync::mpsc::Sender<Response>,
     /// Lets the worker learn that this request's client has gone away.
     link: std::sync::Arc<ClientLink>,
+    scope: diagnostics::OperationScope,
 }
 
 /// The handshake between one connection thread and the camera worker, so work a
@@ -2043,6 +2052,7 @@ fn serve(
     stream: UnixStream,
     arbiter: &arbiter::Arbiter<Queued>,
     engine_ready: &std::sync::atomic::AtomicBool,
+    diagnostic_state: &diagnostics::DiagnosticState,
 ) -> std::io::Result<()> {
     let peer = peer_cred(&stream)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
@@ -2051,9 +2061,36 @@ fn serve(
         ReadOutcome::Closed => Ok(()),
         ReadOutcome::Bad => respond(stream, &Response::Error("bad request".into())),
         ReadOutcome::Req(req) => {
+            // A trace is a privileged, bounded observation stream, not a
+            // camera operation. Serve it on this connection thread before
+            // model readiness and before the arbiter so subscribing can never
+            // queue behind, cancel, or take ownership from authentication.
+            if let Request::TraceSubscribe { duration_ms } = &req {
+                if let Some(resp) = pregate(&req, &peer) {
+                    return respond(stream, &resp);
+                }
+                return serve_trace(stream, diagnostic_state, peer.uid, *duration_ms);
+            }
+            // The recent-event ring exists before model/camera startup and is
+            // intentionally independent of engine readiness. Keep this one
+            // status request useful during startup instead of replacing its
+            // evidence with the generic "still starting" response.
+            if matches!(req, Request::SupportSnapshot { .. }) {
+                if let Some(resp) = pregate(&req, &peer) {
+                    return respond(stream, &resp);
+                }
+                if let Some(resp) =
+                    dispatch_status_with_diagnostics(&req, &peer, Some(diagnostic_state))
+                {
+                    return respond(stream, &resp);
+                }
+            }
             // No engine yet means no worker to queue for.
             if !engine_ready.load(std::sync::atomic::Ordering::Acquire) {
                 return respond(stream, &dispatch_before_engine(req, &peer));
+            }
+            if let Some(resp) = pregate(&req, &peer) {
+                return respond(stream, &resp);
             }
             let class = arbiter::classify(&req);
             // Status is answered HERE, on the connection's own thread: it is
@@ -2068,10 +2105,13 @@ fn serve(
             // fail: the miss never reached the worker, so nothing ever
             // published, so every later listing missed too.
             if class == arbiter::Class::Status {
-                if let Some(resp) = dispatch_status(&req, &peer) {
+                if let Some(resp) =
+                    dispatch_status_with_diagnostics(&req, &peer, Some(diagnostic_state))
+                {
                     return respond(stream, &resp);
                 }
             }
+            let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
             let (reply, answer) = std::sync::mpsc::channel();
             let link = std::sync::Arc::new(ClientLink::default());
             let queued = Queued {
@@ -2079,6 +2119,7 @@ fn serve(
                 peer: peer.clone(),
                 reply,
                 link: std::sync::Arc::clone(&link),
+                scope: scope.clone(),
             };
             if let Err(refusal) = arbiter.submit(class, peer.uid, queued) {
                 // Refused, not queued: answer now so the client can retry rather
@@ -2086,6 +2127,7 @@ fn serve(
                 // so a client that spins on refusals throttles itself at accept
                 // time rather than costing a thread per attempt (#142).
                 record_refusal(peer.uid);
+                scope.finish(irlume_common::diagnostics::CategoricalOutcome::Unavailable);
                 return respond(stream, &Response::Error(refusal.message().into()));
             }
             // Wait for the worker, checking between slices whether the client is
@@ -2127,6 +2169,67 @@ fn serve(
             respond(stream, &resp)
         }
     }
+}
+
+fn serve_trace(
+    mut stream: UnixStream,
+    diagnostic_state: &diagnostics::DiagnosticState,
+    peer_uid: u32,
+    duration_ms: u64,
+) -> std::io::Result<()> {
+    let subscription = match diagnostic_state.subscribe_trace(peer_uid, duration_ms) {
+        Ok(subscription) => subscription,
+        Err(diagnostics::TraceSubscribeError::NotRoot) => {
+            return respond(
+                stream,
+                &Response::Error(format!("trace record requires root (peer uid {peer_uid})")),
+            );
+        }
+        Err(diagnostics::TraceSubscribeError::Busy) => {
+            return respond(
+                stream,
+                &Response::Error("a diagnostic trace is already active".into()),
+            );
+        }
+    };
+    write_json_line(
+        &mut stream,
+        &Response::TraceAccepted {
+            limits: subscription.limits(),
+        },
+    )?;
+
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(subscription.limits().duration_ms);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let wait = remaining.min(std::time::Duration::from_millis(250));
+        match subscription.recv_timeout(wait) {
+            Ok(record) => write_json_line(&mut stream, &record)?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // Stop producers first, then drain every record already assigned a
+    // sequence before appending the terminal records. This makes every file a
+    // contiguous, parser-valid prefix even when the channel was saturated.
+    let terminal = subscription.finish(irlume_common::diagnostics::CategoricalOutcome::Completed);
+    while let Ok(record) = subscription.recv_timeout(std::time::Duration::ZERO) {
+        write_json_line(&mut stream, &record)?;
+    }
+    for record in terminal {
+        write_json_line(&mut stream, &record)?;
+    }
+    stream.flush()
+}
+
+fn write_json_line<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *stream, value).map_err(std::io::Error::other)?;
+    stream.write_all(b"\n")
 }
 
 /// One parsed request line off the wire (see [`read_request`]).
@@ -2369,6 +2472,20 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: None,
             enrollment: Reads,
         },
+        SupportProbe { .. } => RequestPosture {
+            privilege: RootOnly {
+                command: "support-report --probe",
+            },
+            user: None,
+            enrollment: Reads,
+        },
+        TraceSubscribe { .. } => RequestPosture {
+            privilege: RootOnly {
+                command: "trace record",
+            },
+            user: None,
+            enrollment: Reads,
+        },
         // A dry run reads the camera's USB descriptors out of sysfs and sends
         // the device nothing, so it stays open to any peer (the arm charges it
         // the camera-probe interval); the real run writes camera firmware and
@@ -2391,13 +2508,17 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: user.as_deref(),
             enrollment: Reads,
         },
-        Ping | Health | Identify | ListCameras | CameraDiagnostics | CaptureModeStatus => {
-            RequestPosture {
-                privilege: AnyPeer,
-                user: None,
-                enrollment: Reads,
-            }
-        }
+        Ping
+        | Health
+        | Identify
+        | ListCameras
+        | CameraDiagnostics
+        | CaptureModeStatus
+        | SupportSnapshot { .. } => RequestPosture {
+            privilege: AnyPeer,
+            user: None,
+            enrollment: Reads,
+        },
     }
 }
 
@@ -2703,8 +2824,27 @@ fn note_unseal_password_refusal(uid: u32) {
 /// bad username or an unauthorized peer here whatever the request is: `serve`
 /// only routes status requests here, and `dispatch` wants that answer anyway.
 fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
+    dispatch_status_with_diagnostics(req, peer, None)
+}
+
+fn dispatch_status_with_diagnostics(
+    req: &Request,
+    peer: &Peer,
+    diagnostic_state: Option<&diagnostics::DiagnosticState>,
+) -> Option<Response> {
     if let Some(resp) = pregate(req, peer) {
         return Some(resp);
+    }
+    if let Request::SupportSnapshot { since_ms } = req {
+        return Some(match diagnostic_state {
+            Some(state) => Response::SupportSnapshot(Box::new(
+                state.snapshot(std::time::Duration::from_millis(*since_ms)),
+            )),
+            None => Response::OperationError {
+                code: irlume_common::OperationErrorCode::OperationFailed,
+                retryable: false,
+            },
+        });
     }
     let bits = engine_bits()
         .lock()
@@ -3033,7 +3173,82 @@ fn enroll_with_capture_probe(
     enroll()
 }
 
+fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::OperationClass {
+    use irlume_common::diagnostics::OperationClass;
+    use Request::*;
+    match req {
+        Authenticate { .. } | UnsealPassword { .. } | UnsealKeyring { .. } => {
+            OperationClass::Authentication
+        }
+        Enroll { .. } | AddScan { .. } | CaptureEarMedian { .. } | PositionSample { .. } => {
+            OperationClass::Enrollment
+        }
+        Identify => OperationClass::Identification,
+        TuneCaptureMode { .. } => OperationClass::CaptureQualification,
+        SupportProbe { .. } => OperationClass::SupportProbe,
+        SetupIrEmitter { .. }
+        | CaptureModeStatus
+        | SelfTest { .. }
+        | ListCameras
+        | CameraDiagnostics => OperationClass::CameraDiagnostics,
+        SetCameras { .. }
+        | ListProfiles { .. }
+        | DeleteProfile { .. }
+        | DeleteScan { .. }
+        | ForgetRecognizer { .. }
+        | RenameProfile { .. }
+        | RenameScan { .. }
+        | SetRequireEyesOpen { .. }
+        | SetClosureCalibration { .. }
+        | Ping
+        | Health
+        | SupportSnapshot { .. }
+        | TraceSubscribe { .. }
+        | SealPassword { .. }
+        | HasSealedPassword { .. }
+        | KeyringInfo { .. }
+        | ForgetPassword { .. }
+        | ReleaseTokenForDisarm { .. }
+        | ResealPassword { .. }
+        | RecoverySetup { .. }
+        | RecoveryRestore { .. }
+        | RecoveryStatus { .. }
+        | RecoveryForget { .. } => OperationClass::Status,
+    }
+}
+
+fn categorical_outcome(response: &Response) -> irlume_common::diagnostics::CategoricalOutcome {
+    use irlume_common::diagnostics::{CategoricalOutcome, ProbeOutcome};
+    match response {
+        Response::AuthResult { granted: true, .. } => CategoricalOutcome::Granted,
+        Response::AuthResult { granted: false, .. } => CategoricalOutcome::Denied,
+        Response::SupportProbe(result) => match result.outcome {
+            ProbeOutcome::Captured
+            | ProbeOutcome::FallbackCaptured
+            | ProbeOutcome::RgbOnlyCaptured => CategoricalOutcome::Completed,
+            ProbeOutcome::Unavailable => CategoricalOutcome::Unavailable,
+            ProbeOutcome::Failed => CategoricalOutcome::Failed,
+        },
+        Response::Error(_) | Response::OperationError { .. } => CategoricalOutcome::Failed,
+        _ => CategoricalOutcome::Completed,
+    }
+}
+
+#[cfg(test)]
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
+    let state = diagnostics::DiagnosticState::default();
+    let scope = state.begin(diagnostic_operation_class(&req));
+    let response = dispatch_scoped(req, peer, engine, &scope);
+    scope.finish(categorical_outcome(&response));
+    response
+}
+
+fn dispatch_scoped(
+    req: Request,
+    peer: &Peer,
+    engine: &mut irlume_auth::Engine,
+    scope: &diagnostics::OperationScope,
+) -> Response {
     // Status requests are normally answered on the connection thread and
     // never reach here; delegating keeps this dispatch total (and identical
     // in behavior) if one is ever submitted anyway. The pregate rides inside.
@@ -3093,9 +3308,21 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         Request::Ping
         | Request::Health
         | Request::HasSealedPassword { .. }
-        | Request::RecoveryStatus { .. } => {
+        | Request::RecoveryStatus { .. }
+        | Request::SupportSnapshot { .. }
+        | Request::TraceSubscribe { .. } => {
             Response::Error("status request routed past its handler".into())
         }
+        Request::SupportProbe { since_ms } => match engine.support_probe(scope) {
+            Ok(mut result) => {
+                result.snapshot = scope.snapshot(std::time::Duration::from_millis(since_ms));
+                Response::SupportProbe(Box::new(result))
+            }
+            Err(_) => Response::OperationError {
+                code: irlume_common::OperationErrorCode::OperationFailed,
+                retryable: false,
+            },
+        },
         Request::KeyringInfo { user } => {
             let armed = irlume_core::keyring::has_sealed_password(&user);
             let path = irlume_core::keyring::envelope_path(&user);
@@ -3258,7 +3485,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
-            match engine.authenticate(&user, service.as_deref()) {
+            match engine.authenticate_with_diagnostics(&user, service.as_deref(), scope) {
                 Ok(o) => {
                     rate_record(&user, o.granted, !irlume_auth::presence_retryable(&o));
                     if convenience || irlume_common::dbglog::on() {
@@ -3420,9 +3647,13 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         ProbeStore::AutomaticIfAbsent,
                     )
                 },
-                || match engine.enroll_profile_with_ir_preflight(&user, profile, want, || {
-                    prepare_enrollment_ir(&ir_dev)
-                }) {
+                || match engine.enroll_profile_with_ir_preflight_and_diagnostics(
+                    &user,
+                    profile,
+                    want,
+                    || prepare_enrollment_ir(&ir_dev),
+                    scope,
+                ) {
                     Ok(outcome) => enroll_response(outcome),
                     Err(e) => Response::Error(e.to_string()),
                 },
@@ -3688,7 +3919,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     ));
                 }
             }
-            do_unseal_password(&user, service.as_deref(), engine)
+            do_unseal_password_scoped(&user, service.as_deref(), engine, scope)
         }
         Request::UnsealKeyring {
             user,
@@ -4222,10 +4453,22 @@ fn credential_release_purpose() -> irlume_auth::AuthenticationPurpose {
 /// (docs/PAD_SELFTEST.md), which is why this path additionally requires the
 /// temporal consent gesture by default. We log the decision + cosine score, but
 /// never the password or its length.
+#[cfg(test)]
 fn do_unseal_password(
     user: &str,
     service: Option<&str>,
     engine: &mut irlume_auth::Engine,
+) -> Response {
+    let state = diagnostics::DiagnosticState::default();
+    let scope = state.begin(irlume_common::diagnostics::OperationClass::Authentication);
+    do_unseal_password_scoped(user, service, engine, &scope)
+}
+
+fn do_unseal_password_scoped(
+    user: &str,
+    service: Option<&str>,
+    engine: &mut irlume_auth::Engine,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
 ) -> Response {
     eprintln!("irlumed: UnsealPassword: attempt for '{user}'");
     let t = std::time::Instant::now();
@@ -4239,7 +4482,12 @@ fn do_unseal_password(
     if rate_limited(user) {
         return Response::Error("too many recent face attempts; use your password".into());
     }
-    let outcome = match engine.authenticate_for(user, service, credential_release_purpose()) {
+    let outcome = match engine.authenticate_for_with_diagnostics(
+        user,
+        service,
+        credential_release_purpose(),
+        diagnostics,
+    ) {
         Ok(o) => o,
         Err(e) => {
             // A PCR-drift here is the ENROLLED-TEMPLATE key failing to unseal (it
@@ -5044,9 +5292,23 @@ mod tests {
         ready: &std::sync::atomic::AtomicBool,
         client: impl FnOnce(&UnixStream) -> R,
     ) -> R {
+        with_serve_and_diagnostics(
+            arbiter,
+            ready,
+            &diagnostics::DiagnosticState::default(),
+            client,
+        )
+    }
+
+    fn with_serve_and_diagnostics<R>(
+        arbiter: &arbiter::Arbiter<Queued>,
+        ready: &std::sync::atomic::AtomicBool,
+        diagnostic_state: &diagnostics::DiagnosticState,
+        client: impl FnOnce(&UnixStream) -> R,
+    ) -> R {
         std::thread::scope(|scope| {
             let (ours, theirs) = UnixStream::pair().unwrap();
-            let server = scope.spawn(|| serve(theirs, arbiter, ready).unwrap());
+            let server = scope.spawn(|| serve(theirs, arbiter, ready, diagnostic_state).unwrap());
             let out = client(&ours);
             // Dropped before the join so the server reads EOF rather than
             // waiting out the socket timeout. On the panic path the scope
@@ -5114,10 +5376,11 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 3] = [
+        let sources: [(&str, &str); 4] = [
             ("main.rs", include_str!("main.rs")),
             ("users.rs", include_str!("users.rs")),
             ("arbiter.rs", include_str!("arbiter.rs")),
+            ("diagnostics.rs", include_str!("diagnostics.rs")),
         ];
         // The calls that end in glibc's getpwnam_r/getpwuid_r. `serve(` is
         // here because it REACHES them: `dispatch_status`/`dispatch_before_engine`
@@ -5514,6 +5777,9 @@ mod tests {
         Ping => Request::Ping,
         Health => Request::Health,
         CameraDiagnostics => Request::CameraDiagnostics,
+        SupportSnapshot => Request::SupportSnapshot { since_ms: 60_000 },
+        SupportProbe => Request::SupportProbe { since_ms: 60_000 },
+        TraceSubscribe => Request::TraceSubscribe { duration_ms: 60_000 },
         // The user-bearing form, so the traversal walk covers it.
         PositionSample => Request::PositionSample { user: Some(u()) },
         SealPassword => Request::SealPassword {
@@ -5621,6 +5887,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn support_snapshot_is_read_only_and_probe_is_root_only() {
+        let snapshot = posture(&Request::SupportSnapshot { since_ms: 60_000 });
+        assert_eq!(snapshot.privilege, Privilege::AnyPeer);
+        assert_eq!(snapshot.user, None);
+        assert_eq!(snapshot.enrollment, EnrollmentEffect::Reads);
+
+        let probe = posture(&Request::SupportProbe { since_ms: 60_000 });
+        assert!(matches!(probe.privilege, Privilege::RootOnly { .. }));
+        assert_eq!(probe.user, None);
+        assert_eq!(probe.enrollment, EnrollmentEffect::Reads);
     }
 
     #[test]
@@ -6023,6 +6302,7 @@ mod tests {
         // narrow scope was avoiding; readers overlap each other.
         let _passwd = passwd_lock();
         let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let diagnostic_state = diagnostics::DiagnosticState::default();
         // Wedge: an authentication sits queued forever (no worker exists).
         let (dead_reply, _keep) = std::sync::mpsc::channel();
         arbiter
@@ -6038,6 +6318,8 @@ mod tests {
                     },
                     reply: dead_reply,
                     link: std::sync::Arc::new(ClientLink::default()),
+                    scope: diagnostic_state
+                        .begin(irlume_common::diagnostics::OperationClass::Authentication),
                 },
             )
             .unwrap();
@@ -6076,6 +6358,37 @@ mod tests {
             });
             assert!(check(&resp), "wedged queue must not delay status: {resp:?}");
         }
+    }
+
+    #[test]
+    fn support_snapshot_answers_from_memory_without_worker_or_camera() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let arbiter = arbiter::Arbiter::<Queued>::new();
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let diagnostic_state = diagnostics::DiagnosticState::default();
+        let seeded =
+            diagnostic_state.begin(irlume_common::diagnostics::OperationClass::Authentication);
+        seeded.emit(
+            irlume_common::diagnostics::ShareSafeEventKind::CaptureScheduleSelected {
+                schedule: irlume_common::diagnostics::CaptureSchedule::Sequential,
+                source: irlume_common::diagnostics::CaptureScheduleSource::SequentialDefault,
+            },
+        );
+
+        let response = with_serve_and_diagnostics(&arbiter, &ready, &diagnostic_state, |client| {
+            (&*client)
+                .write_all(b"{\"SupportSnapshot\":{\"since_ms\":60000}}\n")
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(client).read_line(&mut line).unwrap();
+            serde_json::from_str::<Response>(line.trim()).unwrap()
+        });
+        let Response::SupportSnapshot(snapshot) = response else {
+            panic!("expected in-memory support snapshot");
+        };
+        assert_eq!(snapshot.events().len(), 1);
+        arbiter.close();
+        assert!(arbiter.take().is_none(), "snapshot must never queue");
     }
 
     #[test]
@@ -6152,6 +6465,7 @@ mod tests {
                 user: u(),
                 structured_errors: false,
             },
+            Request::SupportSnapshot { since_ms: 60_000 },
         ] {
             assert_eq!(classify(&req), Class::Status, "{req:?}");
         }
@@ -6397,6 +6711,7 @@ mod tests {
         // itself, without the request ever reaching the camera. If this only
         // worked because a worker drained the queue, the test would hang here.
         let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let diagnostic_state = diagnostics::DiagnosticState::default();
         let (_dead_reply, _) = std::sync::mpsc::channel();
         arbiter
             .submit(
@@ -6411,6 +6726,8 @@ mod tests {
                     },
                     reply: _dead_reply,
                     link: std::sync::Arc::new(ClientLink::default()),
+                    scope: diagnostic_state
+                        .begin(irlume_common::diagnostics::OperationClass::Authentication),
                 },
             )
             .unwrap();
@@ -6518,6 +6835,60 @@ mod tests {
             }
             other => panic!("expected PasswordUnsealed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn trace_stream_acknowledges_bounds_then_emits_a_complete_parseable_jsonl_trace() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let state = diagnostics::DiagnosticState::default();
+        let limits = irlume_common::diagnostics::TraceLimits::bounded(1);
+        let thread = std::thread::spawn(move || serve_trace(server, &state, 0, 1).unwrap());
+
+        let mut payload = String::new();
+        client.read_to_string(&mut payload).unwrap();
+        thread.join().unwrap();
+        let (accepted, trace) = payload.split_once('\n').unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Response>(accepted).unwrap(),
+            Response::TraceAccepted { limits: actual } if actual == limits
+        ));
+        let parsed = irlume_common::diagnostics::parse_trace(
+            std::io::BufReader::new(trace.as_bytes()),
+            limits,
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.records().first(),
+            Some(irlume_common::diagnostics::TraceRecord {
+                event: irlume_common::diagnostics::TraceEventKind::TraceStarted { .. },
+                ..
+            })
+        ));
+        assert!(parsed.records().last().unwrap().terminal);
+    }
+
+    #[test]
+    fn trace_correlation_ignores_a_client_supplied_operation_id() {
+        let mut wire = serde_json::to_value(Request::Authenticate {
+            user: "carol".into(),
+            service: Some("sudo".into()),
+        })
+        .unwrap();
+        wire.get_mut("Authenticate")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .insert(
+                "operation_id".into(),
+                serde_json::Value::String("01010101010101010101010101010101".into()),
+            );
+        let request: Request = serde_json::from_value(wire).unwrap();
+        let state = diagnostics::DiagnosticState::default();
+        let scope = state.begin(diagnostic_operation_class(&request));
+        assert_ne!(scope.operation_id().as_bytes(), &[1; 16]);
+        assert_eq!(
+            scope.operation_class(),
+            irlume_common::diagnostics::OperationClass::Authentication
+        );
     }
 
     /// Idle is healthy, work in flight is healthy while it reports progress, and
@@ -7214,6 +7585,39 @@ mod tests {
         })
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn root_support_probe_executes_and_returns_bounded_categorical_evidence() {
+        use irlume_common::diagnostics::{ProbeOutcome, ShareSafeEventKind};
+        let _g = env_lock();
+        let mut engine = engine();
+        let state = diagnostics::DiagnosticState::default();
+        let scope = state.begin(irlume_common::diagnostics::OperationClass::SupportProbe);
+        let root = Peer {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+
+        let response = dispatch_scoped(
+            Request::SupportProbe { since_ms: 60_000 },
+            &root,
+            &mut engine,
+            &scope,
+        );
+
+        let Response::SupportProbe(result) = response else {
+            panic!("root support probe did not return its typed response");
+        };
+        assert!(matches!(
+            result.outcome,
+            ProbeOutcome::Unavailable | ProbeOutcome::Failed
+        ));
+        assert!(result.snapshot.events().iter().any(|event| matches!(
+            event.kind,
+            ShareSafeEventKind::CaptureScheduleSelected { .. }
+        )));
     }
 
     /// Isolated state/config/keyring/template-key/recovery dirs plus a method

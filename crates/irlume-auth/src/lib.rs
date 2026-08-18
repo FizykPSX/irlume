@@ -322,6 +322,7 @@ fn enrollment_ir_enabled(ir_available: bool, force_rgb_only: bool) -> bool {
 struct EnrollmentCapturePolicy<'a> {
     mode: &'a CaptureModeSelection,
     use_ir: bool,
+    diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
 }
 
 /// What one add-scan capture stored, with everything the daemon's reply
@@ -658,6 +659,40 @@ fn liveness_deny_kind(verdict: Verdict, reason: &str) -> OutcomeKind {
     }
 }
 
+fn emit_trace_stage_ms(
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    stage: irlume_common::diagnostics::TraceStage,
+    elapsed_ms: u128,
+) {
+    diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+        stage,
+        elapsed_us: u64::try_from(elapsed_ms)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(1_000),
+    });
+}
+
+fn emit_trace_match(
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    metric: irlume_common::diagnostics::TraceMetric,
+    score: f32,
+    threshold: f32,
+    matched: bool,
+) {
+    use irlume_common::diagnostics::{TraceEventKind, TraceMeasurement, TraceVerdict};
+    let measurements = TraceMeasurement::new(metric, f64::from(score), Some(f64::from(threshold)))
+        .into_iter()
+        .collect();
+    diagnostics.emit_trace(TraceEventKind::Decision {
+        verdict: if matched {
+            TraceVerdict::Match
+        } else {
+            TraceVerdict::NoMatch
+        },
+        measurements,
+    });
+}
+
 /// Which gestures a consent mode permits: `(nod, closure)`.
 ///
 /// Extracted so the decision can be tested. It is written as POSITIVE
@@ -866,6 +901,8 @@ struct CaptureModeSelection {
     source: &'static str,
     runtime_key: Option<String>,
     runtime_contract: Option<irlume_camera::RuntimePairContract>,
+    qualification_state: irlume_common::diagnostics::QualificationState,
+    qualification_reason: Option<irlume_common::diagnostics::QualificationReason>,
     operation_demoted: std::cell::Cell<bool>,
 }
 
@@ -978,6 +1015,7 @@ struct AuthenticationCaptureContext<'a> {
     mode: Option<&'a CaptureModeSelection>,
     operation: Option<&'a irlume_camera::lease::CameraOperationSession>,
     held_pair_failed: Option<&'a mut bool>,
+    diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
 }
 
 enum CapturePathError {
@@ -1014,6 +1052,10 @@ fn unavailable_capture_mode_selection() -> CaptureModeSelection {
         source,
         runtime_key: None,
         runtime_contract: None,
+        qualification_state: irlume_common::diagnostics::QualificationState::Unreadable,
+        qualification_reason: Some(
+            irlume_common::diagnostics::QualificationReason::StoreUnreadable,
+        ),
         operation_demoted: std::cell::Cell::new(false),
     }
 }
@@ -1021,6 +1063,14 @@ fn unavailable_capture_mode_selection() -> CaptureModeSelection {
 fn capture_mode_selection(
     rgb_camera: &irlume_camera::RgbCamera,
     ir_camera: &irlume_camera::IrCamera,
+) -> CaptureModeSelection {
+    capture_mode_selection_with_diagnostics(rgb_camera, ir_camera, &())
+}
+
+fn capture_mode_selection_with_diagnostics(
+    rgb_camera: &irlume_camera::RgbCamera,
+    ir_camera: &irlume_camera::IrCamera,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
 ) -> CaptureModeSelection {
     let runtime_contract =
         match irlume_camera::runtime_pair_contract_from_cameras(rgb_camera, ir_camera) {
@@ -1032,22 +1082,14 @@ fn capture_mode_selection(
                 return unavailable_capture_mode_selection();
             }
         };
-    if let Ok(value) = std::env::var("IRLUME_SEQUENTIAL_CAPTURE") {
-        let (sequential, source) = capture_mode_decision(Some(&value), None);
-        return CaptureModeSelection {
-            sequential,
-            source,
-            runtime_key: None,
-            runtime_contract: Some(runtime_contract),
-            operation_demoted: std::cell::Cell::new(false),
-        };
-    }
-
-    let (stored, runtime_key) = match irlume_camera::stored_capture_qualification_state_from_cameras(
-        rgb_camera, ir_camera,
-    ) {
-        Ok(state) => {
-            let stored = match state.resolution {
+    let (stored, runtime_key, qualification_state, qualification_reason) =
+        match irlume_camera::stored_capture_qualification_state_from_cameras(rgb_camera, ir_camera)
+        {
+            Ok(state) => {
+                diagnostics.emit_share_safe(diagnostic_qualification_event(&state));
+                let (qualification_state, qualification_reason) =
+                    diagnostic_qualification_state(&state);
+                let stored = match state.resolution {
                     irlume_camera::capture_qualification::QualificationResolution::ConcurrentQualified => {
                         Some(irlume_camera::CaptureMode::Concurrent)
                     }
@@ -1058,16 +1100,35 @@ fn capture_mode_selection(
                         _,
                     ) => None,
                 };
-            (stored, Some(state.runtime_key))
-        }
-        Err(error) => {
-            irlume_common::dlog!(
-                "capture qualification unreadable ({error}); selecting one-at-a-time capture"
-            );
-            (None, None)
-        }
-    };
-    let selected = capture_mode_decision(None, stored);
+                (
+                    stored,
+                    Some(state.runtime_key),
+                    qualification_state,
+                    qualification_reason,
+                )
+            }
+            Err(error) => {
+                diagnostics.emit_share_safe(
+                    irlume_common::diagnostics::ShareSafeEventKind::QualificationChanged {
+                        state: irlume_common::diagnostics::QualificationState::Unreadable,
+                        reason: Some(
+                            irlume_common::diagnostics::QualificationReason::StoreUnreadable,
+                        ),
+                    },
+                );
+                irlume_common::dlog!(
+                    "capture qualification unreadable ({error}); selecting one-at-a-time capture"
+                );
+                (
+                    None,
+                    None,
+                    irlume_common::diagnostics::QualificationState::Unreadable,
+                    Some(irlume_common::diagnostics::QualificationReason::StoreUnreadable),
+                )
+            }
+        };
+    let env = std::env::var("IRLUME_SEQUENTIAL_CAPTURE").ok();
+    let selected = capture_mode_decision(env.as_deref(), stored);
     let selected = with_runtime_capture_health(|health| {
         apply_runtime_capture_health(selected, runtime_key.as_deref(), health)
     });
@@ -1076,6 +1137,8 @@ fn capture_mode_selection(
         source: selected.1,
         runtime_key,
         runtime_contract: Some(runtime_contract),
+        qualification_state,
+        qualification_reason,
         operation_demoted: std::cell::Cell::new(false),
     }
 }
@@ -1403,6 +1466,271 @@ fn concurrent_pair_degradation(
     )
 }
 
+fn diagnostic_runtime_violation(
+    degradation: RuntimeDegradation,
+) -> irlume_common::diagnostics::RuntimeViolationLabel {
+    use irlume_common::diagnostics::RuntimeViolationLabel as Label;
+    match degradation {
+        RuntimeDegradation::ConcurrentCaptureFailure => Label::ConcurrentCaptureFailure,
+        RuntimeDegradation::PairArmFailure => Label::PairArmFailure,
+        RuntimeDegradation::PairRateEstablishmentFailure => Label::PairRateEstablishmentFailure,
+        RuntimeDegradation::StreamRecovery => Label::StreamRecovery,
+        RuntimeDegradation::MissingRuntimeContract => Label::MissingRuntimeContract,
+        RuntimeDegradation::CameraGenerationChanged => Label::CameraGenerationChanged,
+        RuntimeDegradation::StreamContractMismatch => Label::StreamContractMismatch,
+        RuntimeDegradation::DeliveredRateShortfall => Label::DeliveredRateShortfall,
+        RuntimeDegradation::ContinuityLoss => Label::ContinuityLoss,
+        RuntimeDegradation::ActiveIrMissing => Label::ActiveIrMissing,
+        RuntimeDegradation::ConfirmedSignalLoss => Label::ConfirmedSignalLoss,
+    }
+}
+
+fn emit_capture_schedule(
+    selection: &CaptureModeSelection,
+    ir_available: bool,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+) {
+    use irlume_common::diagnostics::ShareSafeEventKind;
+    let (schedule, source) = diagnostic_capture_schedule(selection, ir_available);
+    diagnostics.emit_share_safe(ShareSafeEventKind::CaptureScheduleSelected { schedule, source });
+}
+
+fn diagnostic_capture_schedule(
+    selection: &CaptureModeSelection,
+    ir_available: bool,
+) -> (
+    irlume_common::diagnostics::CaptureSchedule,
+    irlume_common::diagnostics::CaptureScheduleSource,
+) {
+    use irlume_common::diagnostics::{CaptureSchedule, CaptureScheduleSource};
+    let schedule = if selection.is_sequential() {
+        CaptureSchedule::Sequential
+    } else {
+        CaptureSchedule::Concurrent
+    };
+    let source = if !ir_available {
+        CaptureScheduleSource::NoIrPair
+    } else {
+        match selection.active_source() {
+            ENV_CAPTURE_MODE_SOURCE => CaptureScheduleSource::EnvironmentOverride,
+            STORED_CAPTURE_MODE_SOURCE => CaptureScheduleSource::StoredQualification,
+            RUNTIME_CAPTURE_MODE_SOURCE => CaptureScheduleSource::RuntimeHealth,
+            _ => CaptureScheduleSource::SequentialDefault,
+        }
+    };
+    (schedule, source)
+}
+
+fn diagnostic_qualification_event(
+    state: &irlume_camera::StoredCaptureQualificationState,
+) -> irlume_common::diagnostics::ShareSafeEventKind {
+    let (state_label, reason) = diagnostic_qualification_state(state);
+    irlume_common::diagnostics::ShareSafeEventKind::QualificationChanged {
+        state: state_label,
+        reason,
+    }
+}
+
+fn diagnostic_qualification_state(
+    state: &irlume_camera::StoredCaptureQualificationState,
+) -> (
+    irlume_common::diagnostics::QualificationState,
+    Option<irlume_common::diagnostics::QualificationReason>,
+) {
+    use irlume_camera::capture_qualification::QualificationMismatch;
+    use irlume_common::diagnostics::{QualificationReason as Reason, QualificationState as State};
+    match state.resolution {
+        QualificationResolution::ConcurrentQualified => (State::QualifiedConcurrent, None),
+        QualificationResolution::SequentialRequired(reason) => (
+            State::MeasuredSequential,
+            Some(match reason {
+                SequentialReason::ConcurrentUnavailable => Reason::ConcurrentUnavailable,
+                SequentialReason::DeliveredRateShortfall => Reason::DeliveredRateShortfall,
+                SequentialReason::SignalLoss => Reason::SignalLoss,
+                SequentialReason::InvalidProvenance => Reason::InvalidProvenance,
+            }),
+        ),
+        QualificationResolution::Unqualified(QualificationMismatch::ContextChanged) => (
+            State::UnqualifiedContextChanged,
+            Some(Reason::ContextChanged),
+        ),
+        QualificationResolution::Unqualified(QualificationMismatch::NoAuthority) => {
+            match state.last_attempt_outcome {
+                Some(AttemptOutcome::Inconclusive(reason)) => (
+                    State::Inconclusive,
+                    Some(match reason {
+                        InconclusiveReason::IncompleteRounds => Reason::IncompleteRounds,
+                        InconclusiveReason::DimScene => Reason::DimScene,
+                        InconclusiveReason::ContractDrift => Reason::ContractDrift,
+                        InconclusiveReason::MissingProvenance => Reason::MissingProvenance,
+                    }),
+                ),
+                _ => (
+                    State::UnqualifiedNoAuthority,
+                    Some(Reason::NoStoredAuthority),
+                ),
+            }
+        }
+    }
+}
+
+fn emit_capture_context(
+    selection: &CaptureModeSelection,
+    ir_available: bool,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+) {
+    use irlume_common::diagnostics::{
+        CameraRoleLabel, CaptureStatus, DigestToken, QualificationState, ShareSafeEventKind,
+    };
+    emit_capture_schedule(selection, ir_available, diagnostics);
+    if let Some(contract) = selection.runtime_contract.as_ref() {
+        if let (Ok(cameras), Ok(runtime_context)) = (
+            contract.diagnostic_camera_contexts(),
+            DigestToken::from_sha256_hex(contract.runtime_key()),
+        ) {
+            let qualification_context = cameras[0].qualification_token;
+            let runtime_degradation = selection.runtime_key.as_deref().and_then(|key| {
+                with_runtime_capture_health(|health| health.degradation(key))
+                    .map(diagnostic_runtime_violation)
+            });
+            let (schedule, source) = diagnostic_capture_schedule(selection, ir_available);
+            diagnostics.publish_support_context(
+                CaptureStatus {
+                    schedule,
+                    source,
+                    runtime_context: Some(runtime_context),
+                    qualification_state: selection.qualification_state,
+                    qualification_reason: selection.qualification_reason,
+                    qualification_context,
+                    runtime_degradation,
+                },
+                cameras.into(),
+            );
+        }
+        diagnostics.emit_share_safe(ShareSafeEventKind::LifecycleChanged {
+            role: CameraRoleLabel::Rgb,
+            generation: contract.rgb_generation(),
+        });
+        diagnostics.emit_share_safe(ShareSafeEventKind::LifecycleChanged {
+            role: CameraRoleLabel::Ir,
+            generation: contract.ir_generation(),
+        });
+    }
+    if !ir_available {
+        diagnostics.emit_share_safe(ShareSafeEventKind::QualificationChanged {
+            state: QualificationState::NoIrPair,
+            reason: None,
+        });
+    }
+}
+
+fn publish_rgb_only_support_context(
+    camera: irlume_common::diagnostics::SanitizedCameraContext,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+) {
+    use irlume_common::diagnostics::{
+        CaptureSchedule, CaptureScheduleSource, CaptureStatus, QualificationState,
+    };
+    diagnostics.publish_support_context(
+        CaptureStatus {
+            schedule: CaptureSchedule::Sequential,
+            source: CaptureScheduleSource::NoIrPair,
+            runtime_context: None,
+            qualification_state: QualificationState::NoIrPair,
+            qualification_reason: None,
+            qualification_context: None,
+            runtime_degradation: None,
+        },
+        vec![camera],
+    );
+}
+
+fn emit_capture_fallback(
+    degradation: RuntimeDegradation,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+) {
+    diagnostics.emit_share_safe(
+        irlume_common::diagnostics::ShareSafeEventKind::CaptureFallback {
+            reason: diagnostic_runtime_violation(degradation),
+        },
+    );
+}
+
+struct SupportProbeSink<'a> {
+    upstream: &'a dyn irlume_common::diagnostics::DiagnosticSink,
+    fallback: std::sync::Mutex<Option<irlume_common::diagnostics::RuntimeViolationLabel>>,
+}
+
+impl<'a> SupportProbeSink<'a> {
+    fn new(upstream: &'a dyn irlume_common::diagnostics::DiagnosticSink) -> Self {
+        Self {
+            upstream,
+            fallback: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn fallback(&self) -> Option<irlume_common::diagnostics::RuntimeViolationLabel> {
+        *self
+            .fallback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl irlume_common::diagnostics::DiagnosticSink for SupportProbeSink<'_> {
+    fn emit_share_safe(&self, kind: irlume_common::diagnostics::ShareSafeEventKind) {
+        if let irlume_common::diagnostics::ShareSafeEventKind::CaptureFallback { reason } = &kind {
+            let mut fallback = self
+                .fallback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if fallback.is_none() {
+                *fallback = Some(*reason);
+            }
+            drop(fallback);
+        }
+        self.upstream.emit_share_safe(kind);
+    }
+
+    fn emit_trace(&self, kind: irlume_common::diagnostics::TraceEventKind) {
+        self.upstream.emit_trace(kind);
+    }
+
+    fn publish_support_context(
+        &self,
+        capture: irlume_common::diagnostics::CaptureStatus,
+        cameras: Vec<irlume_common::diagnostics::SanitizedCameraContext>,
+    ) {
+        self.upstream.publish_support_context(capture, cameras);
+    }
+}
+
+fn support_probe_result(
+    schedule: irlume_common::diagnostics::CaptureSchedule,
+    source: irlume_common::diagnostics::CaptureScheduleSource,
+    outcome: irlume_common::diagnostics::ProbeOutcome,
+    fallback_reason: Option<irlume_common::diagnostics::RuntimeViolationLabel>,
+    rgb: irlume_common::diagnostics::ProbeRoleOutcome,
+    ir: irlume_common::diagnostics::ProbeRoleOutcome,
+) -> irlume_common::diagnostics::SupportProbeResult {
+    irlume_common::diagnostics::SupportProbeResult {
+        snapshot: irlume_common::diagnostics::SupportSnapshot::bounded(
+            0,
+            0,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+        schedule,
+        source,
+        outcome,
+        fallback_reason,
+        rgb,
+        ir,
+    }
+}
+
 /// Consecutive dimming self-heals on one camera pairing before irlume stops
 /// asking that pairing to capture concurrently (#100).
 ///
@@ -1594,6 +1922,36 @@ mod capture_mode_decision_tests {
 mod capture_mode_switch_tests {
     use super::*;
     use irlume_camera::CaptureMode;
+    use irlume_common::diagnostics::{
+        CaptureSchedule, CaptureScheduleSource, DiagnosticSink, QualificationReason,
+        QualificationState, RuntimeViolationLabel, ShareSafeEventKind, TraceEventKind, TraceMetric,
+        TraceVerdict,
+    };
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<ShareSafeEventKind>>);
+
+    impl DiagnosticSink for RecordingSink {
+        fn emit_share_safe(&self, kind: ShareSafeEventKind) {
+            self.0.lock().unwrap().push(kind);
+        }
+    }
+
+    impl RecordingSink {
+        fn events(&self) -> Vec<ShareSafeEventKind> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct TraceRecordingSink(Mutex<Vec<TraceEventKind>>);
+
+    impl DiagnosticSink for TraceRecordingSink {
+        fn emit_trace(&self, kind: TraceEventKind) {
+            self.0.lock().unwrap().push(kind);
+        }
+    }
 
     #[test]
     fn runtime_degradation_is_process_local_and_exact_context_scoped() {
@@ -1616,6 +1974,23 @@ mod capture_mode_switch_tests {
             qualified,
             "a failure on one exact USB context must not demote another"
         );
+    }
+
+    #[test]
+    fn match_trace_uses_the_exact_score_threshold_and_authoritative_verdict() {
+        let sink = TraceRecordingSink::default();
+        emit_trace_match(&sink, TraceMetric::MatchCosine, 0.61, 0.64, false);
+        let events = sink.0.lock().unwrap();
+        assert!(matches!(
+            &events[..],
+            [TraceEventKind::Decision {
+                verdict: TraceVerdict::NoMatch,
+                measurements,
+            }] if measurements.len() == 1
+                && measurements[0].metric == TraceMetric::MatchCosine
+                && measurements[0].value == 0.61_f32 as f64
+                && measurements[0].threshold == Some(0.64_f32 as f64)
+        ));
     }
 
     #[test]
@@ -1653,6 +2028,112 @@ mod capture_mode_switch_tests {
     }
 
     #[test]
+    fn schedule_event_uses_the_resolved_operation_snapshot() {
+        let sink = RecordingSink::default();
+        let selection = CaptureModeSelection {
+            sequential: false,
+            source: STORED_CAPTURE_MODE_SOURCE,
+            runtime_key: Some("dock-a".into()),
+            runtime_contract: None,
+            qualification_state: QualificationState::QualifiedConcurrent,
+            qualification_reason: None,
+            operation_demoted: std::cell::Cell::new(false),
+        };
+
+        emit_capture_schedule(&selection, true, &sink);
+
+        assert_eq!(
+            sink.events(),
+            vec![ShareSafeEventKind::CaptureScheduleSelected {
+                schedule: CaptureSchedule::Concurrent,
+                source: CaptureScheduleSource::StoredQualification,
+            }]
+        );
+    }
+
+    #[test]
+    fn runtime_violation_event_preserves_the_exact_validator_cause() {
+        let sink = RecordingSink::default();
+
+        emit_capture_fallback(RuntimeDegradation::DeliveredRateShortfall, &sink);
+
+        assert_eq!(
+            sink.events(),
+            vec![ShareSafeEventKind::CaptureFallback {
+                reason: RuntimeViolationLabel::DeliveredRateShortfall,
+            }]
+        );
+    }
+
+    #[test]
+    fn qualification_mismatch_event_preserves_context_change() {
+        let stored = irlume_camera::StoredCaptureQualificationState {
+            resolution: QualificationResolution::Unqualified(
+                irlume_camera::capture_qualification::QualificationMismatch::ContextChanged,
+            ),
+            runtime_key: "context".into(),
+            last_attempt_outcome: None,
+        };
+
+        assert_eq!(
+            diagnostic_qualification_event(&stored),
+            ShareSafeEventKind::QualificationChanged {
+                state: QualificationState::UnqualifiedContextChanged,
+                reason: Some(QualificationReason::ContextChanged),
+            }
+        );
+    }
+
+    #[test]
+    fn support_probe_preserves_the_first_pair_wide_fallback_cause() {
+        let upstream = RecordingSink::default();
+        let probe = SupportProbeSink::new(&upstream);
+
+        emit_capture_fallback(RuntimeDegradation::DeliveredRateShortfall, &probe);
+        emit_capture_fallback(RuntimeDegradation::ConcurrentCaptureFailure, &probe);
+
+        assert_eq!(
+            probe.fallback(),
+            Some(RuntimeViolationLabel::DeliveredRateShortfall)
+        );
+        assert_eq!(upstream.events().len(), 2);
+    }
+
+    #[test]
+    fn support_probe_forwards_trace_only_events_to_the_daemon_sink() {
+        let upstream = TraceRecordingSink::default();
+        let probe = SupportProbeSink::new(&upstream);
+        let event = TraceEventKind::StageTiming {
+            stage: irlume_common::diagnostics::TraceStage::Detection,
+            elapsed_us: 42,
+        };
+
+        probe.emit_trace(event.clone());
+
+        assert_eq!(&*upstream.0.lock().unwrap(), &[event]);
+    }
+
+    #[test]
+    fn support_probe_result_is_categorical_and_starts_without_history() {
+        use irlume_common::diagnostics::{ProbeOutcome, ProbeRoleOutcome};
+        let result = support_probe_result(
+            CaptureSchedule::Sequential,
+            CaptureScheduleSource::RuntimeHealth,
+            ProbeOutcome::FallbackCaptured,
+            Some(RuntimeViolationLabel::ContinuityLoss),
+            ProbeRoleOutcome::Captured,
+            ProbeRoleOutcome::Captured,
+        );
+
+        assert_eq!(result.outcome, ProbeOutcome::FallbackCaptured);
+        assert_eq!(
+            result.fallback_reason,
+            Some(RuntimeViolationLabel::ContinuityLoss)
+        );
+        assert!(result.snapshot.events().is_empty());
+    }
+
+    #[test]
     fn only_a_one_shot_concurrent_hard_failure_trips_runtime_health() {
         assert!(concurrent_pair_requires_fallback(
             false, true, false, false, false
@@ -1681,6 +2162,8 @@ mod capture_mode_switch_tests {
             source: STORED_CAPTURE_MODE_SOURCE,
             runtime_key: Some("dock-a".into()),
             runtime_contract: None,
+            qualification_state: QualificationState::QualifiedConcurrent,
+            qualification_reason: None,
             operation_demoted: std::cell::Cell::new(false),
         };
         assert!(pair_rate_failure_is_degradation(&qualified));
@@ -2376,22 +2859,235 @@ impl Engine {
             .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
     }
 
+    /// Perform one bounded, production-shaped camera capture for a support
+    /// report. This publishes no enrollment or qualification state and never
+    /// discovers emitter controls; IR session creation uses only the ordinary
+    /// already-authorized emitter path.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn support_probe(
+        &mut self,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<irlume_common::diagnostics::SupportProbeResult> {
+        use irlume_common::diagnostics::{DiagnosticSink as _, ProbeOutcome, ProbeRoleOutcome};
+
+        let probe_sink = SupportProbeSink::new(diagnostics);
+        let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
+        let endpoints: Vec<&str> = if self.ir_available {
+            vec![rgb_dev.as_str(), ir_dev.as_str()]
+        } else {
+            vec![rgb_dev.as_str()]
+        };
+        let operation = match irlume_camera::lease::acquire_camera_operation(
+            &endpoints,
+            irlume_camera::lease::CameraOperationKind::Diagnostics,
+            std::time::Duration::from_secs(2),
+        ) {
+            Ok(operation) => operation,
+            Err(_) => {
+                let selection = unavailable_capture_mode_selection();
+                emit_capture_context(&selection, self.ir_available, &probe_sink);
+                probe_sink.emit_share_safe(
+                    irlume_common::diagnostics::ShareSafeEventKind::CaptureFallback {
+                        reason: irlume_common::diagnostics::RuntimeViolationLabel::PairOpenFailure,
+                    },
+                );
+                let (schedule, source) = diagnostic_capture_schedule(&selection, self.ir_available);
+                return Ok(support_probe_result(
+                    schedule,
+                    source,
+                    ProbeOutcome::Unavailable,
+                    probe_sink.fallback(),
+                    ProbeRoleOutcome::Missing,
+                    ProbeRoleOutcome::Missing,
+                ));
+            }
+        };
+
+        if !self.ir_available {
+            let selection = unavailable_capture_mode_selection();
+            emit_capture_context(&selection, false, &probe_sink);
+            let (schedule, source) = diagnostic_capture_schedule(&selection, false);
+            if let Ok(rgb) = operation.open_rgb(&rgb_dev) {
+                if let Ok(camera) = rgb.diagnostic_camera_context() {
+                    probe_sink.emit_trace(
+                        irlume_common::diagnostics::TraceEventKind::StreamContract {
+                            role: irlume_common::diagnostics::CameraRoleLabel::Rgb,
+                            requested: camera.requested.clone(),
+                            accepted: camera.accepted.clone(),
+                        },
+                    );
+                    publish_rgb_only_support_context(camera, &probe_sink);
+                }
+            }
+            let captured = Self::run_camera_operation(&operation, || {
+                self.assess_rgb_only_with_diagnostics(&probe_sink)
+                    .map(|_| ())
+            });
+            return Ok(support_probe_result(
+                schedule,
+                source,
+                if captured.is_ok() {
+                    ProbeOutcome::RgbOnlyCaptured
+                } else {
+                    ProbeOutcome::Failed
+                },
+                None,
+                if captured.is_ok() {
+                    ProbeRoleOutcome::Captured
+                } else {
+                    ProbeRoleOutcome::Failed
+                },
+                ProbeRoleOutcome::Missing,
+            ));
+        }
+
+        let resolved_cams = match (operation.open_rgb(&rgb_dev), operation.open_ir(&ir_dev)) {
+            (Ok(rgb), Ok(ir)) => Some((rgb, ir)),
+            _ => None,
+        };
+        let mut selection = resolved_cams
+            .as_ref()
+            .map_or_else(unavailable_capture_mode_selection, |(rgb, ir)| {
+                capture_mode_selection_with_diagnostics(rgb, ir, &probe_sink)
+            });
+        emit_capture_context(&selection, true, &probe_sink);
+        if resolved_cams.is_none() {
+            probe_sink.emit_share_safe(
+                irlume_common::diagnostics::ShareSafeEventKind::CaptureFallback {
+                    reason: irlume_common::diagnostics::RuntimeViolationLabel::PairOpenFailure,
+                },
+            );
+        }
+        let (selected_schedule, selected_source) = diagnostic_capture_schedule(&selection, true);
+        let sequential = selection.is_sequential();
+        let held_cams = cameras_for_held_pair(sequential, resolved_cams);
+
+        if let (Some((rgb, ir)), false) = (&held_cams, sequential) {
+            let progress = self.capture_progress();
+            match arm_pair_transactionally(
+                || rgb.session_with_progress(&progress),
+                || ir.session_with_progress(&progress),
+            ) {
+                Ok((mut rgb_session, mut ir_session)) => {
+                    match irlume_camera::establish_pair_rate(&mut rgb_session, &mut ir_session) {
+                        Ok(()) => match self.assess_full_with_operation(
+                            Some((&mut rgb_session, &mut ir_session)),
+                            Some(&selection),
+                            &operation,
+                            &probe_sink,
+                        ) {
+                            Ok(_) => {
+                                return Ok(support_probe_result(
+                                    selected_schedule,
+                                    selected_source,
+                                    ProbeOutcome::Captured,
+                                    probe_sink.fallback(),
+                                    ProbeRoleOutcome::Captured,
+                                    ProbeRoleOutcome::Captured,
+                                ));
+                            }
+                            Err(CapturePathError::ConcurrentPair(_)) => {
+                                drop(rgb_session);
+                                drop(ir_session);
+                                demote_after_concurrent_capture_failure(&mut selection);
+                            }
+                            Err(CapturePathError::Other(_)) => {
+                                return Ok(support_probe_result(
+                                    selected_schedule,
+                                    selected_source,
+                                    ProbeOutcome::Failed,
+                                    probe_sink.fallback(),
+                                    ProbeRoleOutcome::Failed,
+                                    ProbeRoleOutcome::Failed,
+                                ));
+                            }
+                        },
+                        Err(_) => {
+                            emit_capture_fallback(
+                                RuntimeDegradation::PairRateEstablishmentFailure,
+                                &probe_sink,
+                            );
+                            demote_after_pair_rate_failure(&mut selection);
+                        }
+                    }
+                }
+                Err(_) => {
+                    emit_capture_fallback(RuntimeDegradation::PairArmFailure, &probe_sink);
+                    demote_after_pair_arm_failure(&mut selection);
+                }
+            }
+        }
+
+        drop(held_cams);
+        let captured =
+            self.assess_full_with_operation(None, Some(&selection), &operation, &probe_sink);
+        let fallback_reason = probe_sink.fallback();
+        Ok(support_probe_result(
+            selected_schedule,
+            selected_source,
+            if captured.is_ok() {
+                if fallback_reason.is_some() {
+                    ProbeOutcome::FallbackCaptured
+                } else {
+                    ProbeOutcome::Captured
+                }
+            } else {
+                ProbeOutcome::Failed
+            },
+            fallback_reason,
+            if captured.is_ok() {
+                ProbeRoleOutcome::Captured
+            } else {
+                ProbeRoleOutcome::Failed
+            },
+            if captured.is_ok() {
+                ProbeRoleOutcome::Captured
+            } else {
+                ProbeRoleOutcome::Failed
+            },
+        ))
+    }
+
     /// RGB-only capture + algorithmic (no-IR) liveness, the convenience-tier
     /// path for devices without an IR camera. Anti-spoof here is DETERRENT-grade
     /// (well-lit + frontal + screen/glare heuristic), which is why this tier is
     /// limited to lock-screen unlock and never releases credentials.
     fn assess_rgb_only(&mut self) -> irlume_common::Result<Assessment> {
+        self.assess_rgb_only_with_diagnostics(&())
+    }
+
+    fn assess_rgb_only_with_diagnostics(
+        &mut self,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Assessment> {
+        let capture_started = std::time::Instant::now();
         let rgb = irlume_camera::capture_rgb_denoised_with_progress(
             &self.rgb_dev,
             &self.capture_progress(),
         )?;
+        if let Some(event) = irlume_camera::diagnostic_stream_evidence(&rgb) {
+            diagnostics.emit_trace(event);
+        }
+        diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+            stage: irlume_common::diagnostics::TraceStage::RgbCapture,
+            elapsed_us: u64::try_from(capture_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        });
         let rgb_view = align::RgbView {
             data: &rgb.data,
             width: rgb.width,
             height: rgb.height,
         };
+        let detection_started = std::time::Instant::now();
         let rgb_faces = self.det.detect(&rgb_view)?;
         let rgb_top = top_detection(&rgb_faces).cloned();
+        diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+            stage: irlume_common::diagnostics::TraceStage::Detection,
+            elapsed_us: u64::try_from(detection_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        });
+        diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::DetectorCount {
+            role: irlume_common::diagnostics::CameraRoleLabel::Rgb,
+            count: u32::try_from(rgb_faces.len()).unwrap_or(u32::MAX),
+        });
         let (rgb_brightness, rgb_specular) = rgb_top
             .as_ref()
             .map(|f| rgb_luma_stats(&rgb.data, rgb.width, rgb.height, &f.bbox))
@@ -2430,7 +3126,15 @@ impl Engine {
             rgb_specular_frac: rgb_specular,
             rgb_moire_score: rgb_moire,
         };
+        let liveness_started = std::time::Instant::now();
         let (verdict, _cues, reason) = self.gate.evaluate_rgb_only(&signals);
+        diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+            stage: irlume_common::diagnostics::TraceStage::Liveness,
+            elapsed_us: u64::try_from(liveness_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        });
+        diagnostics.emit_trace(irlume_liveness::diagnostic_trace_decision(
+            verdict, &signals,
+        ));
         irlume_common::dlog!(
             "liveness(rgb-only): {verdict:?} ({reason}); bright={:.0} specular={:.2} moire={:.0} face_frac={:.3} (recorded for #174, gates nothing)",
             signals.rgb_face_brightness,
@@ -2473,8 +3177,25 @@ impl Engine {
         &mut self,
         operation: &irlume_camera::lease::CameraOperationSession,
     ) -> irlume_common::Result<Assessment> {
-        self.assess_full_with(None, None, operation)
+        self.assess_full_with(None, None, operation, &())
             .map_err(CapturePathError::into_inner)
+    }
+
+    fn assess_full_with_operation(
+        &mut self,
+        held: Option<(
+            &mut irlume_camera::RgbSession<'_>,
+            &mut irlume_camera::IrSession<'_>,
+        )>,
+        capture_mode: Option<&CaptureModeSelection>,
+        operation: &irlume_camera::lease::CameraOperationSession,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> Result<Assessment, CapturePathError> {
+        operation
+            .run(|| self.assess_full_with(held, capture_mode, operation, diagnostics))
+            .map_err(|error| {
+                CapturePathError::Other(irlume_common::Error::Hardware(error.to_string()))
+            })?
     }
 
     /// [`Self::assess_full`], optionally reusing already-streaming cameras.
@@ -2486,6 +3207,7 @@ impl Engine {
         )>,
         capture_mode: Option<&CaptureModeSelection>,
         operation: &irlume_camera::lease::CameraOperationSession,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> Result<Assessment, CapturePathError> {
         // Median-denoise the RGB frame so a single blurry/over-exposed frame
         // can't false-reject a genuine user (IR is already brightest-of-burst).
@@ -2680,16 +3402,37 @@ impl Engine {
                     (rgb, rgb_ms, ir.map(Some), ir_ms, false)
                 })
             };
-        let runtime_violation = if !sequential {
+        emit_trace_stage_ms(
+            diagnostics,
+            irlume_common::diagnostics::TraceStage::RgbCapture,
+            rgb_ms,
+        );
+        emit_trace_stage_ms(
+            diagnostics,
+            irlume_common::diagnostics::TraceStage::IrCapture,
+            ir_ms,
+        );
+        let observed_runtime_violation =
             match (&rgb_res, &ir_res, capture_mode.runtime_contract.as_ref()) {
                 (Ok(rgb), Ok(Some((ir, _))), Some(contract)) => {
-                    contract.validate_pair(rgb, ir).err()
+                    match contract.diagnostic_trace_events(rgb, ir) {
+                        Ok(events) => {
+                            for event in events {
+                                diagnostics.emit_trace(event);
+                            }
+                            None
+                        }
+                        Err(violation) => Some(violation),
+                    }
                 }
                 _ => None,
-            }
-        } else {
-            None
-        };
+            };
+        // Sequential capture does not depend on the concurrent license, but a
+        // valid pair still contributes exact trace evidence. Only concurrent
+        // violations participate in the bounded safety fallback decision.
+        let runtime_violation = (!sequential)
+            .then_some(observed_runtime_violation)
+            .flatten();
         let missing_runtime_contract = !sequential
             && rgb_res.is_ok()
             && matches!(ir_res, Ok(Some(_)))
@@ -2702,15 +3445,14 @@ impl Engine {
             runtime_violation.is_some() || missing_runtime_contract,
         );
         if held_sessions && pair_requires_fallback {
+            let degradation = concurrent_pair_degradation(
+                runtime_violation,
+                missing_runtime_contract,
+                recovered_side,
+            );
+            emit_capture_fallback(degradation, diagnostics);
             if let Some(context_key) = capture_mode.runtime_key.as_deref() {
-                trip_runtime_capture_health(
-                    context_key,
-                    concurrent_pair_degradation(
-                        runtime_violation,
-                        missing_runtime_contract,
-                        recovered_side,
-                    ),
-                );
+                trip_runtime_capture_health(context_key, degradation);
             }
             return Err(CapturePathError::ConcurrentPair(
                 irlume_common::Error::Hardware(format!(
@@ -2732,15 +3474,14 @@ impl Engine {
         }
         let mut pair_sequential_retried = false;
         if pair_requires_fallback {
+            let degradation = concurrent_pair_degradation(
+                runtime_violation,
+                missing_runtime_contract,
+                recovered_side,
+            );
+            emit_capture_fallback(degradation, diagnostics);
             if let Some(context_key) = capture_mode.runtime_key.as_deref() {
-                trip_runtime_capture_health(
-                    context_key,
-                    concurrent_pair_degradation(
-                        runtime_violation,
-                        missing_runtime_contract,
-                        recovered_side,
-                    ),
-                );
+                trip_runtime_capture_health(context_key, degradation);
             }
             capture_mode.demote_operation();
             irlume_common::dlog!(
@@ -2788,6 +3529,18 @@ impl Engine {
             }
             pair_sequential_retried = true;
         }
+        if pair_sequential_retried {
+            emit_trace_stage_ms(
+                diagnostics,
+                irlume_common::diagnostics::TraceStage::RgbCapture,
+                rgb_ms,
+            );
+            emit_trace_stage_ms(
+                diagnostics,
+                irlume_common::diagnostics::TraceStage::IrCapture,
+                ir_ms,
+            );
+        }
         // Retry a hard-failed side alone: with the other stream stopped, a
         // bandwidth-starved capture succeeds; a genuine fault (privacy
         // switch, missing node) fails again with the same error. Logged so a
@@ -2813,11 +3566,17 @@ impl Engine {
             }
             Err(e) => return Err(e.into()),
         };
+        let rgb_detection_started = std::time::Instant::now();
         let mut rgb_faces = self.det.detect(&align::RgbView {
             data: &rgb.data,
             width: rgb.width,
             height: rgb.height,
         })?;
+        diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+            stage: irlume_common::diagnostics::TraceStage::Detection,
+            elapsed_us: u64::try_from(rgb_detection_started.elapsed().as_micros())
+                .unwrap_or(u64::MAX),
+        });
         let mut rgb_top = top_detection(&rgb_faces).cloned();
         irlume_common::dlog!(
             "assess: rgb {}x{} in {rgb_ms}ms, faces={} top-det={:.2}",
@@ -2855,7 +3614,13 @@ impl Engine {
             width: ir.width,
             height: ir.height,
         };
+        let ir_detection_started = std::time::Instant::now();
         let ir_faces = self.det.detect(&ir_view)?;
+        diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+            stage: irlume_common::diagnostics::TraceStage::Detection,
+            elapsed_us: u64::try_from(ir_detection_started.elapsed().as_micros())
+                .unwrap_or(u64::MAX),
+        });
         let mut ir_top = top_detection(&ir_faces).cloned();
         irlume_common::dlog!(
             "assess: ir {}x{} in {ir_ms}ms, faces={} top-det={:.2}",
@@ -2906,6 +3671,22 @@ impl Engine {
                 rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
             );
         }
+        diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::DetectorCount {
+            role: irlume_common::diagnostics::CameraRoleLabel::Rgb,
+            count: if rgb_top.is_some() {
+                u32::try_from(rgb_faces.len()).unwrap_or(u32::MAX).max(1)
+            } else {
+                0
+            },
+        });
+        diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::DetectorCount {
+            role: irlume_common::diagnostics::CameraRoleLabel::Ir,
+            count: if ir_top.is_some() {
+                u32::try_from(ir_faces.len()).unwrap_or(u32::MAX).max(1)
+            } else {
+                0
+            },
+        });
 
         // How far apart in time the two frames are. The cross-spectrum cues
         // (same face co-located in RGB and IR, RGB pose judged against the IR
@@ -2932,6 +3713,17 @@ impl Engine {
             // says nothing about the person. `OutcomeKind::Uncertain` is
             // presence-retryable, so a caller inside the grace window simply
             // captures again, which is exactly the fix.
+            let measurements = irlume_common::diagnostics::TraceMeasurement::new(
+                irlume_common::diagnostics::TraceMetric::CaptureSkewMilliseconds,
+                skew.as_secs_f64() * 1_000.0,
+                Some(MAX_CROSS_SPECTRUM_SKEW.as_secs_f64() * 1_000.0),
+            )
+            .into_iter()
+            .collect();
+            diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::Decision {
+                verdict: irlume_common::diagnostics::TraceVerdict::Uncertain,
+                measurements,
+            });
             return Ok(Assessment {
                 verdict: Verdict::Uncertain,
                 rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
@@ -3020,6 +3812,7 @@ impl Engine {
             rgb_moire_score: 0.0,
             rgb_specular_frac: 0.0,
         };
+        let liveness_started = std::time::Instant::now();
         let (verdict, _cues, reason) = self.gate.evaluate(&signals);
         // Log the cue values on PASS too; a near-miss on a genuine user is
         // invisible in the outcome line but obvious here.
@@ -3078,6 +3871,13 @@ impl Engine {
         } else {
             (verdict, reason)
         };
+        diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+            stage: irlume_common::diagnostics::TraceStage::Liveness,
+            elapsed_us: u64::try_from(liveness_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        });
+        diagnostics.emit_trace(irlume_liveness::diagnostic_trace_decision(
+            verdict, &signals,
+        ));
 
         // Rebuild the view against the final RGB frame (it may have been
         // recaptured by the cross-spectrum self-heal above).
@@ -3733,7 +4533,29 @@ impl Engine {
         user: &str,
         service: Option<&str>,
     ) -> irlume_common::Result<Outcome> {
-        self.authenticate_for(user, service, AuthenticationPurpose::for_service(service))
+        self.authenticate_for_with_diagnostics(
+            user,
+            service,
+            AuthenticationPurpose::for_service(service),
+            &(),
+        )
+    }
+
+    /// [`Self::authenticate`] while publishing bounded, structurally
+    /// share-safe capture decisions to the caller-owned operation scope.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn authenticate_with_diagnostics(
+        &mut self,
+        user: &str,
+        service: Option<&str>,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Outcome> {
+        self.authenticate_for_with_diagnostics(
+            user,
+            service,
+            AuthenticationPurpose::for_service(service),
+            diagnostics,
+        )
     }
 
     /// [`Self::authenticate`] with the purpose stated explicitly, for callers that
@@ -3750,6 +4572,19 @@ impl Engine {
         user: &str,
         service: Option<&str>,
         purpose: AuthenticationPurpose,
+    ) -> irlume_common::Result<Outcome> {
+        self.authenticate_for_with_diagnostics(user, service, purpose, &())
+    }
+
+    /// [`Self::authenticate_for`] while publishing bounded, structurally
+    /// share-safe capture decisions to the caller-owned operation scope.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn authenticate_for_with_diagnostics(
+        &mut self,
+        user: &str,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
         let window = grace_window_ms(service);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window);
@@ -3847,6 +4682,7 @@ impl Engine {
         // so the watch's S_FMT and REQBUFS hit EBUSY against this very process:
         // the self-collision #187 diagnosed, reintroduced by #346 and caught by
         // the release audit before it shipped.
+        let camera_open_started = std::time::Instant::now();
         let resolved_cams = match (
             camera_operation.open_rgb(&rgb_dev),
             camera_operation.open_ir(&ir_dev),
@@ -3854,11 +4690,24 @@ impl Engine {
             (Ok(rgb), Ok(ir)) => Some((rgb, ir)),
             _ => None,
         };
+        diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+            stage: irlume_common::diagnostics::TraceStage::CameraOpen,
+            elapsed_us: u64::try_from(camera_open_started.elapsed().as_micros())
+                .unwrap_or(u64::MAX),
+        });
         let mut capture_mode = resolved_cams
             .as_ref()
             .map_or_else(unavailable_capture_mode_selection, |(rgb, ir)| {
-                capture_mode_selection(rgb, ir)
+                capture_mode_selection_with_diagnostics(rgb, ir, diagnostics)
             });
+        emit_capture_context(&capture_mode, self.ir_available, diagnostics);
+        if resolved_cams.is_none() && self.ir_available {
+            diagnostics.emit_share_safe(
+                irlume_common::diagnostics::ShareSafeEventKind::CaptureFallback {
+                    reason: irlume_common::diagnostics::RuntimeViolationLabel::PairOpenFailure,
+                },
+            );
+        }
         let sequential = capture_mode.is_sequential();
         let held_cams = cameras_for_held_pair(sequential, resolved_cams);
         let mut held_rgb: Option<irlume_camera::RgbSession<'_>> = None;
@@ -3866,15 +4715,30 @@ impl Engine {
         if let (Some((cam_r, cam_i)), true) = (&held_cams, !sequential && self.ir_available) {
             let progress = self.capture_progress();
             // The camera pair is declared before the sessions so it outlives them.
-            match arm_pair_transactionally(
+            let arm_started = std::time::Instant::now();
+            let armed = arm_pair_transactionally(
                 || cam_r.session_with_progress(&progress),
                 || cam_i.session_with_progress(&progress),
-            ) {
+            );
+            diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+                stage: irlume_common::diagnostics::TraceStage::StreamArm,
+                elapsed_us: u64::try_from(arm_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            });
+            match armed {
                 Ok((mut rs, mut is)) => {
                     // Establish the delivered-rate windows for the HELD PAIR up
                     // front, draining both streams concurrently. A failure drops
                     // both streams and selects the one-at-a-time path below.
-                    match irlume_camera::establish_pair_rate(&mut rs, &mut is) {
+                    let rate_started = std::time::Instant::now();
+                    let rate = irlume_camera::establish_pair_rate(&mut rs, &mut is);
+                    diagnostics.emit_trace(
+                        irlume_common::diagnostics::TraceEventKind::StageTiming {
+                            stage: irlume_common::diagnostics::TraceStage::RateEstablishment,
+                            elapsed_us: u64::try_from(rate_started.elapsed().as_micros())
+                                .unwrap_or(u64::MAX),
+                        },
+                    );
+                    match rate {
                         Ok(()) => {
                             held_rgb = Some(rs);
                             held_ir = Some(is);
@@ -3883,6 +4747,10 @@ impl Engine {
                             irlume_common::dlog!(
                                 "auth: held pair could not establish delivered-rate evidence \
                                  ({error}); dropping both streams and retrying one-at-a-time"
+                            );
+                            emit_capture_fallback(
+                                RuntimeDegradation::PairRateEstablishmentFailure,
+                                diagnostics,
                             );
                             demote_after_pair_rate_failure(&mut capture_mode);
                         }
@@ -3893,6 +4761,7 @@ impl Engine {
                         "auth: held pair could not arm transactionally ({error}); \
                          retrying one-at-a-time"
                     );
+                    emit_capture_fallback(RuntimeDegradation::PairArmFailure, diagnostics);
                     demote_after_pair_arm_failure(&mut capture_mode);
                 }
             }
@@ -3914,6 +4783,7 @@ impl Engine {
                     &mut no_ir,
                     &capture_mode,
                     &camera_operation,
+                    diagnostics,
                 )
                 .0;
         }
@@ -3927,6 +4797,7 @@ impl Engine {
             &mut held_ir,
             &capture_mode,
             &camera_operation,
+            diagnostics,
         );
         if !held_pair_failed {
             return first_result;
@@ -3951,6 +4822,7 @@ impl Engine {
             &mut no_ir,
             &capture_mode,
             &camera_operation,
+            diagnostics,
         )
         .0
     }
@@ -3967,6 +4839,7 @@ impl Engine {
         held_ir: &mut Option<irlume_camera::IrSession<'_>>,
         capture_mode: &CaptureModeSelection,
         camera_operation: &irlume_camera::lease::CameraOperationSession,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> (irlume_common::Result<Outcome>, bool) {
         let mut attempt = 0_u32;
         loop {
@@ -3983,6 +4856,7 @@ impl Engine {
                         mode: Some(capture_mode),
                         operation: Some(camera_operation),
                         held_pair_failed: Some(&mut held_pair_failed),
+                        diagnostics,
                     },
                 )
             });
@@ -4027,15 +4901,17 @@ impl Engine {
             mode,
             operation,
             held_pair_failed,
+            diagnostics,
         } = capture;
         let assessment = if !self.ir_available {
-            self.assess_rgb_only().map_err(CapturePathError::from)
+            self.assess_rgb_only_with_diagnostics(diagnostics)
+                .map_err(CapturePathError::from)
         } else if let (Some(rs), Some(is), Some(operation)) =
             (held_rgb.as_mut(), held_ir.as_mut(), operation)
         {
-            self.assess_full_with(Some((rs, is)), mode, operation)
+            self.assess_full_with(Some((rs, is)), mode, operation, diagnostics)
         } else if let Some(operation) = operation {
-            self.assess_full_with(None, mode, operation)
+            self.assess_full_with(None, mode, operation, diagnostics)
         } else {
             self.assess().map_err(CapturePathError::from)
         };
@@ -4142,6 +5018,13 @@ impl Engine {
                 "match(rgb): best {score:.3} vs thr {thr:.3} ({} scans, best profile '{who}')",
                 scans.len()
             );
+            emit_trace_match(
+                diagnostics,
+                irlume_common::diagnostics::TraceMetric::MatchCosine,
+                score,
+                thr,
+                score >= thr,
+            );
             if score >= thr {
                 release_held(held_rgb, held_ir);
                 return self.challenge_if_required(
@@ -4174,6 +5057,13 @@ impl Engine {
                     );
                     irlume_common::dlog!("match(fusion): p={:.3} grant={} (rgb {score:.3} bright {:.0} / ir {ir_score:.3} bright {:.0})",
                         f.prob, f.grant, a.signals.rgb_face_brightness, a.ir_brightness);
+                    emit_trace_match(
+                        diagnostics,
+                        irlume_common::diagnostics::TraceMetric::FusionProbability,
+                        f.prob,
+                        irlume_core::fusion::FUSION_PROB_THRESHOLD,
+                        f.grant,
+                    );
                     if f.grant {
                         let who = if ir_score >= score { ir_who } else { who };
                         release_held(held_rgb, held_ir);
@@ -4198,6 +5088,13 @@ impl Engine {
                         "match(ir-fallback): {ir_score:.3} vs thr {ir_thr:.3} (adapter={})",
                         self.ir_adapter.is_some()
                     );
+                    emit_trace_match(
+                        diagnostics,
+                        irlume_common::diagnostics::TraceMetric::MatchCosine,
+                        ir_score,
+                        ir_thr,
+                        ir_score >= ir_thr,
+                    );
                     if ir_score >= ir_thr {
                         release_held(held_rgb, held_ir);
                         return self.challenge_if_required(
@@ -4214,6 +5111,13 @@ impl Engine {
                         let cthr = irlume_core::scaled_threshold(ir_base, enr.profiles.len())
                             + irlume_core::IR_FALLBACK_MARGIN;
                         irlume_common::dlog!("match(ir-centroid): {cs:.3} vs thr {cthr:.3}");
+                        emit_trace_match(
+                            diagnostics,
+                            irlume_common::diagnostics::TraceMetric::MatchCosine,
+                            *cs,
+                            cthr,
+                            *cs >= cthr,
+                        );
                         if *cs >= cthr {
                             release_held(held_rgb, held_ir);
                             return self.challenge_if_required(
@@ -4262,6 +5166,9 @@ impl Engine {
                 return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
             let (verdict, _cues, reason) = self.gate.evaluate_ir_only(&a.signals);
+            diagnostics.emit_trace(irlume_liveness::diagnostic_trace_decision(
+                verdict, &a.signals,
+            ));
             irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={} ambient={:.0}",
                 a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio,
                 a.signals
@@ -4347,6 +5254,13 @@ impl Engine {
                 self.ir_adapter.is_some(),
                 m.centroid.as_ref().map(|(s, _)| *s)
             );
+            emit_trace_match(
+                diagnostics,
+                irlume_common::diagnostics::TraceMetric::MatchCosine,
+                score,
+                ir_thr,
+                score >= ir_thr,
+            );
             // Grant on best-of-N at the scaled threshold, or on the
             // calibrated centroid at the base threshold (no best-of-N FAR
             // inflation; the prototype-validated mean-template protocol).
@@ -4362,6 +5276,13 @@ impl Engine {
             if let Some((cs, cwho)) = &m.centroid {
                 let cthr = irlume_core::scaled_threshold(ir_base, enr.profiles.len());
                 irlume_common::dlog!("match(ir/dark centroid): {cs:.3} vs thr {cthr:.3}");
+                emit_trace_match(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceMetric::MatchCosine,
+                    *cs,
+                    cthr,
+                    *cs >= cthr,
+                );
                 if *cs >= cthr {
                     release_held(held_rgb, held_ir);
                     return self.challenge_if_required(
@@ -4550,6 +5471,7 @@ impl Engine {
         pitch_neutral: Option<f32>,
         observed: &mut CaptureShape,
         force_rgb_only: bool,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Vec<CapturedScan>> {
         // Hold the cameras open for the whole loop. This is the heaviest repeated
         // capture in the codebase (the budget below is ten assessments per wanted
@@ -4609,8 +5531,16 @@ impl Engine {
         let mut capture_mode = cams
             .as_ref()
             .map_or_else(unavailable_capture_mode_selection, |(rgb, ir)| {
-                capture_mode_selection(rgb, ir)
+                capture_mode_selection_with_diagnostics(rgb, ir, diagnostics)
             });
+        emit_capture_context(&capture_mode, use_ir, diagnostics);
+        if cams.is_none() && use_ir {
+            diagnostics.emit_share_safe(
+                irlume_common::diagnostics::ShareSafeEventKind::CaptureFallback {
+                    reason: irlume_common::diagnostics::RuntimeViolationLabel::PairOpenFailure,
+                },
+            );
+        }
         let sequential = capture_mode.is_sequential();
         let mode_source = capture_mode.source;
         if sequential {
@@ -4638,6 +5568,7 @@ impl Engine {
                                 EnrollmentCapturePolicy {
                                     mode: &capture_mode,
                                     use_ir,
+                                    diagnostics,
                                 },
                                 &operation,
                                 observed,
@@ -4660,6 +5591,10 @@ impl Engine {
                                 "enroll: held pair could not establish delivered-rate evidence \
                              ({error}); dropping both streams and retrying one-at-a-time"
                             );
+                            emit_capture_fallback(
+                                RuntimeDegradation::PairRateEstablishmentFailure,
+                                diagnostics,
+                            );
                             demote_after_pair_rate_failure(&mut capture_mode);
                         }
                     }
@@ -4669,6 +5604,7 @@ impl Engine {
                         "enroll: held pair could not arm transactionally ({error}); \
                          retrying one-at-a-time"
                     );
+                    emit_capture_fallback(RuntimeDegradation::PairArmFailure, diagnostics);
                     demote_after_pair_arm_failure(&mut capture_mode);
                 }
             }
@@ -4695,6 +5631,7 @@ impl Engine {
             EnrollmentCapturePolicy {
                 mode: &capture_mode,
                 use_ir,
+                diagnostics,
             },
             &operation,
             observed,
@@ -4744,13 +5681,21 @@ impl Engine {
             }
             let a = operation
                 .run(|| match &mut sessions {
-                    Some((rs, is)) => {
-                        self.assess_full_with(Some((rs, is)), Some(policy.mode), operation)
-                    }
-                    None if policy.use_ir => {
-                        self.assess_full_with(None, Some(policy.mode), operation)
-                    }
-                    None => self.assess_rgb_only().map_err(CapturePathError::from),
+                    Some((rs, is)) => self.assess_full_with(
+                        Some((rs, is)),
+                        Some(policy.mode),
+                        operation,
+                        policy.diagnostics,
+                    ),
+                    None if policy.use_ir => self.assess_full_with(
+                        None,
+                        Some(policy.mode),
+                        operation,
+                        policy.diagnostics,
+                    ),
+                    None => self
+                        .assess_rgb_only_with_diagnostics(policy.diagnostics)
+                        .map_err(CapturePathError::from),
                 })
                 .map_err(|error| {
                     CapturePathError::Other(irlume_common::Error::Hardware(error.to_string()))
@@ -4957,7 +5902,7 @@ impl Engine {
         profile_name: Option<String>,
         want: usize,
     ) -> irlume_common::Result<EnrollOutcome> {
-        self.enroll_profile_with_capture_policy(user, profile_name, want, || true)
+        self.enroll_profile_with_capture_policy(user, profile_name, want, || true, &())
     }
 
     /// Run a user-present IR readiness check only after the enrollment's
@@ -4971,7 +5916,21 @@ impl Engine {
         want: usize,
         ir_preflight: impl FnOnce() -> bool,
     ) -> irlume_common::Result<EnrollOutcome> {
-        self.enroll_profile_with_capture_policy(user, profile_name, want, ir_preflight)
+        self.enroll_profile_with_capture_policy(user, profile_name, want, ir_preflight, &())
+    }
+
+    /// [`Self::enroll_profile_with_ir_preflight`] while publishing bounded,
+    /// structurally share-safe capture decisions to the caller-owned scope.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn enroll_profile_with_ir_preflight_and_diagnostics(
+        &mut self,
+        user: &str,
+        profile_name: Option<String>,
+        want: usize,
+        ir_preflight: impl FnOnce() -> bool,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<EnrollOutcome> {
+        self.enroll_profile_with_capture_policy(user, profile_name, want, ir_preflight, diagnostics)
     }
 
     fn enroll_profile_with_capture_policy(
@@ -4980,6 +5939,7 @@ impl Engine {
         profile_name: Option<String>,
         want: usize,
         ir_preflight: impl FnOnce() -> bool,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<EnrollOutcome> {
         use irlume_core::storage::{
             self, Enrollment, FaceProfile, FaceScan, MAX_PROFILES, MAX_SCANS_PER_PROFILE,
@@ -5008,8 +5968,13 @@ impl Engine {
         // the first observed and the message cannot claim "on every attempt"
         // about a subset of them.
         let mut observed = CaptureShape::default();
-        let probe_scans =
-            self.capture_scans(1, enr.pitch_neutral(), &mut observed, force_rgb_only)?;
+        let probe_scans = self.capture_scans(
+            1,
+            enr.pitch_neutral(),
+            &mut observed,
+            force_rgb_only,
+            diagnostics,
+        )?;
         let solo_probe = if probe_scans.is_empty() {
             self.solo_rgb_starvation_probe(observed)
         } else {
@@ -5060,6 +6025,7 @@ impl Engine {
                 enr.pitch_neutral(),
                 &mut observed,
                 force_rgb_only,
+                diagnostics,
             )?);
         }
         if captured.len() < goal {
@@ -5269,8 +6235,13 @@ impl Engine {
         let force_rgb_only = !self.ir_available || !ir_preflight();
         let want = count.clamp(1, room);
         let mut observed = CaptureShape::default();
-        let captured =
-            self.capture_scans(want, enr.pitch_neutral(), &mut observed, force_rgb_only)?;
+        let captured = self.capture_scans(
+            want,
+            enr.pitch_neutral(),
+            &mut observed,
+            force_rgb_only,
+            &(),
+        )?;
         let solo_probe = if captured.len() < want {
             self.solo_rgb_starvation_probe(observed)
         } else {
