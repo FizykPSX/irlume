@@ -7425,6 +7425,38 @@ fn active_by_device_default_message(control: &ir_emitter::EmitterControl) -> Str
     )
 }
 
+fn setup_measurement_from_burst(
+    means: &[f32],
+    sequences: &[u32],
+    flags: &[Option<ir_metadata::Illumination>],
+) -> Option<ir_emitter::SetupMeasurement> {
+    let brightness = means.iter().copied().reduce(f32::max)?;
+    if means.len() != sequences.len() || means.len() != flags.len() {
+        return Some(ir_emitter::SetupMeasurement::optical(brightness));
+    }
+    let optical_observations: Vec<(u32, f32)> = sequences
+        .iter()
+        .copied()
+        .zip(means.iter().copied())
+        .collect();
+    let optical = ir_emitter::D1OpticalEvidence::from_sequence_means(&optical_observations);
+    let metadata = flags.iter().any(Option::is_some).then(|| {
+        let observations: Vec<(u32, Option<bool>)> = sequences
+            .iter()
+            .copied()
+            .zip(flags.iter().map(|flag| match flag {
+                Some(ir_metadata::Illumination::Lit) => Some(true),
+                Some(ir_metadata::Illumination::Dark) => Some(false),
+                None => None,
+            }))
+            .collect();
+        ir_emitter::D1MetadataEvidence::from_sequence_flags(&observations)
+    });
+    Some(ir_emitter::SetupMeasurement::with_d1_evidence(
+        brightness, optical, metadata,
+    ))
+}
+
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     verify_pinned(device)?;
@@ -7467,8 +7499,14 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
         &fmt,
     )?;
     let fd = dev.handle().fd();
+    // Start the metadata queue before the image queue's first dequeue. uvcvideo
+    // otherwise produces no metadata for this stream at all.
+    let mut meta = ir_metadata::IlluminationLog::open(device);
     for _ in 0..4 {
         let _ = stream.next(); // let the sensor settle before baseline
+        if let Some(log) = meta.as_mut() {
+            log.drain();
+        }
     }
     // Mean IR brightness over a short burst (catches a strobed emitter's lit
     // phase). Measured on the DECODED 8-bit frame so the brightness scale is
@@ -7481,7 +7519,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     // exactly the daemon's watchdog deadline, so a stall during setup could get
     // the daemon killed before the control it changed was restored. A fix for a
     // hang is not worth a race with systemd.
-    let mut measure = || -> Option<f32> {
+    let mut measure = || -> Option<ir_emitter::SetupMeasurement> {
         // A stop signal aborts through the same path a dead stream does, which
         // is the path that puts the control back.
         //
@@ -7496,6 +7534,9 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
         if ir_emitter::abort_requested() {
             return None;
         }
+        if let Some(log) = meta.as_mut() {
+            log.begin_burst();
+        }
         // Frames already in flight were captured before the control changed, and
         // taking the brightest of the burst makes one stale frame decide the
         // answer. Discard a stream's worth before believing anything.
@@ -7504,18 +7545,40 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
                 return None;
             }
             stream.next().ok()?;
+            if let Some(log) = meta.as_mut() {
+                log.drain();
+            }
         }
-        let mut best: Option<f32> = None;
+        let mut means = Vec::with_capacity(8);
+        let mut stamps = Vec::with_capacity(8);
+        let mut sequences = Vec::with_capacity(8);
         for _ in 0..8 {
             if ir_emitter::abort_requested() {
                 return None;
             }
-            let (buf, _) = stream.next().ok()?;
+            let (buf, facts) = stream.next().ok()?;
+            stamps.push(facts.timestamp_micros());
+            sequences.push(facts.sequence_raw());
+            if let Some(log) = meta.as_mut() {
+                log.drain();
+            }
             let data = dec.decode(buf, w, h);
             let m = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
-            best = Some(best.map_or(m as f32, |b: f32| b.max(m as f32)));
+            means.push(m as f32);
         }
-        best
+        let flags = match meta.as_mut() {
+            Some(log) => {
+                // The final image's metadata buffer can arrive just after its
+                // image buffer, as in the production capture path.
+                log.drain();
+                stamps
+                    .iter()
+                    .map(|&timestamp| log.illumination_at(timestamp))
+                    .collect::<Vec<_>>()
+            }
+            None => vec![None; means.len()],
+        };
+        setup_measurement_from_burst(&means, &sequences, &flags)
     };
 
     let id = crate::uvc_descriptor::identity_from_fd(fd)
@@ -7533,7 +7596,12 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
         privacy_permits_setup(privacy_state(&dev))
     };
     permit.run_active(|| {
-        match ir_emitter::discover(fd, &id, &mut measure, &mut privacy_allows_write) {
+        match ir_emitter::discover_with_measurements(
+            fd,
+            &id,
+            &mut measure,
+            &mut privacy_allows_write,
+        ) {
             Ok(ir_emitter::DiscoveryOutcome::Applied(found)) => {
                 let encoded = found.control().encode();
                 // Confirm, publish, release, in that order. The sequence lives in
@@ -7742,6 +7810,35 @@ mod tests {
             message.contains("no camera write or saved config was needed"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn setup_burst_keeps_brightness_and_d1_metadata_as_separate_evidence() {
+        use ir_metadata::Illumination::{Dark, Lit};
+
+        let measurement = setup_measurement_from_burst(
+            &[48.0, 52.0, 51.0, 48.0, 52.0],
+            &[10, 11, 13, 14, 15],
+            &[Some(Dark), Some(Lit), Some(Lit), Some(Dark), Some(Lit)],
+        )
+        .expect("a non-empty decoded burst is measurable");
+
+        assert_eq!(measurement.brightness(), 52.0);
+        assert!(measurement.metadata_proves_d1(), "{measurement:?}");
+    }
+
+    #[test]
+    fn setup_burst_retains_sequence_locked_optical_evidence_without_metadata() {
+        let measurement = setup_measurement_from_burst(
+            &[10.0, 41.0, 11.0, 40.0, 9.0, 42.0, 10.0, 41.0],
+            &[10, 11, 12, 13, 14, 15, 16, 17],
+            &[None, None, None, None, None, None, None, None],
+        )
+        .expect("a non-empty decoded burst is measurable");
+
+        assert_eq!(measurement.brightness(), 42.0);
+        assert!(measurement.optical_proves_d1(), "{measurement:?}");
+        assert!(!measurement.metadata_proves_d1(), "{measurement:?}");
     }
 
     fn test_rate_config(role: contracts::StreamRole) -> rate_gate::StreamRateConfig {
