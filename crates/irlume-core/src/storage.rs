@@ -176,21 +176,17 @@ pub struct CameraBinding {
 pub struct Enrollment {
     pub user: String,
     pub profiles: Vec<FaceProfile>,
-    /// Per-user opt-in: require both eyes open to unlock (default off).
-    #[serde(default)]
+    /// Retired eyes-open policy, retained for one release so old files load and
+    /// the explicit OFF cleanup can clear it. New saves omit it.
+    #[serde(default, skip_serializing)]
     pub require_eyes_open: bool,
     /// Camera identity captured at enroll, verified at auth (anti-swap). `None`
     /// for pre-binding enrollments; enforcement only kicks in once bound.
     #[serde(default)]
     pub camera_binding: Option<CameraBinding>,
-    /// Per-user eye-closure calibration `(ear_open, ear_closed)` captured at
-    /// enroll, for the deliberate-closure consent gesture (polkit prompts). The
-    /// gesture compares EAR to an ABSOLUTE per-user threshold derived from these
-    /// extremes, not a running median (which the closure itself would pollute),
-    /// so it cannot be measured from the gesture window and must be enrolled.
-    /// `None` for enrollments captured before this existed; the consent gesture
-    /// then can't run (the daemon fails the polkit face path closed to password).
-    #[serde(default)]
+    /// Retired eye-closure calibration, retained for one release so old files
+    /// load. New saves omit it.
+    #[serde(default, skip_serializing)]
     pub closure_calibration: Option<(f32, f32)>,
 }
 
@@ -1063,8 +1059,46 @@ mod tests {
         let back = deserialize_enrollment(&bytes, Some(&key)).unwrap();
         assert_eq!(back.user, "u");
         assert_eq!(back.total_scans(), 1);
-        assert!(back.require_eyes_open);
+        assert!(!back.require_eyes_open);
         assert_eq!(back.profiles[0].scans[0].rgb, vec![0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn plaintext_save_lazily_removes_retired_eye_fields() {
+        let old = r#"{"user":"u","profiles":[],"require_eyes_open":true,
+            "closure_calibration":[0.24,0.05]}"#;
+        let loaded = deserialize_enrollment(old.as_bytes(), None).expect("old plaintext loads");
+        assert!(loaded.require_eyes_open);
+        assert_eq!(loaded.closure_calibration, Some((0.24, 0.05)));
+
+        let saved = serialize_enrollment(&loaded, None).expect("next plaintext save");
+        let saved: serde_json::Value = serde_json::from_slice(&saved).expect("saved enrollment");
+        assert!(saved.get("require_eyes_open").is_none());
+        assert!(saved.get("closure_calibration").is_none());
+    }
+
+    #[test]
+    fn encrypted_save_lazily_removes_retired_eye_fields() {
+        let key = crypto::generate_key();
+        let old = br#"{"user":"u","profiles":[],"require_eyes_open":true,
+            "closure_calibration":[0.24,0.05]}"#;
+        let envelope = EncEnvelope {
+            version: ENC_ENVELOPE_VERSION,
+            key_id: Some(irlume_common::sha256_hex(&key)),
+            enc: STANDARD.encode(crypto::encrypt(&key, old).expect("encrypt old payload")),
+        };
+        let envelope = serde_json::to_vec(&envelope).expect("old envelope");
+        let loaded = deserialize_enrollment(&envelope, Some(&key)).expect("old encrypted loads");
+        assert!(loaded.require_eyes_open);
+        assert_eq!(loaded.closure_calibration, Some((0.24, 0.05)));
+
+        let saved = serialize_enrollment(&loaded, Some(&key)).expect("next encrypted save");
+        let envelope: EncEnvelope = serde_json::from_slice(&saved).expect("new envelope");
+        let blob = STANDARD.decode(envelope.enc).expect("encoded ciphertext");
+        let plaintext = crypto::decrypt(&key, &blob).expect("decrypt new payload");
+        let saved: serde_json::Value = serde_json::from_slice(&plaintext).expect("inner payload");
+        assert!(saved.get("require_eyes_open").is_none());
+        assert!(saved.get("closure_calibration").is_none());
     }
 
     #[test]

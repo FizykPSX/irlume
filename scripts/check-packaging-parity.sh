@@ -28,6 +28,29 @@ LANES=(
 
 fail=0
 
+echo "== local dependency patches are source-complete =="
+PAMSM_PATCH_FILES=(
+  third_party/pamsm-0.5.5/Cargo.toml
+  third_party/pamsm-0.5.5/License
+  third_party/pamsm-0.5.5/IRLUME-PATCH.md
+  third_party/pamsm-0.5.5/src/libpam.rs
+)
+for file in "${PAMSM_PATCH_FILES[@]}"; do
+  if [[ -f "$file" ]]; then
+    printf '  ok    %s\n' "$file"
+  else
+    printf '  MISS  %s\n' "$file"
+    fail=1
+  fi
+done
+if grep -Fqx 'pamsm = { path = "third_party/pamsm-0.5.5" }' Cargo.toml; then
+  printf '  ok    %s\n' 'Cargo.toml pamsm local patch'
+else
+  printf '  MISS  %s\n' 'Cargo.toml pamsm local patch'
+  fail=1
+fi
+echo
+
 # Installed programs that are not the two obvious bins. A helper added to
 # three lanes and forgotten in the fourth is invisible until someone on that
 # distro logs in and their wallet silently stays locked, which is the same
@@ -84,8 +107,8 @@ done
 # RUNTIME, and never installed the MODEL; the filename was present twice, so a
 # name grep was satisfied while `IRLUME_MESH_MODEL` pointed at a file the
 # package did not ship (#360). Being absent is silent: Engine::with_mesh treats
-# a missing path as a no-op and returns Ok, so the daemon starts and passive
-# liveness, the closure gesture and the BlazeFace rescue just stop working.
+# a missing path as a no-op and returns Ok, so the daemon starts but BlazeFace
+# rescue alignment stops working.
 #
 # So this looks for the filename next to the lane's INSTALL DESTINATION, within
 # a two-line window because two lanes wrap the install across a continuation,

@@ -83,6 +83,7 @@ impl Sandbox {
             .env("IRLUME_KEYRING_DIR", self.root.join("keyring"))
             .env("IRLUME_METHOD_CONF", self.root.join("cfg").join("method"))
             .env_remove("IRLUME_DEV")
+            .env_remove("IRLUME_CONSENT_GESTURE")
             .env_remove("ORT_DYLIB_PATH")
             .env_remove("IRLUME_MODEL")
             .env_remove("IRLUME_DET_MODEL")
@@ -227,7 +228,7 @@ fn write_test_seal_without_pcr_snapshot(path: &Path) {
 // ---------------------------------------------------------------- status arms
 
 // status renders one arm per daemon answer; cli.rs pins the all-green dashboard,
-// so these pin the OTHER branches: eyes-open-required enrollment, an un-armed
+// so these pin the OTHER branches: a legacy eyes-open blocker, an un-armed
 // KeyringInfo, plaintext/not-set recovery, and the opt-in biopolicy gate ON.
 #[test]
 fn status_eyes_open_unarmed_plaintext_and_biopolicy_enforcing() {
@@ -259,11 +260,55 @@ fn status_eyes_open_unarmed_plaintext_and_biopolicy_enforcing() {
     let (code, out, _) = run(&mut sb.cmd(&["status", "--user", "tester"]), "status");
     assert_eq!(code, 0, "status always reports, never gates");
     assert!(out.contains("daemon        : running"), "{out}");
-    assert!(out.contains("eyes-open required"), "{out}");
+    assert!(
+        out.contains("legacy policy blocks authentication")
+            && out.contains("sudo irlume profiles eyes-open off --user 'tester'"),
+        "{out}"
+    );
     assert!(out.contains("keyring unlock: not armed"), "{out}");
     assert!(out.contains("templates     : plaintext"), "{out}");
     assert!(out.contains("recovery pass : not set"), "{out}");
     assert!(out.contains("biopolicy     : ENFORCING"), "{out}");
+}
+
+#[test]
+fn status_empty_legacy_enrollment_keeps_the_targeted_cleanup() {
+    let sb = Sandbox::new("status-empty-legacy");
+    serve(&sb.sock(), |req| match req {
+        Request::Ping => Response::Pong,
+        Request::ListProfiles { .. } => Response::Enrollment {
+            profiles: Vec::new(),
+            require_eyes_open: true,
+            closure_calibrated: false,
+            ir_ratio_calibrated: false,
+        },
+        Request::KeyringInfo { .. } => Response::KeyringInfo {
+            armed: false,
+            policy: None,
+            pcrs: vec![],
+            drifted: None,
+            kind: None,
+        },
+        Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+            encrypted: false,
+            recovery_set: false,
+            tpm_present: true,
+            key_present: false,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    let (code, out, _) = run(
+        &mut sb.cmd(&["status", "--user", "tester"]),
+        "status-empty-legacy",
+    );
+    assert_eq!(code, 0, "status always reports");
+    assert!(out.contains("enrollment    : none"), "{out}");
+    assert!(
+        out.contains("legacy policy blocks authentication")
+            && out.contains("sudo irlume profiles eyes-open off --user 'tester'"),
+        "{out}"
+    );
 }
 
 // The credential-release challenge command: DEFAULT-OFF reporting, the root gate,
@@ -279,8 +324,22 @@ fn credential_release_challenge_reports_defaults_and_toggles() {
     // No settings.conf at all: defaults shown, and status never fails.
     let (code, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
     assert_eq!(code, 0);
-    assert!(out.contains("sudo: REQUIRED"), "{out}");
-    assert!(out.contains("polkit-1: REQUIRED"), "{out}");
+    assert!(
+        out.contains("sudo: Face confirmation: keyboard required"),
+        "{out}"
+    );
+    assert!(
+        out.contains("sudo: Additional head gesture: off (default)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("polkit-1: Face confirmation: keyboard required"),
+        "{out}"
+    );
+    assert!(
+        out.contains("polkit-1: Additional head gesture: off (default)"),
+        "{out}"
+    );
     assert!(out.contains("credential_release: off (default)"), "{out}");
     assert!(
         out.contains("global credential_release_challenge: off (default)"),
@@ -298,7 +357,14 @@ fn credential_release_challenge_reports_defaults_and_toggles() {
     // `<svc> on|off`: the exact command four surfaces recommended exited 2.
     let (code, out, _) = run(&mut sb.cmd(&[cmd, "sudo", "status"]), cmd);
     assert_eq!(code, 0, "the taught per-service form must work: {out}");
-    assert!(out.contains("sudo: REQUIRED"), "{out}");
+    assert!(
+        out.contains("sudo: Face confirmation: keyboard required"),
+        "{out}"
+    );
+    assert!(
+        out.contains("sudo: Additional head gesture: off (default)"),
+        "{out}"
+    );
     assert!(
         !out.contains("polkit-1:"),
         "one service asked, one service answered: {out}"
@@ -362,6 +428,82 @@ fn credential_release_challenge_reports_defaults_and_toggles() {
     assert_eq!(code, 0);
     assert!(out.contains("off (the default)"), "{out}");
     assert!(std::fs::read_to_string(&cfg).unwrap().contains("=0"));
+
+    // Per-service gesture is only an experimental additional gate. Enabling
+    // warns about false rejects; disabling is direct and explicitly preserves
+    // mandatory keyboard confirmation.
+    let (code, out, err) = run(&mut sb.cmd(&[cmd, "sudo", "on"]), cmd);
+    assert_eq!(code, 0, "{out}{err}");
+    let text = format!("{out}{err}");
+    assert!(text.contains("experimental"), "{text}");
+    assert!(text.contains("may reject valid attempts"), "{text}");
+    assert!(!text.contains("face match alone"), "{text}");
+    assert!(std::fs::read_to_string(&cfg)
+        .unwrap()
+        .contains("service_gesture.sudo=1"));
+
+    let (code, out, err) = run(&mut sb.cmd(&[cmd, "sudo", "off"]), cmd);
+    assert_eq!(code, 0, "{out}{err}");
+    let text = format!("{out}{err}");
+    assert!(
+        text.contains("keyboard confirmation remains required"),
+        "{text}"
+    );
+    assert!(!text.contains("WARNING: Disabling"), "{text}");
+    assert!(std::fs::read_to_string(&cfg)
+        .unwrap()
+        .contains("service_gesture.sudo=0"));
+}
+
+#[test]
+fn credential_release_status_names_the_winning_gesture_migration_source() {
+    let sb = Sandbox::new("crc-source");
+    let cfg = sb.path("cfg/settings.conf");
+    let cmd = "credential-release-challenge";
+
+    for (value, expected) in [
+        (
+            "closure",
+            "cannot approve: eye closure is retired; remove consent_gesture from settings.conf or set it to nod",
+        ),
+        (
+            "banana",
+            "cannot approve: consent_gesture is invalid; remove consent_gesture from settings.conf or set it to nod",
+        ),
+    ] {
+        std::fs::write(&cfg, format!("consent_gesture={value}\n")).unwrap();
+        let (code, out, err) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains(expected), "{value}: {out}");
+        assert!(!out.contains("unset IRLUME_CONSENT_GESTURE"), "{out}");
+        if value == "banana" {
+            assert!(!err.contains(value), "arbitrary value was echoed: {err}");
+        }
+    }
+
+    std::fs::write(&cfg, "consent_gesture=nod\n").unwrap();
+    for (value, expected) in [
+        (
+            "closure",
+            "cannot approve: eye closure is retired; unset IRLUME_CONSENT_GESTURE or set it to nod",
+        ),
+        (
+            "banana",
+            "cannot approve: consent_gesture is invalid; unset IRLUME_CONSENT_GESTURE or set it to nod",
+        ),
+    ] {
+        let (code, out, err) = run(
+            sb.cmd(&[cmd, "status"])
+                .env("IRLUME_CONSENT_GESTURE", value),
+            cmd,
+        );
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains(expected), "{value}: {out}");
+        assert!(!out.contains("from settings.conf"), "{out}");
+        if value == "banana" {
+            assert!(!err.contains(value), "arbitrary value was echoed: {err}");
+        }
+    }
 }
 
 // enrollment-query error is a distinct arm from "none"/populated; and when the

@@ -16,7 +16,8 @@
 //! flushes) run on their own threads. The serialization guarantee lives at
 //! the worker, not the process.
 
-use irlume_common::{Request, Response, SOCKET_PATH};
+use irlume_common::pam_service::ServiceKind;
+use irlume_common::{IntentAttestation, Request, Response, SOCKET_PATH};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use zeroize::Zeroize;
@@ -557,10 +558,9 @@ fn main() {
                     // entirely dead" on any host where the bundled runtime
                     // does not load (a GLIBCXX below the .deb build's 3.4.30
                     // floor, a failed unpack); 0.9.0 pointed the unit at the
-                    // ONNX mesh and started fine on the same host. The nod
-                    // path needs no mesh; the eye-closure gesture and the
-                    // rescue alignment are off and every consent prompt still
-                    // works by nod. IRLUME_MODELS_STRICT keeps the refusal
+                    // ONNX mesh and started fine on the same host. Head consent
+                    // needs no mesh; rescue alignment is unavailable, while
+                    // every consent prompt still works. IRLUME_MODELS_STRICT keeps the refusal
                     // for operators who asked for it. An ABSENT mesh file was
                     // already a silent no-op inside with_mesh.
                     .and_then(|e| {
@@ -574,9 +574,9 @@ fn main() {
                         if let Some(err) = err {
                             eprintln!(
                                 "irlumed: FaceMesh did not load ({err}); continuing WITHOUT \
-                                 the mesh: the eye-closure consent gesture and the \
-                                 detection-rescue alignment are off, the head nod still \
-                                 works. Fix the TFLite runtime (doctor: tflite-runtime) or \
+                                 the mesh: BlazeFace detection-rescue alignment is unavailable; \
+                                 head nod approval and head-shake decline still work. Fix the \
+                                 TFLite runtime (doctor: tflite-runtime) or \
                                  set IRLUME_MESH_MODEL to the ONNX mesh."
                             );
                         }
@@ -2055,6 +2055,16 @@ fn serve(
     diagnostic_state: &diagnostics::DiagnosticState,
 ) -> std::io::Result<()> {
     let peer = peer_cred(&stream)?;
+    serve_peer(stream, arbiter, engine_ready, diagnostic_state, peer)
+}
+
+fn serve_peer(
+    stream: UnixStream,
+    arbiter: &arbiter::Arbiter<Queued>,
+    engine_ready: &std::sync::atomic::AtomicBool,
+    diagnostic_state: &diagnostics::DiagnosticState,
+    peer: Peer,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(15)))?;
     match read_request(&stream)? {
@@ -2090,6 +2100,10 @@ fn serve(
                 return respond(stream, &dispatch_before_engine(req, &peer));
             }
             if let Some(resp) = pregate(&req, &peer) {
+                // This is a completed production request even though it never
+                // queues: retain its failed Status diagnostic before replying.
+                let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
+                scope.finish(categorical_outcome(&resp));
                 return respond(stream, &resp);
             }
             let class = arbiter::classify(&req);
@@ -2343,8 +2357,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
         | ForgetRecognizer { user, .. }
         | RenameProfile { user, .. }
         | RenameScan { user, .. }
-        | SetRequireEyesOpen { user, .. }
-        | SetClosureCalibration { user, .. } => RequestPosture {
+        | SetRequireEyesOpen { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "modify" },
             user: Some(user.as_str()),
             enrollment: Mutates,
@@ -2391,6 +2404,13 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: Some(user.as_str()),
             enrollment: Reads,
         },
+        // Retains the old root-or-target posture, but the retired tombstone
+        // neither reads nor rewrites the enrollment.
+        SetClosureCalibration { user, .. } => RequestPosture {
+            privilege: RootOrTarget { verb: "modify" },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
         HasSealedPassword { user } | KeyringInfo { user } | RecoveryStatus { user } => {
             RequestPosture {
                 privilege: RootOrTarget { verb: "query" },
@@ -2427,7 +2447,8 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             enrollment: Reads,
         },
         // Root-only and account-naming: the sealed credential is released to a
-        // root peer alone, and the calibration capture fires the camera.
+        // root peer alone. The retired calibration request keeps its historical
+        // root-only posture before returning its tombstone.
         UnsealPassword { user, .. } => RequestPosture {
             privilege: RootOnly {
                 command: "unseal_password",
@@ -2635,17 +2656,8 @@ fn summarize_enrollment(
                     }
                 })
                 .collect(),
-            require_eyes_open: enr.require_eyes_open,
-            closure_calibrated: enr
-                .closure_calibration
-                .map(|(o, c)| {
-                    irlume_liveness::ClosureCalibration {
-                        ear_open: o,
-                        ear_closed: c,
-                    }
-                    .is_usable()
-                })
-                .unwrap_or(false),
+            require_eyes_open: false,
+            closure_calibrated: false,
             ir_ratio_calibrated: enr.ir_center_edge_ratio_floor().is_some(),
         },
         // A successful load that found nothing IS an observation: publishing
@@ -2735,6 +2747,47 @@ fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
     Response::Error(format!("not authorized to {verb} '{user}'"))
 }
 
+/// Validate the PAM assertion before startup routing, worker queueing, or any
+/// camera path. The field carries no prompt bytes and is trusted only from a
+/// root peer for a recognized privileged service.
+fn intent_confirmation_gate(req: &Request, peer: &Peer) -> Option<Response> {
+    let Request::Authenticate {
+        service,
+        intent_confirmation,
+        ..
+    } = req
+    else {
+        return None;
+    };
+
+    let requires_confirmation = service
+        .as_deref()
+        .and_then(irlume_common::pam_service::classify)
+        .is_some_and(ServiceKind::requires_face_intent_confirmation);
+    let has_trusted_confirmation = peer.uid == 0
+        && matches!(
+            intent_confirmation,
+            Some(IntentAttestation::PamConversation)
+        );
+    let valid = if requires_confirmation {
+        has_trusted_confirmation
+    } else {
+        intent_confirmation.is_none()
+    };
+    if valid {
+        return None;
+    }
+
+    Some(Response::AuthResult {
+        granted: false,
+        score: 0.0,
+        live: false,
+        reason: "privileged face authentication requires PAM conversation confirmation".into(),
+        declined_by_gesture: false,
+        refused_by_policy: true,
+    })
+}
+
 /// The gate every request passes before any arm runs, shared by the worker
 /// dispatch and the connection-thread status dispatch: the username the
 /// request names is screened for traversal, then the privilege the [`posture`]
@@ -2748,6 +2801,9 @@ fn pregate(req: &Request, peer: &Peer) -> Option<Response> {
         if !valid_username(u) {
             return Some(Response::Error("invalid username".into()));
         }
+    }
+    if let Some(response) = intent_confirmation_gate(req, peer) {
+        return Some(response);
     }
     match posture.privilege {
         Privilege::AnyPeer => None,
@@ -3173,6 +3229,11 @@ fn enroll_with_capture_probe(
     enroll()
 }
 
+const CAPTURE_EAR_MEDIAN_RETIRED: &str =
+    "capture-ear-median is retired; eye-closure calibration is no longer used";
+const SET_CLOSURE_CALIBRATION_RETIRED: &str =
+    "set-closure-calibration is retired; eye-closure calibration is no longer used";
+
 fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::OperationClass {
     use irlume_common::diagnostics::OperationClass;
     use Request::*;
@@ -3180,9 +3241,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         Authenticate { .. } | UnsealPassword { .. } | UnsealKeyring { .. } => {
             OperationClass::Authentication
         }
-        Enroll { .. } | AddScan { .. } | CaptureEarMedian { .. } | PositionSample { .. } => {
-            OperationClass::Enrollment
-        }
+        Enroll { .. } | AddScan { .. } | PositionSample { .. } => OperationClass::Enrollment,
         Identify => OperationClass::Identification,
         TuneCaptureMode { .. } => OperationClass::CaptureQualification,
         SupportProbe { .. } => OperationClass::SupportProbe,
@@ -3199,6 +3258,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | RenameProfile { .. }
         | RenameScan { .. }
         | SetRequireEyesOpen { .. }
+        | CaptureEarMedian { .. }
         | SetClosureCalibration { .. }
         | Ping
         | Health
@@ -3229,6 +3289,12 @@ fn categorical_outcome(response: &Response) -> irlume_common::diagnostics::Categ
             ProbeOutcome::Unavailable => CategoricalOutcome::Unavailable,
             ProbeOutcome::Failed => CategoricalOutcome::Failed,
         },
+        Response::Error(message)
+            if message == CAPTURE_EAR_MEDIAN_RETIRED
+                || message == SET_CLOSURE_CALIBRATION_RETIRED =>
+        {
+            CategoricalOutcome::Completed
+        }
         Response::Error(_) | Response::OperationError { .. } => CategoricalOutcome::Failed,
         _ => CategoricalOutcome::Completed,
     }
@@ -3261,16 +3327,8 @@ fn dispatch_scoped(
     if let Some(resp) = pregate(&req, peer) {
         return resp;
     }
-    // Refuses to turn ON, and this is deliberate (#386). The gate cannot admit
-    // the user it exists for: replaying the committed blink corpus through the
-    // shipped `both_eyes_open`, 12 detected frames per state, bare-eyed with
-    // eyes genuinely OPEN reads open 1 time in 12 and with glasses 0 times in
-    // 12, so no eyewear or lighting state in the record leaves it usable.
-    //
-    // Refused rather than warned because there is no configuration that works:
-    // a warning implies a tradeoff the measurement does not offer. Turning it
-    // OFF is always allowed, so an enrollment already carrying the flag is
-    // never trapped.
+    // Eyes-open enforcement is retired (#386). Turning it OFF remains available
+    // so a legacy enrollment carrying the flag is never trapped.
     //
     // Placed HERE, above the invalidation below, rather than in the match: this
     // is a refusal, and the invariant in that comment is that a request about
@@ -3284,9 +3342,8 @@ fn dispatch_scoped(
     // landing inside another session's open/closed separation window.
     if matches!(req, Request::SetRequireEyesOpen { on: true, .. }) {
         return Response::Error(
-            "require-eyes-open cannot be enabled: it refuses the user it exists to admit \
-             (measured 1 of 12 bare-eyed frames with eyes open, 0 of 12 with glasses). \
-             See issue #386; `irlume profiles eyes-open off` still works."
+            "require-eyes-open is retired and cannot be enabled; see issue #386; \
+             `irlume profiles eyes-open off` still works."
                 .into(),
         );
     }
@@ -3396,7 +3453,7 @@ fn dispatch_scoped(
                 Err(e) => Response::Error(e.to_string()),
             }
         }
-        Request::Authenticate { user, service } => {
+        Request::Authenticate { user, service, .. } => {
             // Root (PAM stacks) or the account owner only, from the posture
             // table. Without that gate any local peer could probe
             // Authenticate{other_user} and read the raw similarity score, a
@@ -3876,8 +3933,8 @@ fn dispatch_scoped(
             }
             // ALWAYS-ON: a polkit prompt never releases the sealed credential,
             // independent of the tier and the opt-in biopolicy below. The
-            // polkit agent runs its PAM conversation with no user gesture, so a
-            // `unseal`-arg line (mis)wired into polkit-1 must not be able to
+            // A polkit agent can start PAM before conventional confirmation, so
+            // an `unseal`-arg line (mis)wired into polkit-1 must not be able to
             // pull the login password out of the TPM; polkit gets verify-only
             // (Authenticate).
             {
@@ -4224,36 +4281,13 @@ fn dispatch_scoped(
             s.name = new_name.clone();
             Ok(format!("renamed scan to '{new_name}'"))
         }),
-        Request::SetRequireEyesOpen { user, on } => mutate_enrollment(&user, |enr| {
-            enr.require_eyes_open = on;
-            Ok(format!(
-                "require-eyes-open {}",
-                if on { "ENABLED" } else { "disabled" }
-            ))
-        }),
-        Request::CaptureEarMedian { user: _ } => {
-            // Fires the camera, so the table root-gates it like the other
-            // camera-bearing requests. The socket is world-connectable, so that
-            // gate is what keeps other uids out.
-            //
-            // ~3s window: enough frames for a stable median of the current eye
-            // state (open or closed, whichever the caller is prompting).
-            const CAL_FRAMES: usize = 45;
-            match engine.capture_ear_samples(CAL_FRAMES) {
-                Ok(samples) => Response::EarMedian(irlume_liveness::calibrate_open_ear(&samples)),
-                Err(e) => Response::Error(e.to_string()),
-            }
+        Request::SetRequireEyesOpen { user, .. } => {
+            set_require_eyes_open_off(&user, engine.embed_space())
         }
-        Request::SetClosureCalibration {
-            user,
-            ear_open,
-            ear_closed,
-        } => mutate_enrollment(&user, |enr| {
-            enr.closure_calibration = Some((ear_open, ear_closed));
-            Ok(format!(
-                "closure calibration stored (open {ear_open:.3}, closed {ear_closed:.3})"
-            ))
-        }),
+        Request::CaptureEarMedian { .. } => Response::Error(CAPTURE_EAR_MEDIAN_RETIRED.into()),
+        Request::SetClosureCalibration { .. } => {
+            Response::Error(SET_CLOSURE_CALIBRATION_RETIRED.into())
+        }
         Request::SelfTest { kind } => {
             // Fires the camera and returns raw liveness/alignment measurements
             // (IR brightness, center/edge, glint), which are a spoof-tuning
@@ -4363,6 +4397,23 @@ fn mutate_enrollment(
             }
         }
         Err(e) => Response::Error(e),
+    }
+}
+
+fn set_require_eyes_open_off(user: &str, embed_space: &str) -> Response {
+    let mut enrollment = match irlume_core::storage::load(user) {
+        Ok(Some(enrollment)) => enrollment,
+        Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
+        Err(error) => return Response::Error(error.to_string()),
+    };
+    enrollment.require_eyes_open = false;
+    match irlume_core::storage::save(&enrollment) {
+        Ok(()) => {
+            let summary = summarize_enrollment(Some(&enrollment), embed_space);
+            publish_enrollment_summary(user, summary);
+            Response::Ok("require-eyes-open disabled".into())
+        }
+        Err(error) => Response::Error(error.to_string()),
     }
 }
 
@@ -5319,6 +5370,24 @@ mod tests {
         })
     }
 
+    fn with_serve_as_peer_and_diagnostics<R>(
+        arbiter: &arbiter::Arbiter<Queued>,
+        ready: &std::sync::atomic::AtomicBool,
+        diagnostic_state: &diagnostics::DiagnosticState,
+        peer: Peer,
+        client: impl FnOnce(&UnixStream) -> R,
+    ) -> R {
+        std::thread::scope(|scope| {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            let server =
+                scope.spawn(|| serve_peer(theirs, arbiter, ready, diagnostic_state, peer).unwrap());
+            let out = client(&ours);
+            drop(ours);
+            server.join().unwrap();
+            out
+        })
+    }
+
     /// Exclusive. For a test that MUTATES the environment.
     fn env_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
         crate::test_support::env_write()
@@ -5709,7 +5778,8 @@ mod tests {
         u, secret;
         Authenticate => Request::Authenticate {
             user: u(),
-            service: Some("sudo".into()),
+            service: Some("kde".into()),
+            intent_confirmation: None,
         },
         Enroll => Request::Enroll {
             user: u(),
@@ -5986,6 +6056,91 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// The service table decides whether conventional confirmation is required;
+    /// the peer credentials decide whether its typed assertion is trusted.
+    #[test]
+    fn privileged_auth_requires_root_pam_attestation() {
+        let _g = env_lock();
+        let root = peer(0);
+        let nobody = peer(NOBODY);
+        let auth = |service: Option<&str>, intent_confirmation| Request::Authenticate {
+            user: "root".into(),
+            service: service.map(str::to_string),
+            intent_confirmation,
+        };
+
+        for request in [
+            auth(Some("sudo"), Some(IntentAttestation::PamConversation)),
+            auth(Some("polkit-1"), Some(IntentAttestation::PamConversation)),
+            auth(Some("kde"), None),
+            auth(None, None),
+        ] {
+            assert!(
+                pregate(&request, &root).is_none(),
+                "valid request was refused: {request:?}"
+            );
+        }
+
+        for (request, request_peer) in [
+            (auth(Some("sudo"), None), &root),
+            (
+                auth(Some("sudo"), Some(IntentAttestation::PamConversation)),
+                &nobody,
+            ),
+            (auth(None, Some(IntentAttestation::PamConversation)), &root),
+            (
+                auth(Some("kde"), Some(IntentAttestation::PamConversation)),
+                &root,
+            ),
+        ] {
+            match pregate(&request, request_peer) {
+                Some(Response::AuthResult {
+                    granted,
+                    score,
+                    live,
+                    reason,
+                    declined_by_gesture,
+                    refused_by_policy,
+                }) => {
+                    assert!(!granted && !live && !declined_by_gesture);
+                    assert_eq!(score, 0.0);
+                    assert!(refused_by_policy);
+                    assert_eq!(
+                        reason,
+                        "privileged face authentication requires PAM conversation confirmation"
+                    );
+                }
+                other => panic!("invalid intent assertion was not typed refusal: {other:?}"),
+            }
+        }
+    }
+
+    /// Model startup cannot weaken the gate: an old PAM request missing the
+    /// field gets the same typed fallback before an engine or worker exists.
+    #[test]
+    fn startup_privileged_auth_refuses_missing_confirmation() {
+        let _g = env_lock();
+        let response = dispatch_before_engine(
+            Request::Authenticate {
+                user: "root".into(),
+                service: Some("sudo".into()),
+                intent_confirmation: None,
+            },
+            &peer(0),
+        );
+        assert!(matches!(
+            response,
+            Response::AuthResult {
+                granted: false,
+                score: 0.0,
+                live: false,
+                declined_by_gesture: false,
+                refused_by_policy: true,
+                ..
+            }
+        ));
     }
 
     /// The refusal has to name the thing the operator typed, not the wire
@@ -6391,6 +6546,288 @@ mod tests {
         assert!(arbiter.take().is_none(), "snapshot must never queue");
     }
 
+    /// Exercise the production socket route: invalid intent is a recorded typed
+    /// denial before the arbiter, while a root-attested privileged request
+    /// is the only one allowed to cross the worker boundary.
+    #[test]
+    fn intent_refusal_is_recorded_without_queue_or_camera() {
+        use irlume_common::diagnostics::{CategoricalOutcome, OperationClass, ShareSafeEventKind};
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let _g = env_lock();
+        let diagnostic_state = diagnostics::DiagnosticState::default();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let refused = arbiter::Arbiter::<Queued>::new();
+        refused.close();
+
+        for (request, request_peer) in [
+            (
+                Request::Authenticate {
+                    user: "root".into(),
+                    service: Some("sudo".into()),
+                    intent_confirmation: None,
+                },
+                peer(0),
+            ),
+            (
+                Request::Authenticate {
+                    user: "root".into(),
+                    service: Some("sudo".into()),
+                    intent_confirmation: Some(IntentAttestation::PamConversation),
+                },
+                peer(NOBODY),
+            ),
+        ] {
+            let mut wire = serde_json::to_string(&request).unwrap();
+            wire.push('\n');
+            let response = with_serve_as_peer_and_diagnostics(
+                &refused,
+                &ready,
+                &diagnostic_state,
+                request_peer,
+                |client| {
+                    (&*client).write_all(wire.as_bytes()).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(client).read_line(&mut line).unwrap();
+                    serde_json::from_str::<Response>(line.trim()).unwrap()
+                },
+            );
+            match response {
+                Response::AuthResult {
+                    granted: false,
+                    score,
+                    live: false,
+                    reason,
+                    declined_by_gesture: false,
+                    refused_by_policy: true,
+                } => {
+                    assert_eq!(score, 0.0);
+                    assert_eq!(
+                        reason,
+                        "privileged face authentication requires PAM conversation confirmation"
+                    );
+                }
+                other => panic!("intent refusal changed shape: {other:?}"),
+            }
+        }
+        assert!(refused.take().is_none(), "intent refusals must never queue");
+
+        let events = || {
+            diagnostic_state
+                .snapshot(std::time::Duration::from_secs(60))
+                .events()
+                .iter()
+                .filter_map(|event| match event.kind {
+                    ShareSafeEventKind::OperationFinished { outcome } => {
+                        Some((event.operation, outcome))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            events(),
+            vec![
+                (OperationClass::Authentication, CategoricalOutcome::Denied),
+                (OperationClass::Authentication, CategoricalOutcome::Denied),
+            ]
+        );
+
+        let authorized = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let worker = {
+            let authorized = std::sync::Arc::clone(&authorized);
+            std::thread::spawn(move || {
+                let job = authorized.take().expect("attested request queued");
+                let Queued {
+                    req,
+                    reply,
+                    link,
+                    scope,
+                    ..
+                } = job.payload;
+                assert!(matches!(
+                    req,
+                    Request::Authenticate {
+                        service: Some(ref service),
+                        intent_confirmation: Some(IntentAttestation::PamConversation),
+                        ..
+                    } if service == "sudo"
+                ));
+                assert!(link.claim());
+                let response = Response::Ok("queued".into());
+                scope.finish(categorical_outcome(&response));
+                link.released();
+                authorized.finish(job.class, job.uid);
+                reply.send(response).unwrap();
+            })
+        };
+        let request = Request::Authenticate {
+            user: "root".into(),
+            service: Some("sudo".into()),
+            intent_confirmation: Some(IntentAttestation::PamConversation),
+        };
+        let mut wire = serde_json::to_string(&request).unwrap();
+        wire.push('\n');
+        let response = with_serve_as_peer_and_diagnostics(
+            &authorized,
+            &ready,
+            &diagnostic_state,
+            peer(0),
+            |client| {
+                (&*client).write_all(wire.as_bytes()).unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(line.trim()).unwrap()
+            },
+        );
+        assert!(matches!(response, Response::Ok(ref message) if message == "queued"));
+        authorized.close();
+        worker.join().unwrap();
+        assert_eq!(
+            events(),
+            vec![
+                (OperationClass::Authentication, CategoricalOutcome::Denied),
+                (OperationClass::Authentication, CategoricalOutcome::Denied),
+                (
+                    OperationClass::Authentication,
+                    CategoricalOutcome::Completed,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn serve_records_eye_privilege_failures_and_tombstone_completion() {
+        use irlume_common::diagnostics::{CategoricalOutcome, OperationClass, ShareSafeEventKind};
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let _g = env_lock();
+        let diagnostic_state = diagnostics::DiagnosticState::default();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+
+        // Closed on purpose: a regression that queues either unauthorized
+        // request gets an arbiter refusal instead of the exact privilege reply.
+        let refused = arbiter::Arbiter::<Queued>::new();
+        refused.close();
+        for (wire, expected) in [
+            (
+                "{\"CaptureEarMedian\":{\"user\":\"root\"}}\n".to_string(),
+                format!("capture_ear_median requires root (peer uid {NOBODY})"),
+            ),
+            (
+                "{\"SetClosureCalibration\":{\"user\":\"root\",\"ear_open\":0.3,\"ear_closed\":0.1}}\n"
+                    .into(),
+                "not authorized to modify 'root'".into(),
+            ),
+        ] {
+            let response = with_serve_as_peer_and_diagnostics(
+                &refused,
+                &ready,
+                &diagnostic_state,
+                peer(NOBODY),
+                |client| {
+                    (&*client).write_all(wire.as_bytes()).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(client).read_line(&mut line).unwrap();
+                    serde_json::from_str::<Response>(line.trim()).unwrap()
+                },
+            );
+            match response {
+                Response::Error(message) => assert_eq!(message, expected),
+                other => panic!("privilege refusal changed: {other:?}"),
+            }
+        }
+        assert!(
+            refused.take().is_none(),
+            "privilege refusals must never queue"
+        );
+
+        let terminal_events = || {
+            diagnostic_state
+                .snapshot(std::time::Duration::from_secs(60))
+                .events()
+                .iter()
+                .filter_map(|event| match event.kind {
+                    ShareSafeEventKind::OperationFinished { outcome } => {
+                        Some((event.operation, outcome))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            terminal_events(),
+            vec![
+                (OperationClass::Status, CategoricalOutcome::Failed),
+                (OperationClass::Status, CategoricalOutcome::Failed),
+            ]
+        );
+
+        // The worker is outside `serve`; stand in only for that boundary and
+        // finish the real queued scope exactly as the production worker does.
+        let authorized = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let worker = {
+            let authorized = std::sync::Arc::clone(&authorized);
+            std::thread::spawn(move || {
+                let mut engine = engine();
+                for _ in 0..2 {
+                    let job = authorized.take().expect("authorized tombstone queued");
+                    let Queued {
+                        req,
+                        peer,
+                        reply,
+                        link,
+                        scope,
+                    } = job.payload;
+                    assert!(link.claim());
+                    let response = dispatch_scoped(req, &peer, &mut engine, &scope);
+                    scope.finish(categorical_outcome(&response));
+                    link.released();
+                    authorized.finish(job.class, job.uid);
+                    reply.send(response).unwrap();
+                }
+            })
+        };
+        for (wire, expected) in [
+            (
+                "{\"CaptureEarMedian\":{\"user\":\"carol\"}}\n",
+                CAPTURE_EAR_MEDIAN_RETIRED,
+            ),
+            (
+                "{\"SetClosureCalibration\":{\"user\":\"carol\",\"ear_open\":0.3,\"ear_closed\":0.1}}\n",
+                SET_CLOSURE_CALIBRATION_RETIRED,
+            ),
+        ] {
+            let response = with_serve_as_peer_and_diagnostics(
+                &authorized,
+                &ready,
+                &diagnostic_state,
+                peer(0),
+                |client| {
+                    (&*client).write_all(wire.as_bytes()).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(client).read_line(&mut line).unwrap();
+                    serde_json::from_str::<Response>(line.trim()).unwrap()
+                },
+            );
+            match response {
+                Response::Error(message) => assert_eq!(message, expected),
+                other => panic!("authorized tombstone changed: {other:?}"),
+            }
+        }
+        authorized.close();
+        worker.join().unwrap();
+        assert_eq!(
+            terminal_events(),
+            vec![
+                (OperationClass::Status, CategoricalOutcome::Failed),
+                (OperationClass::Status, CategoricalOutcome::Failed),
+                (OperationClass::Status, CategoricalOutcome::Completed),
+                (OperationClass::Status, CategoricalOutcome::Completed),
+            ]
+        );
+    }
+
     #[test]
     fn peer_gone_reads_a_closed_peer_and_only_a_closed_peer() {
         // The primitive the disconnect check rests on, against a real socket pair
@@ -6473,6 +6910,21 @@ mod tests {
         // one command at a time, so it serves from the worker with the
         // other TPM users, not from a connection thread.
         assert_eq!(classify(&Request::KeyringInfo { user: u() }), Class::Plain);
+        for req in [
+            Request::CaptureEarMedian { user: u() },
+            Request::SetClosureCalibration {
+                user: u(),
+                ear_open: 0.3,
+                ear_closed: 0.1,
+            },
+        ] {
+            assert_eq!(classify(&req), Class::Plain, "{req:?}");
+            assert_eq!(
+                diagnostic_operation_class(&req),
+                irlume_common::diagnostics::OperationClass::Status,
+                "{req:?}"
+            );
+        }
         // Mutating requests stay serialized on the worker: reclassifying one
         // as Status would let it race captures and other writers.
         for req in [
@@ -6526,7 +6978,7 @@ mod tests {
                     scans_by_recognizer: Default::default(),
                     live_recognizer: None,
                 }],
-                require_eyes_open: true,
+                require_eyes_open: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: true,
             },
@@ -6535,11 +6987,12 @@ mod tests {
             Some(Response::Enrollment {
                 profiles,
                 require_eyes_open,
+                closure_calibrated,
                 ir_ratio_calibrated,
-                ..
             }) => {
                 assert_eq!(profiles.len(), 1);
-                assert!(require_eyes_open);
+                assert!(!require_eyes_open);
+                assert!(!closure_calibrated);
                 assert!(ir_ratio_calibrated);
             }
             other => panic!("expected the cached enrollment, got {other:?}"),
@@ -6570,7 +7023,6 @@ mod tests {
             "RenameProfile",
             "RenameScan",
             "SetRequireEyesOpen",
-            "SetClosureCalibration",
             "RecoverySetup",
             "RecoveryRestore",
             "RecoveryForget",
@@ -6615,7 +7067,7 @@ mod tests {
             SAMPLE_USER,
             EnrollmentSummary {
                 profiles: Vec::new(),
-                require_eyes_open: true,
+                require_eyes_open: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
@@ -6872,6 +7324,7 @@ mod tests {
         let mut wire = serde_json::to_value(Request::Authenticate {
             user: "carol".into(),
             service: Some("sudo".into()),
+            intent_confirmation: None,
         })
         .unwrap();
         wire.get_mut("Authenticate")
@@ -7672,6 +8125,21 @@ mod tests {
         .unwrap();
     }
 
+    /// Write the pre-retirement wire shape. Normal serialization deliberately
+    /// omits this field, so a legacy fixture must insert it as literal JSON.
+    fn write_legacy_eyes_open_enrollment(dir: &std::path::Path, e: &Enrollment) {
+        let mut legacy = serde_json::to_value(e).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert("require_eyes_open".into(), serde_json::Value::Bool(true));
+        std::fs::write(
+            dir.join(format!("{}.json", e.user)),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn unit512(seed: usize) -> Vec<f32> {
         let mut v: Vec<f32> = (0..512)
             .map(|j| (j as f32 * 0.7).sin() + 0.05 * (seed as f32 * 1.3 + j as f32).sin())
@@ -7735,6 +8203,7 @@ mod tests {
             Request::Authenticate {
                 user: "a/b".into(),
                 service: None,
+                intent_confirmation: None,
             },
             Request::UnsealPassword {
                 user: "-flag".into(),
@@ -7805,6 +8274,7 @@ mod tests {
             Request::Authenticate {
                 user: "carol".into(),
                 service: None,
+                intent_confirmation: None,
             },
             &peer(NOBODY),
             &mut e,
@@ -7825,6 +8295,7 @@ mod tests {
             Request::Authenticate {
                 user: "carol".into(),
                 service: Some("kde".into()),
+                intent_confirmation: None,
             },
             &peer(0),
             &mut e,
@@ -7865,6 +8336,8 @@ mod tests {
                 Request::Authenticate {
                     user: "carol".into(),
                     service: Some(service.into()),
+                    intent_confirmation: (service == "sudo")
+                        .then_some(IntentAttestation::PamConversation),
                 },
                 &peer(0),
                 &mut e,
@@ -7901,6 +8374,7 @@ mod tests {
             Request::Authenticate {
                 user: "irlume-test-ghost".into(),
                 service: Some("kde".into()),
+                intent_confirmation: None,
             },
             &peer(0),
             &mut e,
@@ -7931,6 +8405,7 @@ mod tests {
             Request::Authenticate {
                 user: "carol".into(),
                 service: Some("kde".into()),
+                intent_confirmation: None,
             },
             &peer(0),
             &mut e,
@@ -7977,6 +8452,7 @@ mod tests {
         let sb = sandbox("list");
         let mut enr = enrollment_with("carol", &["Face Scan 1", "Face Scan 2"]);
         enr.require_eyes_open = true;
+        enr.closure_calibration = Some((0.3, 0.1));
         write_enrollment(&sb.dir, &enr);
         match dispatch(
             Request::ListProfiles {
@@ -7989,6 +8465,7 @@ mod tests {
             Response::Enrollment {
                 profiles,
                 require_eyes_open,
+                closure_calibrated,
                 ..
             } => {
                 assert_eq!(profiles.len(), 1);
@@ -7997,7 +8474,8 @@ mod tests {
                     profiles[0].scans,
                     vec!["Face Scan 1".to_string(), "Face Scan 2".to_string()]
                 );
-                assert!(require_eyes_open);
+                assert!(!require_eyes_open);
+                assert!(!closure_calibrated);
             }
             other => panic!("expected Response::Enrollment, got {other:?}"),
         }
@@ -8401,11 +8879,95 @@ mod tests {
     }
 
     #[test]
+    fn retired_eye_tombstones_are_diagnostic_completed_not_failures() {
+        use irlume_common::diagnostics::CategoricalOutcome;
+
+        for message in [
+            "capture-ear-median is retired; eye-closure calibration is no longer used",
+            "set-closure-calibration is retired; eye-closure calibration is no longer used",
+        ] {
+            assert_eq!(
+                categorical_outcome(&Response::Error(message.into())),
+                CategoricalOutcome::Completed
+            );
+        }
+        assert_eq!(
+            categorical_outcome(&Response::Error(
+                "capture_ear_median requires root (peer uid 65534)".into()
+            )),
+            CategoricalOutcome::Failed,
+            "the privilege refusal is not the successfully served tombstone"
+        );
+    }
+
+    #[test]
+    fn retired_eye_calibration_requests_keep_privilege_and_have_no_side_effects() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("retired-eye-calibration");
+        let _ = &sb;
+        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
+        let profile_path = irlume_core::storage::profile_path("carol");
+        let stored = std::fs::read(&profile_path).expect("stored enrollment fixture");
+        let cases = [
+            (
+                Request::CaptureEarMedian {
+                    user: "carol".into(),
+                },
+                format!("capture_ear_median requires root (peer uid {NOBODY})"),
+                "capture-ear-median is retired; eye-closure calibration is no longer used",
+            ),
+            (
+                Request::SetClosureCalibration {
+                    user: "carol".into(),
+                    ear_open: 0.3,
+                    ear_closed: 0.1,
+                },
+                "not authorized to modify 'carol'".into(),
+                "set-closure-calibration is retired; eye-closure calibration is no longer used",
+            ),
+        ];
+
+        for (request, privilege_error, retired_error) in cases {
+            assert_eq!(arbiter::classify(&request), arbiter::Class::Plain);
+            assert_eq!(
+                diagnostic_operation_class(&request),
+                irlume_common::diagnostics::OperationClass::Status
+            );
+            publish_enrollment_summary(
+                "carol",
+                EnrollmentSummary {
+                    profiles: Vec::new(),
+                    require_eyes_open: false,
+                    closure_calibrated: false,
+                    ir_ratio_calibrated: false,
+                },
+            );
+            match dispatch(request.clone(), &peer(NOBODY), &mut e) {
+                Response::Error(message) => assert_eq!(message, privilege_error),
+                other => panic!("privilege gate must run before tombstone, got {other:?}"),
+            }
+            let response = dispatch(request, &peer(0), &mut e);
+            match response {
+                Response::Error(message) => assert_eq!(message, retired_error),
+                other => panic!("retired request must return its tombstone, got {other:?}"),
+            }
+            assert!(
+                cached_enrollment_summary("carol").is_some(),
+                "a tombstone must not invalidate the enrollment summary"
+            );
+            assert_eq!(
+                std::fs::read(&profile_path).expect("enrollment remains present"),
+                stored,
+                "a tombstone must not mutate enrollment storage"
+            );
+        }
+    }
+
+    #[test]
     fn require_eyes_open_is_refused_at_the_dispatch_choke_point() {
-        // #386. The gate refuses the user it exists to admit: replaying the
-        // committed blink corpus through the shipped `both_eyes_open` reads
-        // eyes-open 1 time in 12 bare-eyed and 0 times in 12 with glasses, so
-        // no eyewear or lighting state in the record leaves it usable.
+        // #386 retired the gate because it cannot reliably admit the user it
+        // exists to admit under ordinary eyewear and lighting changes.
         //
         // Asserted at DISPATCH because that is the one choke point: `irlume
         // profiles eyes-open on` and the TUI toggle both send this request, so
@@ -8517,7 +9079,30 @@ mod tests {
     }
 
     #[test]
-    fn refusing_require_eyes_open_writes_nothing_and_off_still_works() {
+    fn legacy_eyes_open_fixture_writes_the_retired_true_literal() {
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-legacy-eyes-open-fixture-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let enrollment = enrollment_with("carol", &["Face Scan 1"]);
+
+        write_legacy_eyes_open_enrollment(&dir, &enrollment);
+
+        let raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("carol.json")).expect("legacy fixture exists"),
+        )
+        .unwrap();
+        assert_eq!(
+            raw.get("require_eyes_open"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn require_eyes_open_off_is_idempotent_and_on_is_retired() {
         // The storage half of the refusal, which does need a TPM-free host
         // because the off arm ends in storage::save. Same convention as the
         // other save-touching tests here.
@@ -8529,37 +9114,63 @@ mod tests {
         let mut e = engine();
         let sb = sandbox("eyes-open-refusal");
         let _ = &sb;
-        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
+        let mut enrollment = enrollment_with("carol", &["Face Scan 1"]);
+        enrollment.require_eyes_open = true;
+        write_legacy_eyes_open_enrollment(&sb.dir, &enrollment);
         let root = peer(0);
 
-        let _ = dispatch(
+        publish_enrollment_summary(
+            "carol",
+            summarize_enrollment(Some(&enrollment), e.embed_space()),
+        );
+
+        match dispatch(
             Request::SetRequireEyesOpen {
                 user: "carol".into(),
                 on: true,
             },
             &root,
             &mut e,
-        );
-        // A refused enable that persisted anyway would be the worst of both:
-        // told no, locked out regardless.
+        ) {
+            Response::Error(msg) => assert!(msg.contains("retired"), "{msg}"),
+            other => panic!("enabling the retired policy must fail, got {other:?}"),
+        }
         let enr = irlume_core::storage::load("carol")
             .expect("load")
             .expect("the enrollment exists");
         assert!(
-            !enr.require_eyes_open,
+            enr.require_eyes_open,
             "a refused enable must leave the stored flag alone"
         );
+        assert!(
+            !cached_enrollment_summary("carol")
+                .expect("refused ON must preserve the summary")
+                .require_eyes_open,
+            "the preserved summary must keep the retired field frozen false"
+        );
 
-        match dispatch(
-            Request::SetRequireEyesOpen {
-                user: "carol".into(),
-                on: false,
-            },
-            &root,
-            &mut e,
-        ) {
-            Response::Ok(msg) => assert_eq!(msg, "require-eyes-open disabled"),
-            other => panic!("disabling must still work, got {other:?}"),
+        for attempt in 1..=2 {
+            match dispatch(
+                Request::SetRequireEyesOpen {
+                    user: "carol".into(),
+                    on: false,
+                },
+                &root,
+                &mut e,
+            ) {
+                Response::Ok(msg) => assert_eq!(msg, "require-eyes-open disabled"),
+                other => panic!("OFF attempt {attempt} must succeed, got {other:?}"),
+            }
+            let enr = irlume_core::storage::load("carol")
+                .expect("load")
+                .expect("the enrollment exists");
+            assert!(!enr.require_eyes_open, "OFF attempt {attempt} must persist");
+            assert!(
+                !cached_enrollment_summary("carol")
+                    .expect("OFF must publish the saved summary")
+                    .require_eyes_open,
+                "OFF attempt {attempt} must publish the cleared flag"
+            );
         }
     }
 
@@ -8886,8 +9497,8 @@ mod tests {
             other => panic!("convenience tier must refuse unseal, got {other:?}"),
         }
         // A polkit service NEVER releases the credential, on any tier, with or
-        // without the opt-in biopolicy: the polkit agent starts its PAM
-        // conversation with no user gesture, so this fires before every other
+        // without the opt-in biopolicy: a polkit agent can start PAM before
+        // conventional confirmation, so this fires before every other
         // consideration except root and method.
         for svc in ["polkit-1", "polkit"] {
             match dispatch(
@@ -9382,6 +9993,7 @@ mod tests {
             Request::Authenticate {
                 user: "lbuser".into(),
                 service: Some("kde".into()),
+                intent_confirmation: None,
             },
             &peer(0),
             &mut e,

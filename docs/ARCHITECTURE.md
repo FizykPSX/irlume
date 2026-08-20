@@ -94,7 +94,7 @@ runtime.
 |---|---|---|---|
 | YuNet (`face_detection_yunet_2023mar.onnx`) | detection | finds the face in both the RGB and IR frames: bbox + 5 landmarks | MIT |
 | BlazeFace short-range (`blaze_face_short_range.onnx`) | detection rescue | cascade stage 2, runs only when YuNet finds nothing (saturated or backlit frames); its coarse box is refined by FaceMesh before use | Apache-2.0 |
-| MediaPipe FaceLandmarker mesh (`face_landmarks_detector.tflite`, Google's published artifact run on the bundled TFLite runtime; `face_landmark.onnx` ships as the ONNX conversion fallback) | consent gesture + rescue alignment | 478 dense landmarks; drives the eye-closure consent gesture and its calibration, and turns rescue boxes into alignment points. Never used for recognition | Apache-2.0 |
+| MediaPipe FaceLandmarker mesh (`face_landmarks_detector.tflite`, Google's published artifact run on the bundled TFLite runtime; `face_landmark.onnx` ships as the ONNX conversion fallback) | rescue alignment | 478 dense landmarks; turns BlazeFace rescue boxes into alignment points. Never used for recognition or head consent | Apache-2.0 |
 | AuraFace (`glintr100.onnx`) | recognition | 512-D ArcFace-style embedding of the aligned 112×112 face; matching is cosine similarity against the enrolled templates | Apache-2.0 |
 
 ```mermaid
@@ -140,6 +140,20 @@ ships; the acceptance bar one would have to clear is in
 Per-model provenance, license verification notes, and the models this project
 refuses to bundle are documented in [`models/README.md`](../models/README.md);
 demographic-fairness measurements are in [FAIRNESS.md](FAIRNESS.md).
+
+Privileged intent is established through a conventional PAM conversation before
+camera work: hidden literal `yes` authorizes one face attempt, and the root PAM
+client carries an additive typed assertion that the daemon validates against
+the shared service class and `SO_PEERCRED`. The assertion is not cryptographic
+proof against root or a compromised conversation provider.
+
+Head gesture is a separate, optional policy gate. Every service defaults off;
+an explicit opt-in adds repeated-nod approval and head-shake decline after
+privileged keyboard confirmation. It uses the primary detector's five
+landmarks, is experimental rather than population-qualified, and cannot bypass
+capture, matching, passive PAD, camera binding, rate limiting, or biopolicy.
+Greeter, lock, and cold-keyring release keep their separate default-off gesture
+policy. See [ADR-0010](adr/0010-conventional-face-intent-confirmation.md).
 
 ## IR capture: strobe and ambient subtraction
 

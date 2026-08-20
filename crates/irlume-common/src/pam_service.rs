@@ -106,6 +106,13 @@ pub fn classify(service: &str) -> Option<ServiceKind> {
 }
 
 impl ServiceKind {
+    /// Whether a face attempt for this service needs an explicit conventional
+    /// PAM response before it may reach the camera.
+    #[must_use]
+    pub fn requires_face_intent_confirmation(self) -> bool {
+        matches!(self, Self::Elevation | Self::AppConsent)
+    }
+
     /// Whether this service should get the SHORT grace window.
     ///
     /// Elevation and consent prompts are both "the user is already at the
@@ -118,12 +125,9 @@ impl ServiceKind {
         matches!(self, ServiceKind::Elevation | ServiceKind::AppConsent)
     }
 
-    /// Whether the user should be TOLD which consent gesture to make.
-    ///
-    /// Only the polkit path: it is the one where a gesture is demanded by a
-    /// dialog the user did not open, so an unnamed requirement reads as a
-    /// failure. Getting this out of step with the class above is exactly what
-    /// #362 was about.
+    /// Whether this service uses app-consent decline semantics in PAM.
+    /// A deliberate shake aborts polkit's attempt when its optional gesture is
+    /// enabled; other services retain ordinary password fallback.
     #[must_use]
     pub fn wants_consent_instruction(self) -> bool {
         matches!(self, ServiceKind::AppConsent)
@@ -171,8 +175,8 @@ mod tests {
         assert!(kind.wants_short_grace());
     }
 
-    /// Consent instruction and short grace must agree for polkit, because the
-    /// two used to be decided by two different hard-coded lists.
+    /// App-consent decline semantics and short grace must agree for polkit,
+    /// because the two used to be decided by separate hard-coded lists.
     #[test]
     fn app_consent_implies_both_the_short_window_and_the_instruction() {
         for (name, kind) in SERVICES {
@@ -185,6 +189,21 @@ mod tests {
                     "{name}: only the consent path prompts for a gesture"
                 );
             }
+        }
+    }
+
+    /// Removing the optional gesture default must not remove the mandatory
+    /// conventional-confirmation classification. Every privileged spelling in
+    /// the shared table gets the same answer, while login, lock, and remote
+    /// services never inherit the privileged prompt.
+    #[test]
+    fn only_privileged_services_require_face_intent_confirmation() {
+        for (name, kind) in SERVICES {
+            assert_eq!(
+                kind.requires_face_intent_confirmation(),
+                matches!(kind, ServiceKind::Elevation | ServiceKind::AppConsent),
+                "{name}"
+            );
         }
     }
 

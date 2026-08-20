@@ -308,7 +308,11 @@ sudo irlume login enable --with-sudo --apply
 
 The password still works for `sudo` too; face is `sufficient`, not required.
 Test it in a fresh terminal with `sudo -k` (clear the cached credential) then
-`sudo true`.
+`sudo true`. PAM shows `Type yes to use face authentication` above the normal
+hidden field. Type `yes` for one face attempt, or type the ordinary password
+once for the password/fingerprint path. Empty Enter never starts the camera and
+falls through to the password provider. This confirmation is mandatory and has
+no disable setting.
 
 ## App prompts via polkit (optional)
 
@@ -320,12 +324,12 @@ sudo irlume login enable --with-polkit --apply
 ```
 
 The daemon treats polkit as verify-only (it never releases the TPM-sealed
-credential to it) and requires a deliberate consent gesture before approving,
-because the prompt starts scanning without any action from you. The default
-gesture is a **head nod** (no calibration; works at any angle or lighting). If
-you prefer to approve by closing your eyes for about a second, run `sudo irlume
-calibrate-closure` once and either gesture is accepted; calibrate in the light
-you actually use, because the stored eye measurements shift as the room changes.
+credential to it). PAM shows `Type yes to use face authentication` above the
+normal hidden field. Type `yes` for one face attempt, or type the ordinary
+password once for the password/fingerprint path. Empty Enter and cancellation
+never open the camera. An experimental head gesture can be explicitly added as
+a second gate, but defaults off and never replaces keyboard confirmation.
+Automatic passive PAD remains mandatory and separate.
 Full walkthrough, Bitwarden setup, and the security stance:
 [APP-INTEGRATION.md](APP-INTEGRATION.md).
 
@@ -479,11 +483,15 @@ live in them; sealed envelopes are stored separately (see
 
 | File | Holds | Written by |
 |---|---|---|
-| `/etc/irlume/settings.conf` | `credential_release_challenge=1` opts IN to a gesture before your keyring password is released (default: off, so a greeter cold login and logout release with no nod); `service_gesture.<service>=0\|1` overrides the consent gesture per PAM service (`sudo`, `polkit-1`, …) or the special token `credential_release`; `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` names an enabled opt-in PAD model; `third_party_recognizer=<name>` names an enabled opt-in recognizer (`models add buffalo` writes it); `consent_gesture=nod\|closure` restricts the consent gesture (unset = either) | TUI Settings; `sudo irlume credential-release-challenge [<service>] on\|off`; `sudo irlume models enable/add/disable` |
+| `/etc/irlume/settings.conf` | `credential_release_challenge=1` opts IN to a head gesture before the login-keyring credential is released (default off); every `service_gesture.<service>` also defaults off, with `=1` adding an experimental gesture after mandatory privileged keyboard confirmation; the legacy `polkit_gesture=1` switch remains an explicit polkit opt-in. `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` and `third_party_recognizer=<name>` select enabled third-party models. During the migration window, `consent_gesture=closure` or malformed values block only a gesture-gated request until removed or changed to `nod` | TUI Settings; `sudo irlume credential-release-challenge [<service>] on\|off`; `sudo irlume models enable/add/disable` |
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |
 | `/var/lib/irlume/ir-emitter-journal/` | one record per camera, holding the bytes a control held before `ir-setup` changed it. Written before the change and removed once the control reads back as restored, so a crash, a kill or a power loss mid-setup leaves something that can undo it. Root-only | `irlume ir-setup`, cleared by it or by the next capture |
+
+During the one-release migration window, a stored legacy eyes-open policy also
+fails closed. Clear it with `irlume profiles eyes-open off`; no current setup
+path enables it.
 
 Camera selection precedence: the `IRLUME_RGB_DEVICE`+`IRLUME_IR_DEVICE` env
 pair (both set), then `cameras.conf`, then auto-detection, then the compiled
@@ -499,6 +507,8 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | `IRLUME_MODELS_STRICT` | refuse to start when a model file is missing or fails the checksum manifest, instead of warning | warn and continue |
 | `IRLUME_ENFORCE_BIOPOLICY` | same switch as `enforce_biopolicy` in `settings.conf`; the env var wins | off |
 | `IRLUME_CREDENTIAL_RELEASE_CHALLENGE` | same switch as `credential_release_challenge` in `settings.conf`. Precedence: `service_gesture.credential_release` has highest priority; when that key is absent, this variable overrides the `settings.conf` key. Set `1` to add a gesture before the keyring password is released | off |
+| `IRLUME_POLKIT_GESTURE` | legacy explicit opt-in for an additional experimental polkit head gesture; `service_gesture.polkit-1` takes precedence. It cannot disable or replace mandatory PAM keyboard confirmation | off |
+| `IRLUME_CONSENT_GESTURE` | one-release migration input that overrides `consent_gesture` in `settings.conf`. Unset or `nod` permits an explicitly enabled head gesture; legacy `closure` and malformed values fail that gesture-gated request closed. Unset the variable or set it to `nod` to migrate | unset |
 | `IRLUME_DET_MODEL` / `IRLUME_MODEL` / `IRLUME_MESH_MODEL` / `IRLUME_BLAZE_MODEL` | paths to the detector / recognizer / FaceMesh / BlazeFace weights | `/etc/irlume/*.onnx` |
 | `IRLUME_IR_ADAPTER` | path to an optional IR-adapter model (none ships; see ADR-0004) | `/etc/irlume/ir_adapter.onnx` |
 | `IRLUME_RGB_DEVICE` / `IRLUME_IR_DEVICE` | camera-pair override; both must be set | auto |
@@ -511,7 +521,7 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | `IRLUME_SRK_HANDLE` | persistent SRK handle (hex), if the default collides with another TPM user | `0x81010002` |
 | `IRLUME_METHOD_CONF` | alternate path for the method file | `/etc/irlume/method` |
 
-Liveness-cue tuning knobs (blink thresholds, IR capture debug) are in
+Liveness-cue tuning knobs and IR capture debug settings are in
 [DEBUGGING.md](DEBUGGING.md); development sandbox overrides (state/config/socket
 paths) are in [DEVELOPMENT.md](DEVELOPMENT.md).
 
@@ -539,8 +549,9 @@ irlume status for 'you'
   fingerprint   : none
 ```
 
-Then lock your screen (or open a fresh `sudo` if you wired it) and look at the
-camera. Want to check the anti-spoofing and other claims for yourself? See
+Then lock your screen and look at the camera. For a wired fresh `sudo`, type
+`yes` at irlume's hidden confirmation before looking at the camera. Want to
+check the anti-spoofing and other claims for yourself? See
 [VERIFY.md](VERIFY.md).
 
 ## Undo everything

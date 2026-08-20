@@ -14,17 +14,15 @@
 //!   irlume doctor                                check cameras/IR/TPM/models
 //!   irlume keyring <arm|status|forget>           TPM-sealed keyring/wallet unlock
 //!   irlume recovery <status|setup|restore|forget> template-key recovery passphrase
-//!   irlume calibrate-closure [--rounds N]        teach the eye-closure consent gesture
-//!   irlume calibrate-closure --measure-only      labelled EAR readings, nothing stored
 //!   irlume fingerprint <status|add|verify|reset|enable|disable> fprintd companion (face OR fingerprint)
 //!   irlume login <status|enable|disable|reconcile> wire face auth into PAM (+--with-polkit for apps)
 //!   irlume logs [-f] [debug on|off]              face-auth journal view + tracing switch
 
 mod bitwarden;
-mod blinkcap;
 mod commands;
 mod doctor_report;
 mod fingerprint;
+mod gesturecap;
 mod logintx;
 mod logs;
 mod machine;
@@ -78,10 +76,9 @@ const DEV_CMDS: &[&str] = &[
     "irbench",
     "genuine",
     "calcapture",
-    "blinkcap",
+    "gesturecap",
     "normprobe",
     "liveness",
-    "meshprobe",
     "selftest",
     "padcapture",
     "padreport",
@@ -154,12 +151,11 @@ fn main() -> std::process::ExitCode {
         (Some("irbench"), _) => irbench(&args),
         (Some("genuine"), _) => genuine(&args),
         (Some("calcapture"), _) => calcapture(&args),
-        (Some("blinkcap"), _) => blinkcap::run(&args),
+        (Some("gesturecap"), _) => gesturecap::run(&args),
         (Some("padcapture"), _) => pad::padcapture(&args),
         (Some("padreport"), _) => pad::padreport(&args),
         (Some("suncal"), _) => suncal::run(&args),
         (Some("liveness"), _) => liveness_probe(&args),
-        (Some("meshprobe"), _) => meshprobe(&args),
         (Some("enroll"), _) => enroll(&args),
         // Matched on PRESENCE of the subcommand, not on its position. Binding it
         // to args[1] meant a flag before it displaced it: `profiles --contract 9
@@ -223,7 +219,6 @@ fn main() -> std::process::ExitCode {
         (Some("credential-release-challenge"), sub) => {
             commands::credential_release_challenge(sub, &args)
         }
-        (Some("calibrate-closure"), _) => calibrate_closure(&args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("camera-tune"), _) => camera_tune(&args),
         (Some("camera-mode"), _) => camera_mode(&args),
@@ -398,6 +393,7 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
     let user = user_arg(args);
+    let quoted_user = shell_single_quote(&user);
     let req = match sub {
         None | Some("list") => Request::ListProfiles {
             user,
@@ -495,8 +491,14 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
             _ => return usage_profiles(),
         },
         Some("eyes-open") => match toggle_value(args, "eyes-open") {
-            Some(on) => Request::SetRequireEyesOpen { user, on },
-            None => return std::process::ExitCode::from(2),
+            Some(false) => Request::SetRequireEyesOpen { user, on: false },
+            Some(true) => {
+                eprintln!(
+                    "[profiles] eyes-open can only be turned off; this legacy gate cannot be enabled"
+                );
+                return std::process::ExitCode::from(2);
+            }
+            None => return usage_profiles(),
         },
         _ => return usage_profiles(),
     };
@@ -506,13 +508,14 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
             require_eyes_open,
             ..
         }) => {
+            if require_eyes_open {
+                println!(
+                    "[profiles] legacy policy blocks authentication; run: sudo irlume profiles eyes-open off --user {quoted_user}"
+                );
+            }
             if profiles.is_empty() {
                 println!("[profiles] none enrolled");
             } else {
-                println!(
-                    "[profiles] require-eyes-open: {}",
-                    if require_eyes_open { "ON" } else { "off" }
-                );
                 for p in &profiles {
                     println!("  {} ({} scans)", p.name, p.scans.len());
                     // Per-recognizer breakdown when a profile holds more than
@@ -640,451 +643,6 @@ fn report_ok_response(
     }
 }
 
-/// Ask before discarding an existing calibration. Defaults to NO, including on
-/// a read error: the safe answer is the one that keeps working settings.
-fn confirm_replace() -> bool {
-    use std::io::Write;
-    print!("    replace it? [y/N] ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
-    }
-    let s = line.trim();
-    s.eq_ignore_ascii_case("y") || s.eq_ignore_ascii_case("yes")
-}
-
-/// Ask whether to keep the reading just shown; Enter means yes. Defaults to
-/// keeping on any read error, so a closed stdin cannot spin the capture loop.
-fn keep_reading() -> bool {
-    use std::io::Write;
-    print!("    keep this reading? [Y/n] ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return true;
-    }
-    match line.trim() {
-        "" => true,
-        s => s.eq_ignore_ascii_case("y") || s.eq_ignore_ascii_case("yes"),
-    }
-}
-
-/// How many of the captured readings the resulting calibration would actually
-/// accept, as `(closures, reopens)`.
-///
-/// The gate is applied exactly as [`irlume_liveness::detect_deliberate_closure`]
-/// applies it, so the count cannot flatter a calibration the engine would then
-/// refuse: a closure must read strictly UNDER `closed_threshold`, and a reopen
-/// at or OVER `reopen_threshold`.
-fn rounds_that_would_register(
-    opens: &[f32],
-    closeds: &[f32],
-    cal: &irlume_liveness::ClosureCalibration,
-) -> (usize, usize) {
-    let (closed_thr, reopen_thr) = (cal.closed_threshold(), cal.reopen_threshold());
-    (
-        closeds.iter().filter(|c| **c < closed_thr).count(),
-        opens.iter().filter(|o| **o >= reopen_thr).count(),
-    )
-}
-
-/// The `--pose` label for measure-only runs, refusing a swallowed value:
-/// `flag()` blindly returns the next argument, so `--pose --rounds 5` would
-/// label research data '--rounds' and a trailing `--pose` would silently read
-/// as unlabeled; both mislabel the measurement they exist to identify (#267
-/// review). `Err` means the flag was given without a usable label.
-fn measure_pose_label(args: &[String]) -> Result<&str, ()> {
-    match args.iter().position(|a| a == "--pose") {
-        None => Ok("unlabeled"),
-        Some(i) => match args.get(i + 1).map(String::as_str) {
-            Some(v) if !v.starts_with('-') => Ok(v),
-            _ => Err(()),
-        },
-    }
-}
-
-/// Median of a non-empty slice. Takes `&mut` because selecting the middle
-/// element needs an ordering, and EAR readings are floats (`total_cmp`, so a
-/// stray NaN sorts to one end rather than corrupting the comparison).
-fn median_ear(values: &mut [f32]) -> f32 {
-    values.sort_by(|a, b| a.total_cmp(b));
-    let n = values.len();
-    if n % 2 == 1 {
-        values[n / 2]
-    } else {
-        (values[n / 2 - 1] + values[n / 2]) / 2.0
-    }
-}
-
-/// How many rounds `calibrate-closure` captures unless `--rounds N` says
-/// otherwise. One reading of each phase is a coin toss: measured on real
-/// hardware, one user, one seated position, five consecutive closed captures
-/// spanned 0.0424 to 0.0894. Calibrating from whichever single value happened to
-/// land leaves a threshold that may sit almost on top of the user's own
-/// closures. Three rounds and a median cost about a minute and remove that.
-const CALIBRATION_ROUNDS_DEFAULT: usize = 3;
-
-/// The guidance shown before `calibrate-closure` captures. It names the two
-/// conditions the stored eye shape is tied to: the light in the room, and
-/// whether the user is wearing glasses.
-///
-/// Glasses get their own line because the measurement makes them the sharper
-/// trap (#173, 2026-08-04, ASUS FHD IR module). A lens lifts the CLOSED-eye EAR
-/// about sixfold (median 0.018 bare-eyed to 0.113 with glasses) while the open
-/// extreme barely moves, so the shift eats the bottom of the range rather than
-/// offsetting it. A calibration taken bare-eyed then places its closed threshold
-/// (0.088 there) below every glasses-on closure (0.107-0.130), and the consent
-/// gesture silently never fires: 0 of 5 genuine closures registered. The
-/// glasses-on calibration classified both states, so a user who sometimes wears
-/// glasses should calibrate with them on. This is the interim guidance the
-/// measurement called for; holding more than one calibration per user is the
-/// full fix and is still open.
-///
-/// # The direction this loosens, taken deliberately
-///
-/// This advice is a tradeoff, not a free win, and the cost lands on the user
-/// who calibrates with glasses and then authenticates without them.
-/// `closed_threshold` is `ear_closed + CLOSURE_DEEP_FRACTION * gap`, so the
-/// glasses-on pair (0.271 / 0.113) puts it at 0.160, while the bare-eyed pair
-/// (0.253 / 0.018) puts it at 0.088. Measured against the BARE-EYED range,
-/// 0.160 sits at openness fraction 0.61: about twice the 0.30 that
-/// [`irlume_liveness::CLOSURE_DEEP_FRACTION`] was validated at, whose own doc
-/// says the point of that number is to separate a held closure from a squint.
-///
-/// The same #173 session recorded an intermediate state that lands in the gap.
-/// The operator's excluded run, watching the terminal instead of the camera,
-/// read 0.07 to 0.16 "because looking down closes the measured eye shape".
-/// Every value in that band is under the glasses-on 0.160; only 0.07 to 0.088
-/// is under the bare-eyed 0.088. So a glance down at the keyboard held for the
-/// 11 to 25 face frames `detect_deliberate_closure` wants, followed by looking
-/// back up (bare-eyed open 0.246-0.254 clears the 0.208 reopen bar), can form a
-/// qualifying run under the glasses-on calibration and mostly cannot under the
-/// bare-eyed one. That path has no motion, glint, brightness or head-pose test.
-///
-/// It is still the right default, because the alternative is measured at 0 of 5
-/// genuine closures registering, which stops the gesture firing at all for a
-/// glasses wearer; that failure is fail-closed to the password, this one
-/// loosens a consent gate. The issue's own analysis compared only the two
-/// extremes and did not look at intermediate states, which is why this is
-/// written down here rather than left implied.
-fn closure_calibration_intro(rounds: usize) -> String {
-    format!(
-        "[calibrate] this teaches irlume your open/closed eye shape for the polkit\n            \
-         'close your eyes to approve' gesture. {rounds} round(s), two phases each.\n            \
-         Sit the way you actually sit, in the light you actually use: what is stored\n            \
-         describes this position and this lighting.\n            \
-         If you sometimes wear glasses, wear them for this. A lens lifts your\n            \
-         closed-eye reading toward your open one, so a calibration taken without\n            \
-         glasses can stop registering a real closure once you put them on;\n            \
-         calibrating with them on covers both.\n"
-    )
-}
-
-/// The note shown after a calibration is stored, at the one moment the user
-/// still has the camera up and can redo it. Names the same two conditions the
-/// stored eye shape depends on as [`closure_calibration_intro`]: the room light
-/// and glasses. The head nod reassurance stays, so a user this gate keeps
-/// missing knows the other gesture needs none of this.
-fn closure_calibration_stored_note() -> &'static str {
-    "[calibrate] this reading is tied to the conditions you are in now. Eye shape is\n            \
-     stored as absolute values and they shift as the room changes, so a calibration\n            \
-     taken in daylight can stop registering after dark: re-run this in the light you\n            \
-     actually use. For the same reason, if you wear glasses sometimes, calibrate with\n            \
-     them on. The head nod needs no calibration and is not affected."
-}
-
-/// `irlume calibrate-closure [--rounds N]`: teach irlume the user's open and
-/// closed eye shape (EAR) for the deliberate-closure consent gesture used by
-/// polkit prompts ("close your eyes for a second to approve").
-///
-/// Captures both phases [`CALIBRATION_ROUNDS_DEFAULT`] times and stores the
-/// median of each, then checks the thresholds that result back against every
-/// individual reading and says how many would have registered. A calibration
-/// that would reject the user's own captures is the failure this reports, and
-/// it is invisible from a single pair of numbers.
-///
-/// Each phase waits for Enter on a terminal, because a capture fired on a
-/// countdown while the user is still settling produces a reading that has to be
-/// thrown away. With no terminal (a script, a test) the waits and the keep/retry
-/// prompt are skipped and every reading is kept, so it stays automatable.
-///
-/// REPLACING an existing calibration asks first, and with no terminal refuses
-/// unless `--force`. Without that, running this command with stdin closed
-/// silently overwrites a good calibration with whatever the camera happened to
-/// see, and the previous values are gone: they live only inside the encrypted
-/// enrollment, so there is nothing to roll back to. That is not hypothetical; it
-/// is how this guard came to exist.
-///
-/// Needs root (fires the camera through the daemon's privileged path); the
-/// daemon must be running.
-fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
-    use irlume_common::{Request, Response};
-    use std::io::{IsTerminal, Write};
-    let user = user_arg(args);
-    if !is_root() {
-        eprintln!("[calibrate] needs root (fires the camera): sudo irlume calibrate-closure");
-        return std::process::ExitCode::FAILURE;
-    }
-    let rounds = match flag(args, "--rounds") {
-        // A dangling `--rounds` is an omission: silently using the default runs
-        // the camera a different number of times than the operator asked for.
-        None if flag_present(args, "--rounds") => {
-            eprintln!("[calibrate] --rounds requires a number from 1 to 10");
-            return std::process::ExitCode::from(2);
-        }
-        None => CALIBRATION_ROUNDS_DEFAULT,
-        Some(v) => match v.parse::<usize>() {
-            Ok(n) if (1..=10).contains(&n) => n,
-            _ => {
-                eprintln!("[calibrate] --rounds takes a number from 1 to 10 (got {v:?})");
-                // Usage error, not a runtime failure; the refusal itself was
-                // already right, only the code disagreed with every sibling.
-                return std::process::ExitCode::from(2);
-            }
-        },
-    };
-    // --measure-only: capture and print EAR medians without storing anything.
-    // The #173 measurement mode: the stored calibration stays untouched, so a
-    // second state (glasses on, different seat, different light) can be
-    // measured side by side against the one the user actually authenticates
-    // with. `--pose` names what the operator is holding; it is recorded in the
-    // output only, since the daemon cannot know what the face is doing.
-    if args.iter().any(|a| a == "--measure-only") {
-        let Ok(pose) = measure_pose_label(args) else {
-            eprintln!("[calibrate] --pose requires a label (e.g. --pose glasses-on-open)");
-            return std::process::ExitCode::from(2);
-        };
-        println!(
-            "[calibrate] measure-only: {rounds} capture(s), pose '{pose}', nothing stored.\n\
-             [calibrate] hold the pose now; each capture starts after a 3s pause."
-        );
-        let mut vals: Vec<f32> = Vec::new();
-        for i in 1..=rounds {
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            match daemon_request(&Request::CaptureEarMedian { user: user.clone() }) {
-                Ok(Response::EarMedian(Some(v))) => {
-                    println!("    round {i}: EAR = {v:.4}");
-                    vals.push(v);
-                }
-                Ok(Response::EarMedian(None)) => {
-                    println!("    round {i}: no eye detected (face the camera)");
-                }
-                Ok(Response::Error(e)) => println!("    round {i}: {e}"),
-                Ok(other) => println!("    round {i}: unexpected response: {other:?}"),
-                Err(e) => println!("    round {i}: {e}"),
-            }
-        }
-        if vals.is_empty() {
-            eprintln!("[calibrate] no reading succeeded; nothing to report");
-            return std::process::ExitCode::FAILURE;
-        }
-        // The SAME median the calibration path stores (median_ear averages the
-        // two middles of an even sample); a failed round makes the count even,
-        // and an upper-middle pick there is not a median (#267 review).
-        let median = median_ear(&mut vals);
-        println!(
-            "[calibrate] pose '{pose}': median EAR {median:.4} over {} reading(s) (range {:.4} to {:.4})",
-            vals.len(),
-            vals[0],
-            vals[vals.len() - 1]
-        );
-        return std::process::ExitCode::SUCCESS;
-    }
-    let interactive = std::io::stdin().is_terminal();
-    // Ask BEFORE spending the user's time on captures, not after.
-    let already_calibrated = matches!(
-        daemon_request(&Request::ListProfiles {
-            user: user.clone(),
-            structured_errors: false,
-        }),
-        Ok(Response::Enrollment {
-            closure_calibrated: true,
-            ..
-        })
-    );
-    if already_calibrated && !args.iter().any(|a| a == "--force") {
-        if !interactive {
-            eprintln!(
-                "[calibrate] '{user}' already has a closure calibration, and replacing it here \
-                 would\n            \
-                 discard it with nothing to restore from. Re-run on a terminal, or pass \
-                 --force."
-            );
-            return std::process::ExitCode::FAILURE;
-        }
-        println!("[calibrate] '{user}' already has a closure calibration.");
-        println!(
-            "[calibrate] replacing it discards the old values; they are not recoverable.\n            \
-             Do this in the light you actually use, or answer n to keep what you have."
-        );
-        if !confirm_replace() {
-            println!("[calibrate] keeping the existing calibration; nothing changed.");
-            return std::process::ExitCode::SUCCESS;
-        }
-    }
-    println!("[calibrate] eye-closure consent calibration for '{user}'.");
-    println!("{}", closure_calibration_intro(rounds));
-
-    // Capture one phase, returning the median EAR or a printed error.
-    let capture_phase = |label: &str| -> Result<f32, String> {
-        print!("    {label}\n    hold still, capturing in 3");
-        let _ = std::io::stdout().flush();
-        for n in [2, 1] {
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            print!(" {n}");
-            let _ = std::io::stdout().flush();
-        }
-        println!(" GO");
-        match daemon_request(&Request::CaptureEarMedian { user: user.clone() }) {
-            Ok(Response::EarMedian(Some(v))) => Ok(v),
-            Ok(Response::EarMedian(None)) => {
-                Err("no eye detected in the capture; face the camera and retry".into())
-            }
-            Ok(Response::Error(e)) => Err(e),
-            Ok(other) => Err(format!("unexpected response: {other:?}")),
-            Err(e) => Err(e),
-        }
-    };
-
-    // One phase, repeated until the user keeps a reading. A rejected reading is
-    // re-taken rather than averaged in: the person in front of the camera knows
-    // whether they actually held the pose, and no statistic recovers a capture
-    // taken while they were still moving.
-    let one_phase = |name: &str, instruction: &str| -> Result<f32, String> {
-        loop {
-            if interactive {
-                print!("    {instruction}\n    Press Enter when you are ready… ");
-                let _ = std::io::stdout().flush();
-                let mut line = String::new();
-                if std::io::stdin().read_line(&mut line).is_err() {
-                    return Err("could not read from the terminal".into());
-                }
-            }
-            match capture_phase(instruction) {
-                Ok(v) => {
-                    println!("    {name} EAR = {v:.4}");
-                    if !interactive || keep_reading() {
-                        return Ok(v);
-                    }
-                }
-                Err(e) => {
-                    if !interactive {
-                        return Err(e);
-                    }
-                    println!("    {e}");
-                }
-            }
-        }
-    };
-
-    let (mut opens, mut closeds) = (Vec::new(), Vec::new());
-    for r in 1..=rounds {
-        if rounds > 1 {
-            println!("--- round {r}/{rounds} ---");
-        }
-        let o = match one_phase(
-            "open",
-            "Look at the camera with your eyes OPEN and hold still.",
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[calibrate] {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-        };
-        let c = match one_phase(
-            "closed",
-            "CLOSE your eyes firmly and HOLD them shut through the countdown.",
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[calibrate] {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-        };
-        println!(
-            "    round {r}: open {o:.4} | closed {c:.4} | gap {:.4}\n",
-            o - c
-        );
-        opens.push(o);
-        closeds.push(c);
-    }
-
-    let ear_open = median_ear(&mut opens.clone());
-    let ear_closed = median_ear(&mut closeds.clone());
-    if rounds > 1 {
-        println!(
-            "[calibrate] median of {rounds} rounds: open {ear_open:.4} closed {ear_closed:.4}"
-        );
-    }
-
-    if ear_open - ear_closed < irlume_liveness::MIN_CALIBRATION_SEPARATION {
-        eprintln!(
-            "[calibrate] open ({ear_open:.3}) and closed ({ear_closed:.3}) EAR are too close to \
-             tell apart. Make sure you fully open then fully close your eyes, and retry."
-        );
-        return std::process::ExitCode::FAILURE;
-    }
-
-    // Check the thresholds this calibration produces back against every reading
-    // that produced it. A median can be perfectly sound while the spread around
-    // it is wide enough that some of the user's own closures would not register,
-    // which is the difference between a gesture that works and one that works
-    // most of the time. Reported, not fatal: it is still the best pair available
-    // from these captures, and the user is the one who decides whether to redo it.
-    let cal = irlume_liveness::ClosureCalibration {
-        ear_open,
-        ear_closed,
-    };
-    let (closed_thr, reopen_thr) = (cal.closed_threshold(), cal.reopen_threshold());
-    let (closures_ok, reopens_ok) = rounds_that_would_register(&opens, &closeds, &cal);
-    if closures_ok < rounds || reopens_ok < rounds {
-        println!(
-            "[calibrate] ⚠ with this calibration, {closures_ok}/{rounds} of your closures and \
-             {reopens_ok}/{rounds} of your\n            \
-             reopens would register (closed must read under {closed_thr:.4}, reopen at or \
-             over\n            {reopen_thr:.4}). Your readings varied more than the gate \
-             allows, so the gesture\n            \
-             will sometimes miss. Re-running in steadier light, holding each pose until \
-             GO,\n            usually tightens it. The head nod needs no calibration at all."
-        );
-    } else if rounds > 1 {
-        println!(
-            "[calibrate] ✓ all {rounds} rounds would register with this calibration \
-             (closed under {closed_thr:.4}, reopen over {reopen_thr:.4})."
-        );
-    }
-    match daemon_request(&Request::SetClosureCalibration {
-        user: user.clone(),
-        ear_open,
-        ear_closed,
-    }) {
-        Ok(Response::Ok(msg)) => {
-            println!("[calibrate] ✓ {msg}");
-            println!("[calibrate] the polkit consent gesture is now calibrated for '{user}'.");
-            // Said HERE, where the user still has the camera up and can redo it,
-            // rather than only in doctor. What was just stored describes the eye
-            // shape under the light in the room, and behind whatever eyewear the
-            // user had on, right now.
-            println!("{}", closure_calibration_stored_note());
-            std::process::ExitCode::SUCCESS
-        }
-        Ok(Response::Error(e)) => {
-            eprintln!("[calibrate] {e}");
-            std::process::ExitCode::FAILURE
-        }
-        Ok(other) => {
-            eprintln!("[calibrate] unexpected response: {other:?}");
-            std::process::ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("[calibrate] {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
 fn ir_setup(args: &[String]) -> std::process::ExitCode {
     use irlume_common::Request;
     let dry = args.iter().any(|a| a == "--dry-run");
@@ -1194,7 +752,7 @@ fn usage_profiles() -> std::process::ExitCode {
         delete --profile P [--scan S]           delete a profile or a scan\n  \
         forget-model <model>                    remove one recognizer's scans from every\n  \
                                                 profile (shipped | a catalog name | embed:<sha256>)\n  \
-        eyes-open off                           turn OFF the eyes-open check\n  \
+        eyes-open off                           one-release migration: clear the retired gate\n  \
         \x20                                       (it cannot be turned on; see issue #386)"
     );
     std::process::ExitCode::from(2)
@@ -1705,7 +1263,7 @@ fn toggle_value(args: &[String], sub: &str) -> Option<bool> {
     match value {
         Some(v) if !contradicted => Some(v),
         _ => {
-            eprintln!("usage: irlume profiles {sub} <on|off> [--user U]");
+            eprintln!("usage: irlume profiles {sub} off [--user U] (one-release migration only)");
             None
         }
     }
@@ -1987,7 +1545,7 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
 /// Either flag ALONE overrides its half; the partner comes from `selected`
 /// (in production [`irlume_camera::select_pair`]: the persisted pair with
 /// identity resolution, then discovery), because a lone flag used to be
-/// SILENTLY IGNORED: `blinkcap capture --ir /dev/video6` captured against
+/// SILENTLY IGNORED: `gesturecap capture --ir /dev/video6` captured against
 /// the built-in default node and failed with "no camera found", saying
 /// nothing about the dropped flag (#209). `selected` runs only when needed,
 /// since it can probe devices.
@@ -2034,7 +1592,7 @@ pub(crate) fn engine(
     let mesh = flag(args, "--mesh").unwrap_or("models/face_landmarks_detector.tflite");
     let e = e.with_mesh(mesh)?;
     if e.has_mesh() {
-        eprintln!("[engine] FaceMesh loaded ({mesh}); passive EAR liveness available");
+        eprintln!("[engine] FaceMesh loaded ({mesh}); BlazeFace rescue alignment available");
     }
     let blaze = flag(args, "--blaze").unwrap_or("models/blaze_face_short_range.onnx");
     let e = e.with_blaze_rescue(blaze)?;
@@ -2803,161 +2361,6 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
     }
 }
 
-/// `irlume meshprobe --det <yunet> --mesh <face_landmark.onnx> [--rgb ..] [--ir ..] [--n 30] [--burst 2]`
-/// Diagnostic for the ADR-0002 passive-EAR liveness (MediaPipe FaceMesh). First a
-/// single RGB frame as a sanity check (does the mesh give a sane open-eye EAR ~0.3
-/// at all?), then an IR sequence to see whether EAR survives the RGB→IR domain gap
-/// and whether a natural blink shows. Blink naturally a couple times during the IR
-/// capture.
-fn meshprobe(args: &[String]) -> std::process::ExitCode {
-    let ir_dev = flag(args, "--ir").unwrap_or(irlume_camera::DEFAULT_IR_DEVICE);
-    let (Some(det_path), Some(mesh_path)) = (flag(args, "--det"), flag(args, "--mesh")) else {
-        eprintln!("usage: irlume meshprobe --det <yunet.onnx> --mesh <face_landmark.onnx> [--ir ..] [--n 40] [--burst 2] [--reps 1]");
-        eprintln!("  to record a PAD-style validation run: --species NAME --kind bonafide|attack --out ear.jsonl");
-        return std::process::ExitCode::from(2);
-    };
-    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(75);
-    let burst: usize = flag(args, "--burst")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let reps: usize = flag(args, "--reps")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let trace_on = args.iter().any(|a| a == "--trace");
-    // Optional recording (reuses the padreport JSONL format: Blinked→Live,
-    // NoBlink→Uncertain/non-response, NoEyes→Spoof).
-    let record = match (
-        flag(args, "--species"),
-        flag(args, "--kind"),
-        flag(args, "--out"),
-    ) {
-        (Some(s), Some(k), Some(o)) => Some((s.to_string(), k.to_string(), o.to_string())),
-        _ => None,
-    };
-    let run = || -> irlume_common::Result<usize> {
-        use std::io::Write;
-        let mut det = irlume_vision::Detector::load_from_file(det_path)?;
-        let mut mesh = irlume_vision::FaceMesh::load_from_file(mesh_path)?;
-        let mut out_file = match &record {
-            Some((_, _, o)) => Some(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(o)
-                    .map_err(|e| irlume_common::Error::Io(e.to_string()))?,
-            ),
-            None => None,
-        };
-        let mut written = 0usize;
-        for rep in 0..reps {
-            let frames = irlume_camera::capture_ir_sequence(ir_dev, n, burst)?;
-            let mut ears: Vec<f32> = Vec::new();
-            // Per-frame corneal-specular CONTRAST (the candidate 2nd cue): peak eye
-            // contrast over the window. Banner ≤70, no-glasses live ~120; the open
-            // question is where glasses-genuine lands (does it clear the floor?).
-            let mut contrast_max = 0.0f32;
-            // Full EarSample stream (index + EAR-if-face + frame brightness): the
-            // brightness column doubles as an emitter duty-cycle probe in dark rooms.
-            let mut samples: Vec<irlume_liveness::EarSample> = Vec::new();
-            for (i, f) in frames.iter().enumerate() {
-                let bri =
-                    f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
-                let ir_rgb = irlume_camera::grey_to_rgb(&f.data);
-                let iv = irlume_vision::align::RgbView {
-                    data: &ir_rgb,
-                    width: f.width,
-                    height: f.height,
-                };
-                let mut ear_i = None;
-                let (mut cx, mut cy, mut fsize, mut contrast) = (0.0, 0.0, 0.0, 0.0);
-                if let Some(t) = det
-                    .detect(&iv)?
-                    .into_iter()
-                    .max_by(|a, b| a.score.total_cmp(&b.score))
-                {
-                    let lm = mesh.landmarks(&iv, &t.bbox, 0.25)?;
-                    let ear = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT)
-                        .min(irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT));
-                    ears.push(ear);
-                    ear_i = Some(ear);
-                    contrast =
-                        irlume_auth::eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
-                    contrast_max = contrast_max.max(contrast);
-                    cx = (t.bbox[0] + t.bbox[2]) * 0.5;
-                    cy = (t.bbox[1] + t.bbox[3]) * 0.5;
-                    fsize = (t.bbox[2] - t.bbox[0]).max(0.0);
-                }
-                samples.push(irlume_liveness::EarSample {
-                    idx: i,
-                    ear: ear_i,
-                    bri,
-                    cx,
-                    cy,
-                    fsize,
-                    contrast,
-                });
-            }
-            if trace_on {
-                for s in &samples {
-                    match s.ear {
-                        Some(e) => {
-                            println!("    trace {:>3}  ear {e:.3}  bri {:>5.1}", s.idx, s.bri)
-                        }
-                        None => println!(
-                            "    trace {:>3}  ear   -    bri {:>5.1}  (no face)",
-                            s.idx, s.bri
-                        ),
-                    }
-                }
-            }
-            let verdict = irlume_liveness::detect_blink(&samples);
-            let (vs, live) = match verdict {
-                irlume_liveness::BlinkResult::Blinked => ("Live", true),
-                irlume_liveness::BlinkResult::NoBlink => ("Uncertain", false),
-                irlume_liveness::BlinkResult::NoEyes => ("Spoof", false),
-            };
-            let (mut mn, mut mx) = (1.0f32, 0.0f32);
-            for &e in &ears {
-                mn = mn.min(e);
-                mx = mx.max(e);
-            }
-            let flag_note = match (&record, live) {
-                (Some((_, k, _)), true) if k == "attack" => " ‼ ACCEPTED (breach!)",
-                (Some((_, k, _)), false) if k == "bonafide" => " ✗ live user not confirmed",
-                _ => "",
-            };
-            let (_, mot_med, _) = irlume_liveness::face_speeds(&samples);
-            let (open_c, dip_c) = irlume_liveness::contrast_signature(&samples);
-            let drop = if dip_c > 0.0 { open_c / dip_c } else { 0.0 };
-            println!("  [rep {:>2}/{reps}] EAR open {mx:.3} min {mn:.3}  contrast open {open_c:>4.0} dip {dip_c:>4.0} drop {drop:.2}  motion med {mot_med:.3}  (n={}) -> {vs}{flag_note}", rep + 1, ears.len());
-            if let (Some(f), Some((sp, kind, _))) = (out_file.as_mut(), &record) {
-                let rec = serde_json::json!({
-                    "species": sp, "kind": kind, "path": "ear", "idx": rep,
-                    "verdict": vs, "reason": format!("passive EAR ({verdict:?})"),
-                    "ear_open": json_f32(mx), "ear_min": json_f32(mn), "ear_samples": ears.len(),
-                    "contrast_max": json_f32(contrast_max),
-                    "caught": Vec::<String>::new(),
-                });
-                writeln!(f, "{rec}").map_err(|e| irlume_common::Error::Io(e.to_string()))?;
-                written += 1;
-            }
-        }
-        Ok(written)
-    };
-    match run() {
-        Ok(w) => {
-            if let Some((_, _, o)) = &record {
-                println!("[meshprobe] appended {w} presentations to {o}; run `irlume padreport --in {o}`");
-            }
-            std::process::ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("meshprobe error: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
 /// Capture several frames of the (one) live person, embed each, and report the
 /// GENUINE cosine distribution. Compared to the impostor ceiling (~0.42 from
 /// `eval`), this shows the separation and lets us set the operating threshold.
@@ -3442,20 +2845,6 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 );
                 rec.insert("ir_iod_px".into(), json_f32(iod_px(&t.landmarks)));
                 rec.insert(
-                    "ir_eyes_open".into(),
-                    // Same raw frame and ceiling the daemon passes, so a corpus
-                    // recorded here answers the question production answers. A
-                    // railed eye window reads the lens, not the cornea (#386).
-                    irlume_auth::both_eyes_open(
-                        ir_stats.saturation_frame.as_deref().unwrap_or(&irf.data),
-                        irf.width,
-                        irf.height,
-                        &t.landmarks,
-                        ir_stats.white_level,
-                    )
-                    .into(),
-                );
-                rec.insert(
                     "ir_center_edge_ratio".into(),
                     json_f32(ir_center_edge_ratio),
                 );
@@ -3638,8 +3027,8 @@ pub(crate) fn tpm_device() -> Option<&'static str> {
 /// TPM-sealed keyring password is released, and can that gesture actually run here?
 ///
 /// Kept separate from the polkit block because the failure MEANING differs. A
-/// polkit prompt that cannot run the gesture falls back to a password dialog the
-/// user is already looking at; a credential release that cannot run it leaves the
+/// polkit prompt with the optional gesture enabled falls back to its password
+/// dialog when that gesture cannot run; a credential release failure leaves the
 /// keyring locked after an otherwise successful face login, which reads as "face
 /// login is broken" unless doctor names it.
 ///
@@ -3648,11 +3037,9 @@ pub(crate) fn tpm_device() -> Option<&'static str> {
 fn report_credential_release(
     report: &mut crate::doctor_report::Report,
     user: &str,
-    gesture_mode: irlume_common::config::ConsentGesture,
-    closure_calibrated: bool,
+    policy: irlume_common::config::HeadConsentPolicy,
 ) {
     use crate::doctor_report::State;
-    let gesture_is_closure = gesture_mode == irlume_common::config::ConsentGesture::Closure;
     // Recorded from the same visibility the block below prints from, so the
     // machine answer cannot disagree with the human one.
     report.check(
@@ -3700,24 +3087,21 @@ fn report_credential_release(
             return;
         }
     }
-    // The dedicated consent-gesture warning above is the whole story for a
-    // Misconfigured mode; hand-writing "keep nodding" here contradicted it on
-    // the same screen while NO gesture was accepted and the keyring quietly
-    // fell back to the password. Mirrors the polkit block's arm.
-    if gesture_mode == irlume_common::config::ConsentGesture::Misconfigured {
+    if matches!(
+        policy,
+        irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+            | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
+    ) {
         dout!(
             report,
-            "[doctor] credential-release challenge: required, but NO gesture is accepted \
-             while
-     `consent_gesture` is unreadable (see above); your keyring falls \
-             back to the typed password"
+            "[doctor] credential-release challenge: required, but {}; the daemon \
+             refuses the release and your keyring falls back to the typed password",
+            policy.instruction("release your keyring password")
         );
         return;
     }
-    // The gate is on. Whether it can RUN needs the mesh model (every consent frame
-    // goes through FaceMesh) and, in closure-only mode, this user's EAR calibration.
-    // A nod needs no calibration, which is why the default mode leaves existing
-    // enrollments working with no re-enroll.
+    // The gate is on. Running the head gesture needs the mesh model because every
+    // consent frame goes through FaceMesh.
     let mesh = matches!(
         daemon_request(&irlume_common::Request::Health),
         Ok(irlume_common::Response::Health { mesh: true, .. })
@@ -3733,33 +3117,10 @@ fn report_credential_release(
         );
         return;
     }
-    if gesture_is_closure && !closure_calibrated {
-        dout!(
-            report,
-            "[doctor] ⚠ credential-release challenge is required but consent_gesture=closure \
-             is NOT\n     calibrated for '{user}': your keyring will fall back to the typed \
-             password.\n     Fix: sudo irlume calibrate-closure, or unset consent_gesture in \
-             settings.conf to\n     use the no-calibration head nod."
-        );
-        return;
-    }
     dout!(
         report,
-        "[doctor] credential-release challenge: required ✓ ({} to release your keyring \
-         password)",
-        if gesture_is_closure {
-            "close your eyes ~1s then open"
-        } else if closure_calibrated
-            && irlume_common::config::consent_gesture_mode()
-                == irlume_common::config::ConsentGesture::Either
-        {
-            // A stored calibration is not the same as an accepted gesture: under
-            // `consent_gesture=nod` the closure is refused however well calibrated
-            // it is, and offering it there costs the user the release window.
-            "keep nodding, or close your eyes ~1s then open"
-        } else {
-            "keep nodding your head"
-        }
+        "[doctor] credential-release challenge: required ✓ (keep nodding your head to \
+         release your keyring password; shake your head to decline)"
     );
     // The gate is on AND working; the remaining failure is that the user may never
     // be TOLD. pam_irlume sends the instruction, but a login manager that drops
@@ -3770,48 +3131,34 @@ fn report_credential_release(
     if let Some(dm) = crate::pamwire::active_dm_hides_pam_instructions() {
         dout!(
             report,
-            "[doctor] ⚠ your login manager ({dm}) does not display the gesture \
+            "[doctor] ⚠ your login manager ({dm}) does not display the head-gesture \
              instruction.\n     \
-             It is still REQUIRED at the login screen after a reboot or logout: {}\n     \
+             It is still REQUIRED at the login screen after a reboot or logout: keep \
+             nodding your head\n     \
              while your face is being read. Nothing on screen will ask you to. Without \
              it your\n     \
-             login still succeeds and only the keyring falls back to the typed password.",
-            if gesture_is_closure {
-                "close your eyes ~1s then open"
-            } else {
-                "keep nodding your head"
-            }
+             login still succeeds and only the keyring falls back to the typed password."
         );
     }
-    // Only for users who actually have a closure calibration: it is stored as
-    // absolute EAR values, and those move with the light. Measured on one user's
-    // hardware the same seated position gave a median open EAR of 0.109 at an
-    // ambient of 22-42 and 0.166 at an ambient of 1, a 52% shift. No single
-    // calibration covers both: registering that session's deepest closure and
-    // its shallowest reopen needs a gap of 0.030, and the code requires 0.05.
-    //
-    // Nothing here can fix that, so doctor says it. Being told once beats
-    // discovering it as a keyring prompt that only happens after dark, and the
-    // nod is right there needing no calibration at all.
-    if closure_calibrated || gesture_is_closure {
-        dout!(
-            report,
-            "[doctor] note: your eye-closure calibration is tied to the LIGHT you \
-             calibrated in.\n     \
-             Eye shape is stored as absolute values, and they shift as the room \
-             changes, so a\n     \
-             calibration taken in daylight can stop registering after dark. \
-             Re-run `sudo irlume\n     \
-             calibrate-closure` in the light you actually use{}",
-            if gesture_is_closure {
-                ". consent_gesture=closure means there\n     \
-                 is no fallback gesture; unset it in settings.conf to also accept the head \
-                 nod,\n     which is pose-defined and needs no calibration."
-            } else {
-                ", or just use the head nod, which is\n     \
-                 pose-defined and unaffected by lighting."
-            }
-        );
+}
+
+fn polkit_doctor_message(
+    gesture: Option<bool>,
+    policy: irlume_common::config::HeadConsentPolicy,
+) -> String {
+    match gesture {
+        Some(false) => "[doctor] polkit app prompts: wired ✓ (keyboard confirmation required; additional head gesture: off)".into(),
+        Some(true)
+            if matches!(
+                policy,
+                irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
+            ) => format!(
+                "[doctor] polkit app prompts: wired ✓; keyboard confirmation remains required; additional gesture blocked: {}",
+                policy.instruction("approve")
+            ),
+        Some(true) => "[doctor] polkit app prompts: wired ✓ (type yes, then KEEP NODDING to approve Bitwarden unlock, pkexec, …; shake your head to decline)".into(),
+        None => "[doctor] polkit app prompts: wired ✓ (keyboard confirmation required; additional gesture state is root-only—re-run doctor with sudo)".into(),
     }
 }
 
@@ -4610,7 +3957,9 @@ fn doctor_run(
             ),
             None => (
                 State::Warn,
-                format!("{file} — not found; the eye-closure consent gesture, its calibration, and the detection-rescue alignment are disabled"),
+                format!(
+                    "{file} — not found; head gestures and detection-rescue alignment are disabled"
+                ),
             ),
         };
         dout!(report, "  {}: {line}", s.stage);
@@ -4768,19 +4117,9 @@ fn doctor_run(
     // installs for a snap; keying on only the former made doctor tell snap users
     // to run `bitwarden setup`, which then refuses (snapd owns that file).
     let bitwarden_action = bitwarden::action_present();
-    // The consent gesture is a head NOD by default (no calibration). Only the
-    // opt-in closure gesture needs a per-user calibration; wired-but-uncalibrated
-    // then silently falls to the password on every polkit prompt.
-    // Same parse the engine gates on and the PAM module instructs from, so doctor
-    // can never report a gesture the daemon would refuse.
-    let gesture_mode = irlume_common::config::consent_gesture_mode();
-    let gesture_is_closure = gesture_mode == irlume_common::config::ConsentGesture::Closure;
-    // `Misconfigured` is not "some gesture other than closure". It permits
-    // NEITHER, so every face prompt falls back to the password, and comparing
-    // only against `Closure` reported that state as ordinary nod operation:
-    // a gate that can never pass, shown as healthy, on the surface whose whole
-    // job is to say what is wrong (#365 review). The parser has already told
-    // the operator on stderr; doctor is where they look afterwards.
+    // Same policy the engine gates on and the PAM module instructs from, so
+    // doctor can never report a head gesture the daemon would refuse.
+    let head_policy = irlume_common::config::head_consent_policy();
     //
     // Reported as a human line and not as a new check id on purpose. The
     // machine-API registry conformance test asserts BOTH directions (every id
@@ -4788,31 +4127,23 @@ fn doctor_run(
     // id fails on every healthy machine. Giving it an always-emitted id is a
     // public contract addition and belongs in its own change, not in a review
     // fix.
-    if gesture_mode == irlume_common::config::ConsentGesture::Misconfigured {
+    if matches!(
+        head_policy,
+        irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+            | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
+    ) {
         dout!(
             report,
-            "[doctor] consent gesture: MISCONFIGURED. `consent_gesture` is set to a \
-             value irlume cannot read (expected `nod` or `closure`), so NO gesture is \
-             accepted and every face prompt for a polkit action or the keyring falls \
-             back to the password. Fix or remove the key in /etc/irlume/settings.conf, \
-             or unset IRLUME_CONSENT_GESTURE."
+            "[doctor] head gesture: BLOCKED. {}. The daemon refuses gesture-gated \
+             requests until the configuration is migrated; password fallback remains.",
+            head_policy.instruction("approve")
         );
     }
-    let closure_calibrated = matches!(
-        daemon_request(&irlume_common::Request::ListProfiles {
-            user: user.clone(),
-            structured_errors: false,
-        }),
-        Ok(irlume_common::Response::Enrollment {
-            closure_calibrated: true,
-            ..
-        })
-    );
     // --- credential release (the keyring password) --------------------------
     // Reported before the polkit block because it shares the gesture-readiness
-    // facts above: this is the same nod/closure gate, applied to the one operation
+    // facts above: this is the same head gate, applied to the one operation
     // where a spoof yields a REUSABLE secret instead of one session.
-    report_credential_release(report, &user, gesture_mode, closure_calibrated);
+    report_credential_release(report, &user, head_policy);
 
     report.check(
         "polkit-app-prompts",
@@ -4823,57 +4154,13 @@ fn doctor_run(
         },
     );
     match crate::pamwire::polkit_wired() {
-        // "KEEP nodding", matching the prompt the user will actually see: a
-        // single nod released 0 times out of 3 on hardware, because the detector
-        // needs a run of frames showing the motion.
-        // The gesture can be turned off for polkit alone, and then no gesture is
-        // asked for at all; saying "KEEP NODDING" there describes a prompt the
-        // user will never see.
-        // The VISIBLE read: settings.conf is 0600, and the plain read collapses
-        // "could not read" into the permissive default, so an unprivileged
-        // doctor asserted face-alone-approves about a policy it never saw.
-        // Unknown falls through to the gesture arms below, which describe the
-        // default-on behaviour that holds unless someone turned it off.
-        Some(true)
-            if irlume_common::config::service_gesture_required_visible("polkit-1")
-                == Some(false) =>
-        {
-            dout!(report,
-            "[doctor] polkit app prompts: wired ✓ (face alone approves Bitwarden unlock, pkexec, …;\n     \
-             the consent gesture is OFF for polkit: sudo irlume credential-release-challenge polkit-1 on)"
+        Some(true) => dout!(
+            report,
+            "{}",
+            polkit_doctor_message(
+                irlume_common::config::service_gesture_required_visible("polkit-1"),
+                head_policy,
             )
-        }
-        // A misconfigured `consent_gesture` accepts NEITHER gesture, so the
-        // dedicated warning above is the whole story; repeating "keep nodding"
-        // here would contradict it on the same screen.
-        Some(true)
-            if gesture_mode == irlume_common::config::ConsentGesture::Misconfigured =>
-        {
-            dout!(report,
-                "[doctor] polkit app prompts: wired ✓ but NO gesture is accepted while \n     \
-                 `consent_gesture` is unreadable (see above), so these prompts fall back to the password")
-        }
-        Some(true) if !gesture_is_closure => dout!(report,
-            "[doctor] polkit app prompts: wired ✓ (KEEP NODDING to approve Bitwarden unlock,\n     \
-             pkexec, …; shake your head to decline; no calibration needed{})",
-            if closure_calibrated
-                && gesture_mode == irlume_common::config::ConsentGesture::Either
-            {
-                "; closing your eyes ~1s also works"
-            } else if closure_calibrated {
-                "" // calibrated but not accepted in this mode: do not offer it
-            } else {
-                ", or run calibrate-closure to also allow the eye-closure gesture"
-            }
-        ),
-        Some(true) if closure_calibrated => dout!(report,
-            "[doctor] polkit app prompts: wired ✓ and calibrated ✓ (close your eyes ~1s to \
-             approve; consent_gesture=closure)"
-        ),
-        Some(true) => dout!(report,
-            "[doctor] polkit app prompts: wired ✓ but consent_gesture=closure and NOT calibrated;\n     \
-             prompts fall back to the password. Calibrate (sudo irlume calibrate-closure) or unset\n     \
-             consent_gesture in settings.conf to use the no-calibration head nod."
         ),
         Some(false) if bitwarden_action => dout!(report,
             "[doctor] polkit app prompts: NOT wired, but Bitwarden's polkit action is installed.\n     \
@@ -5257,6 +4544,40 @@ mod tests {
     }
 
     #[test]
+    fn doctor_polkit_copy_keeps_keyboard_confirmation_primary() {
+        use irlume_common::config::{HeadConsentPolicy, HeadConsentSource};
+
+        let off = polkit_doctor_message(Some(false), HeadConsentPolicy::Ready);
+        assert!(off.contains("keyboard confirmation required"), "{off}");
+        assert!(off.contains("additional head gesture: off"), "{off}");
+        assert!(!off.contains("face alone approves"), "{off}");
+
+        let on = polkit_doctor_message(Some(true), HeadConsentPolicy::Ready);
+        assert!(on.contains("type yes, then KEEP NODDING"), "{on}");
+        assert!(on.contains("shake your head to decline"), "{on}");
+
+        let blocked = polkit_doctor_message(
+            Some(true),
+            HeadConsentPolicy::LegacyClosure(HeadConsentSource::Settings),
+        );
+        assert!(blocked.contains("additional gesture blocked"), "{blocked}");
+        assert!(
+            blocked.contains("keyboard confirmation remains required"),
+            "{blocked}"
+        );
+
+        let unknown = polkit_doctor_message(None, HeadConsentPolicy::Ready);
+        assert!(
+            unknown.contains("keyboard confirmation required"),
+            "{unknown}"
+        );
+        assert!(
+            unknown.contains("additional gesture state is root-only"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
     fn the_login_password_reader_hands_back_a_wiping_string() {
         // Heap hygiene is invisible at runtime: nothing a test can observe
         // distinguishes a wiped allocation from a freed one. The type is what
@@ -5277,30 +4598,6 @@ mod tests {
         // that, so the prompt that wraps it is pinned too.
         fn accepts_only_a_wiping_prompt(_: fn() -> Option<zeroize::Zeroizing<String>>) {}
         accepts_only_a_wiping_prompt(commands::prompt_login_password);
-    }
-
-    #[test]
-    fn measure_pose_label_refuses_swallowed_and_missing_values() {
-        // No flag at all: the honest default.
-        assert_eq!(
-            measure_pose_label(&argv(&["--measure-only"])),
-            Ok("unlabeled")
-        );
-        // A proper label passes through.
-        assert_eq!(
-            measure_pose_label(&argv(&["--measure-only", "--pose", "glasses-on-open"])),
-            Ok("glasses-on-open")
-        );
-        // `--pose --rounds 5` must not label the data '--rounds'.
-        assert_eq!(
-            measure_pose_label(&argv(&["--pose", "--rounds", "5"])),
-            Err(())
-        );
-        // A trailing `--pose` asked for a label and gave none.
-        assert_eq!(
-            measure_pose_label(&argv(&["--measure-only", "--pose"])),
-            Err(())
-        );
     }
 
     #[test]
@@ -5413,8 +4710,7 @@ mod tests {
     ///
     /// `enroll --scans` fired a real camera capture at the DEFAULT count while
     /// the operator had asked for a number and lost it to the shell or a typo.
-    /// The same shape reached `calibrate-closure --rounds` and `camera-tune
-    /// --rounds`, both of which run the IR emitter.
+    /// The same shape reaches `camera-tune --rounds`, which runs the IR emitter.
     #[test]
     fn a_value_flag_with_no_value_is_a_usage_error_not_the_default() {
         let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
@@ -5474,54 +4770,6 @@ mod tests {
     fn flag_takes_the_first_occurrence() {
         let a = argv(&["--user", "a", "--user", "b"]);
         assert_eq!(flag(&a, "--user"), Some("a"));
-    }
-
-    #[test]
-    fn median_ear_picks_the_middle_regardless_of_capture_order() {
-        // Odd count: the true middle, not the mean, so one bad capture in a
-        // round cannot drag the stored value the way an average would.
-        assert_eq!(median_ear(&mut [0.10, 0.30, 0.20]), 0.20);
-        // Even count: mean of the two middles.
-        assert_eq!(median_ear(&mut [0.10, 0.20, 0.30, 0.40]), 0.25);
-        assert_eq!(median_ear(&mut [0.17]), 0.17);
-        // The outlier that motivated the median: four tight readings and one
-        // shallow closure. The mean would be 0.0511, the median stays at 0.0450.
-        let mut real = [0.0424, 0.0450, 0.0661, 0.0727, 0.0894];
-        assert_eq!(median_ear(&mut real), 0.0661);
-    }
-
-    /// The self-check must agree with the engine's own gate, or it would tell the
-    /// user a calibration is fine while the daemon refuses their closures.
-    #[test]
-    fn the_self_check_counts_rounds_the_engine_would_accept() {
-        use irlume_liveness::ClosureCalibration;
-        // Tonight's measured session: open median 0.1658, closed median 0.0661.
-        let opens = [0.1635, 0.1652, 0.1658, 0.1861, 0.1868];
-        let closeds = [0.0424, 0.0450, 0.0661, 0.0727, 0.0894];
-        let cal = ClosureCalibration {
-            ear_open: 0.1658,
-            ear_closed: 0.0661,
-        };
-        let (c_ok, o_ok) = rounds_that_would_register(&opens, &closeds, &cal);
-        // Calibrated from its own session, every round registers: the median
-        // puts closed_threshold at 0.0960, above even the shallowest closure.
-        assert_eq!(o_ok, 5, "every reopen clears {}", cal.reopen_threshold());
-        assert_eq!(c_ok, 5, "closed_threshold {}", cal.closed_threshold());
-
-        // The calibration actually stored on that machine, taken in different
-        // light, applied to the same evening readings: the 0.0894 closure now
-        // sits above a 0.0739 threshold and would not register. This is the
-        // shortfall the warning exists to surface, and it is invisible from the
-        // stored pair alone.
-        let stored = ClosureCalibration {
-            ear_open: 0.1090,
-            ear_closed: 0.0588,
-        };
-        let (c2, o2) = rounds_that_would_register(&opens, &closeds, &stored);
-        assert_eq!((c2, o2), (4, 5));
-
-        // And the degenerate case: no readings cannot report false confidence.
-        assert_eq!(rounds_that_would_register(&[], &[], &cal), (0, 0));
     }
 
     /// Every capture-mode case reports a fact, never a fault: a mode is a
@@ -5651,41 +4899,6 @@ mod tests {
             ),
             CaptureModeReport::Unmeasured
         ));
-    }
-
-    /// The stored eye shape is tied to two conditions, room light and glasses,
-    /// and the user reads this guidance once. If it names only the light, a user
-    /// who calibrates bare-eyed is not warned that putting glasses on can strand
-    /// their closures (#173: measured 0 of 5 glasses-on closures registering
-    /// against a bare-eyed calibration). Both the pre-capture guidance and the
-    /// post-store note must name both conditions, and neither may drop the round
-    /// count or the "the nod needs none of this" reassurance.
-    #[test]
-    fn closure_calibration_guidance_names_light_and_glasses() {
-        let intro = closure_calibration_intro(3);
-        assert!(intro.contains("3 round(s)"), "intro states the round count");
-        assert!(
-            intro.to_ascii_lowercase().contains("glasses"),
-            "intro must tell a glasses wearer to calibrate with them on"
-        );
-        assert!(
-            intro.contains("light you actually use"),
-            "intro must keep the room-light guidance"
-        );
-
-        let note = closure_calibration_stored_note();
-        assert!(
-            note.to_ascii_lowercase().contains("glasses"),
-            "stored note must name glasses too"
-        );
-        assert!(
-            note.contains("light you"),
-            "stored note must keep the room-light guidance"
-        );
-        assert!(
-            note.contains("nod"),
-            "stored note must keep the reassurance that the nod path is unaffected"
-        );
     }
 
     /// The on/off word is positional. Scanning argv for it meant a flag value

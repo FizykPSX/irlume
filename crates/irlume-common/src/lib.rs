@@ -395,6 +395,15 @@ pub fn write_atomic_reporting(
     }
 }
 
+/// How a privileged face request claims explicit user intent was collected.
+/// The daemon still validates the service class and peer credentials; this is
+/// an assertion, not cryptographic proof of physical input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntentAttestation {
+    /// A root PAM client reports collecting the conventional confirmation.
+    PamConversation,
+}
+
 /// Request from an (untrusted) client to the (privileged) daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
@@ -407,6 +416,10 @@ pub enum Request {
         user: String,
         #[serde(default)]
         service: Option<String>,
+        /// Root PAM's assertion that it collected conventional confirmation.
+        /// The daemon rejects it from untrusted peers and irrelevant services.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intent_confirmation: Option<IntentAttestation>,
     },
     /// Enrol a (possibly named) profile for `user`. PRIVILEGED: the daemon must
     /// verify via SO_PEERCRED that the caller is root or `user` themselves.
@@ -500,15 +513,14 @@ pub enum Request {
         scan: String,
         new_name: String,
     },
-    /// Toggle the per-user "require eyes open to unlock" gate. PRIVILEGED.
+    /// Retired eyes-open policy. Kept parseable for one release; OFF performs
+    /// legacy cleanup and ON returns a retired error. PRIVILEGED.
     SetRequireEyesOpen { user: String, on: bool },
-    /// Capture a short IR sequence and return the MEDIAN eye-aspect-ratio over
-    /// it: one phase of the deliberate-closure consent calibration. The caller
-    /// prompts the user (eyes open, then eyes closed) and sends this once per
-    /// phase. Fires the camera; PRIVILEGED.
+    /// Retired eye-closure calibration capture tombstone. Kept parseable for
+    /// one release and returns a retired error. PRIVILEGED.
     CaptureEarMedian { user: String },
-    /// Store the per-user eye-closure calibration `(ear_open, ear_closed)` from
-    /// the two `CaptureEarMedian` phases into the enrollment. PRIVILEGED.
+    /// Retired eye-closure calibration storage tombstone. Kept parseable for
+    /// one release and returns a retired error. PRIVILEGED.
     SetClosureCalibration {
         user: String,
         ear_open: f32,
@@ -830,13 +842,12 @@ pub enum Response {
         live: bool,
         reason: String,
     },
-    /// Structured enrollment listing: profiles (each with its scan names) plus
-    /// the per-user require-eyes-open setting.
+    /// Structured enrollment listing. The retired eye fields remain required
+    /// on the wire and are frozen at false for compatibility.
     Enrollment {
         profiles: Vec<ProfileSummary>,
         require_eyes_open: bool,
-        /// Whether a usable eye-closure consent calibration is stored (for the
-        /// polkit gesture); surfaced so `doctor` can flag wired-but-uncalibrated.
+        /// Retired eye-closure signal, frozen at false for compatibility.
         #[serde(default)]
         closure_calibrated: bool,
         /// Whether this enrollment has a per-user floor fitted on the IR
@@ -903,7 +914,7 @@ pub enum Response {
         tier: String,
         rgb_dev: Option<String>,
         ir_dev: Option<String>,
-        /// FaceMesh (passive blink liveness) model loaded.
+        /// FaceMesh dense-landmark model loaded for BlazeFace rescue alignment.
         mesh: bool,
         /// IR domain adapter loaded.
         adapter: bool,
@@ -945,8 +956,8 @@ pub enum Response {
     Position(PositionReport),
     /// Delivered-rate diagnostic report (`CameraDiagnostics`).
     CameraDiagnostics(Box<CameraDiagnosticsReport>),
-    /// Median eye-aspect-ratio over a capture (`CaptureEarMedian`); `None` if no
-    /// eye was detected in any frame.
+    /// Retired `CaptureEarMedian` response tombstone. No current request
+    /// produces it; retained for one-release wire compatibility.
     EarMedian(Option<f32>),
     Error(String),
     /// A failure the caller can act on, sent ONLY to a request that opted in
@@ -1308,6 +1319,70 @@ mod tests {
         assert!(!declined_by_gesture, "absent must decode false (no abort)");
     }
 
+    #[test]
+    fn retired_eye_requests_still_parse_as_tombstones() {
+        for wire in [
+            r#"{"SetRequireEyesOpen":{"user":"u","on":false}}"#,
+            r#"{"CaptureEarMedian":{"user":"u"}}"#,
+            r#"{"SetClosureCalibration":{"user":"u","ear_open":0.2,"ear_closed":0.1}}"#,
+        ] {
+            serde_json::from_str::<Request>(wire).expect("old request remains parseable");
+        }
+    }
+
+    #[test]
+    fn enrollment_response_is_compatible_in_both_reader_directions() {
+        #[derive(serde::Deserialize)]
+        enum OldResponse {
+            Enrollment {
+                profiles: Vec<ProfileSummary>,
+                require_eyes_open: bool,
+                #[serde(default)]
+                closure_calibrated: bool,
+                #[serde(default)]
+                ir_ratio_calibrated: bool,
+            },
+        }
+
+        let new = Response::Enrollment {
+            profiles: Vec::new(),
+            require_eyes_open: false,
+            closure_calibrated: false,
+            ir_ratio_calibrated: false,
+        };
+        let old: OldResponse = serde_json::from_value(
+            serde_json::to_value(new).expect("serialize current enrollment response"),
+        )
+        .expect("old reader requires require_eyes_open");
+        let OldResponse::Enrollment {
+            profiles,
+            require_eyes_open,
+            closure_calibrated,
+            ir_ratio_calibrated,
+        } = old;
+        assert!(profiles.is_empty());
+        assert!(!require_eyes_open);
+        assert!(!closure_calibrated);
+        assert!(!ir_ratio_calibrated);
+
+        let old = r#"{"Enrollment":{"profiles":[],"require_eyes_open":true}}"#;
+        let current: Response =
+            serde_json::from_str(old).expect("current reader accepts old reply");
+        let Response::Enrollment {
+            profiles,
+            require_eyes_open,
+            closure_calibrated,
+            ir_ratio_calibrated,
+        } = current
+        else {
+            panic!("old enrollment reply must remain Enrollment");
+        };
+        assert!(profiles.is_empty());
+        assert!(require_eyes_open);
+        assert!(!closure_calibrated);
+        assert!(!ir_ratio_calibrated);
+    }
+
     /// Every directory whose entry has to survive is in the chain, shallowest
     /// first, including the one a RELATIVE state root is anchored in.
     ///
@@ -1655,7 +1730,7 @@ mod tests {
         // must default to None, not fail the parse (login would break).
         let r: Request = serde_json::from_str(r#"{"Authenticate":{"user":"alice"}}"#).unwrap();
         match r {
-            Request::Authenticate { user, service } => {
+            Request::Authenticate { user, service, .. } => {
                 assert_eq!(user, "alice");
                 assert_eq!(service, None);
             }
@@ -1686,6 +1761,67 @@ mod tests {
             }
             other => panic!("expected Health, got {other:?}"),
         }
+    }
+
+    /// `Authenticate` crosses a live-upgrade boundary in both directions: an
+    /// old PAM omits the attestation, while a new PAM can meet an old daemon
+    /// whose reader knows only `user` and `service`.
+    #[test]
+    fn authenticate_intent_attestation_is_compatible_in_both_directions() {
+        let old: Request =
+            serde_json::from_str(r#"{"Authenticate":{"user":"alice","service":"sudo"}}"#).unwrap();
+        assert!(matches!(
+            old,
+            Request::Authenticate {
+                user,
+                service: Some(service),
+                intent_confirmation: None,
+            } if user == "alice" && service == "sudo"
+        ));
+
+        let without_attestation = Request::Authenticate {
+            user: "alice".into(),
+            service: Some("kde".into()),
+            intent_confirmation: None,
+        };
+        let value = serde_json::to_value(without_attestation).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"Authenticate":{"user":"alice","service":"kde"}}),
+            "None must be omitted so the ordinary wire shape stays unchanged"
+        );
+
+        let new = Request::Authenticate {
+            user: "alice".into(),
+            service: Some("sudo".into()),
+            intent_confirmation: Some(IntentAttestation::PamConversation),
+        };
+        let wire = serde_json::to_string(&new).unwrap();
+        let round_trip: Request = serde_json::from_str(&wire).unwrap();
+        assert!(matches!(
+            round_trip,
+            Request::Authenticate {
+                user,
+                service: Some(service),
+                intent_confirmation: Some(IntentAttestation::PamConversation),
+            } if user == "alice" && service == "sudo"
+        ));
+
+        #[derive(serde::Deserialize)]
+        struct OldAuthenticate {
+            user: String,
+            #[serde(default)]
+            service: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        enum OldRequest {
+            Authenticate(OldAuthenticate),
+        }
+
+        let parsed: OldRequest = serde_json::from_str(&wire).unwrap();
+        let OldRequest::Authenticate(old) = parsed;
+        assert_eq!(old.user, "alice");
+        assert_eq!(old.service.as_deref(), Some("sudo"));
     }
 
     #[test]

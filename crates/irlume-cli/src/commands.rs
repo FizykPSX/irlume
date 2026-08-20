@@ -708,42 +708,45 @@ pub fn status(args: &[String]) -> ExitCode {
             profiles,
             require_eyes_open,
             ..
-        }) if !profiles.is_empty() => {
-            let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
-            println!(
-                "  enrollment    : {} profile(s), {scans} scan(s) {OK}{}",
-                profiles.len(),
-                if require_eyes_open {
-                    " · eyes-open required"
-                } else {
-                    ""
+        }) => {
+            if profiles.is_empty() {
+                println!("  enrollment    : none {WARN} (run `irlume enroll`)");
+            } else {
+                let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
+                println!(
+                    "  enrollment    : {} profile(s), {scans} scan(s) {}",
+                    profiles.len(),
+                    if require_eyes_open { WARN } else { OK }
+                );
+                for p in &profiles {
+                    println!("                  - {} ({} scan(s))", p.name, p.scans.len());
                 }
-            );
-            for p in &profiles {
-                println!("                  - {} ({} scan(s))", p.name, p.scans.len());
-            }
-            // A scan can only match the recognizer it was captured with, which is
-            // what `scans_by_recognizer`'s own doc says: "how many scans" has no
-            // single answer worth reporting on its own. The line above reports
-            // exactly that number with a tick, so a profile whose templates all
-            // belong to a recognizer that is no longer loaded (a third-party model
-            // disabled, or swapped) read as healthy while no face could match.
-            //
-            // Silent when the daemon sent no counts at all: that is an older
-            // daemon, and unknown is not zero.
-            let usable = usable_scans(&profiles);
-            if let Some(0) = usable {
-                if scans > 0 {
-                    println!(
-                        "                  {WARN} none of those scans belong to the recognizer \
-                         that is loaded now, so no face can match: re-enable the model it was \
-                         enrolled with, or run `irlume enroll` again"
-                    );
+                // A scan can only match the recognizer it was captured with, which is
+                // what `scans_by_recognizer`'s own doc says: "how many scans" has no
+                // single answer worth reporting on its own. The line above reports
+                // exactly that number with a tick, so a profile whose templates all
+                // belong to a recognizer that is no longer loaded (a third-party model
+                // disabled, or swapped) read as healthy while no face could match.
+                //
+                // Silent when the daemon sent no counts at all: that is an older
+                // daemon, and unknown is not zero.
+                let usable = usable_scans(&profiles);
+                if let Some(0) = usable {
+                    if scans > 0 {
+                        println!(
+                            "                  {WARN} none of those scans belong to the recognizer \
+                             that is loaded now, so no face can match: re-enable the model it was \
+                             enrolled with, or run `irlume enroll` again"
+                        );
+                    }
                 }
             }
-        }
-        Ok(Response::Enrollment { .. }) => {
-            println!("  enrollment    : none {WARN} (run `irlume enroll`)")
+            if require_eyes_open {
+                println!(
+                    "                  legacy policy blocks authentication; run: sudo irlume profiles eyes-open off --user {}",
+                    crate::shell_single_quote(&user)
+                );
+            }
         }
         Ok(Response::Error(e)) => println!("  enrollment    : error: {e}"),
         _ => println!("  enrollment    : unknown (daemon unreachable)"),
@@ -1501,7 +1504,7 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
 }
 
 /// `irlume credential-release-challenge [<service>] <on|off|status>`: the
-/// per-service consent-gesture toggle, plus the global credential-release gate on
+/// per-service head-gesture toggle, plus the global credential-release gate on
 /// releasing the sealed login-keyring password (`credential_release_challenge` in
 /// settings.conf). The daemon reads all of it live per request, so no restart is
 /// needed.
@@ -1511,12 +1514,22 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
 /// liveness (measured 2026-07-27, the gesture fired on a hand-held print 2 times
 /// in 24, so it never stood between a photograph and the credential; the
 /// cross-spectrum liveness and PAD cues do, and the typed password is always the
-/// fallback). Turning any gesture on adds a deliberate step; disabling it for a
-/// high-privilege escalation service (sudo, su, doas, polkit) asks for
-/// confirmation first.
-/// One service's effective consent-gesture line, shared by the all-services
+/// fallback). Turning any gesture on adds an experimental additional step;
+/// disabling it cannot remove the mandatory keyboard confirmation on a
+/// high-privilege service.
+/// One service's effective head-gesture line, shared by the all-services
 /// `status` and the per-service `<svc> status` so the two can never disagree.
 fn print_service_gesture_status(tag: &str, svc: &str) {
+    let privileged = irlume_common::pam_service::classify(svc)
+        .is_some_and(irlume_common::pam_service::ServiceKind::requires_face_intent_confirmation);
+    if privileged {
+        println!("{tag} {svc}: Face confirmation: keyboard required");
+    }
+    let additional = if privileged {
+        "Additional head gesture: "
+    } else {
+        ""
+    };
     let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
     match irlume_common::config::observe_kv("settings.conf", &key) {
         // Per-service keys use `!falsy` (the daemon's `service_gesture`
@@ -1524,9 +1537,13 @@ fn print_service_gesture_status(tag: &str, svc: &str) {
         // what the engine does for this key.
         irlume_common::config::KvObservation::Value(v) => {
             if !irlume_common::config::falsy(&v) {
-                println!("{tag} {svc}: REQUIRED {OK} (explicit)");
+                if privileged {
+                    println!("{tag} {svc}: {additional}on (experimental, explicit)");
+                } else {
+                    println!("{tag} {svc}: REQUIRED {OK} (explicit)");
+                }
             } else {
-                println!("{tag} {svc}: off (explicit)");
+                println!("{tag} {svc}: {additional}off (explicit)");
             }
         }
         irlume_common::config::KvObservation::Absent => {
@@ -1534,20 +1551,21 @@ fn print_service_gesture_status(tag: &str, svc: &str) {
                 // The keyring release falls back to the global gate,
                 // which now defaults OFF.
                 "credential_release" => irlume_common::config::credential_release_challenge(),
-                // Every PAM service through the shared helper, which
-                // knows polkit (AppConsent) defaults ON and that
-                // `polkit_gesture=0` turns that default off. The
-                // hardcoded `true` here could not see the second half.
+                // Every PAM service through the shared explicit-only helper.
                 _ => irlume_common::config::service_gesture_required(svc),
             };
             if required {
-                println!("{tag} {svc}: REQUIRED {OK} (default)");
+                if privileged {
+                    println!("{tag} {svc}: {additional}on (experimental, configured)");
+                } else {
+                    println!("{tag} {svc}: REQUIRED {OK} (default)");
+                }
             } else {
-                println!("{tag} {svc}: off (default)");
+                println!("{tag} {svc}: {additional}off (default)");
             }
         }
         irlume_common::config::KvObservation::Unknown(_) => {
-            println!("{tag} {svc}: root-only setting, re-run with sudo");
+            println!("{tag} {svc}: {additional}root-only setting, re-run with sudo");
         }
     }
 }
@@ -1577,18 +1595,15 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                     "{TAG} global credential_release_challenge: root-only setting, re-run with sudo"
                 ),
             }
-            // A REQUIRED gesture that no gesture can satisfy is not a healthy
-            // state, and every line above reads as one. The mode decides WHICH
-            // gesture is accepted, so an unreadable `consent_gesture` leaves the
-            // requirement standing with nothing able to meet it, and every prompt
-            // falls to the password.
-            if irlume_common::config::consent_gesture_mode()
-                == irlume_common::config::ConsentGesture::Misconfigured
-            {
+            let policy = irlume_common::config::head_consent_policy();
+            if matches!(
+                policy,
+                irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
+            ) {
                 println!(
-                    "{TAG} WARNING: `consent_gesture` is set to a value irlume cannot read \
-                     (expected nod or closure), so NO gesture is accepted and every \
-                     REQUIRED line above falls back to the password until it is fixed."
+                    "{TAG} WARNING: {}. Required gates fall back to the password.",
+                    policy.instruction("approve")
                 );
             }
             ExitCode::SUCCESS
@@ -1636,36 +1651,26 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                              effect only if a PAM stack really uses that service name."
                         );
                     }
-                    // Disabling the gesture for a high-privilege escalation
-                    // service (sudo, su, doas, sudo-i, su-l, runuser, polkit) asks
-                    // for confirmation first: a face match alone would then
-                    // approve it. The set comes from the shared pam_service table,
-                    // not a private list that already omitted sudo-i/su-l/runuser
-                    // (the #362 drift). The keyring release (`credential_release`)
-                    // is NOT here: it defaults OFF by design, so disabling it is
-                    // the default state, not a weakening that warrants a warning.
-                    let high_priv = matches!(
-                        irlume_common::pam_service::classify(svc),
-                        Some(
-                            irlume_common::pam_service::ServiceKind::Elevation
-                                | irlume_common::pam_service::ServiceKind::AppConsent
-                        )
+                    let high_priv = irlume_common::pam_service::classify(svc).is_some_and(
+                        irlume_common::pam_service::ServiceKind::requires_face_intent_confirmation,
                     );
-                    if v == "off" && high_priv {
-                        let assumed_yes = args.iter().any(|a| a == "--yes" || a == "-y");
-                        if !assumed_yes && !confirm_high_privilege_disable(svc) {
-                            println!("{TAG} {svc}: left REQUIRED.");
-                            return ExitCode::SUCCESS;
-                        }
-                    }
                     let val = if v == "on" { "1" } else { "0" };
                     let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
                     match irlume_common::config::write_kv("settings.conf", &key, val) {
                         Ok(()) => {
-                            if v == "on" {
-                                println!("{TAG} {svc}: consent gesture REQUIRED {OK}");
+                            if v == "on" && high_priv {
+                                println!("{TAG} {svc}: Additional head gesture on (experimental)");
+                                eprintln!(
+                                    "{TAG} WARNING: the head classifier is not population-qualified and may reject valid attempts. Face confirmation: keyboard required."
+                                );
+                            } else if v == "off" && high_priv {
+                                println!(
+                                    "{TAG} {svc}: Additional head gesture off; keyboard confirmation remains required"
+                                );
+                            } else if v == "on" {
+                                println!("{TAG} {svc}: head gesture REQUIRED {OK}");
                             } else {
-                                eprintln!("{TAG} {svc}: consent gesture off {WARN}");
+                                println!("{TAG} {svc}: head gesture off");
                             }
                             ExitCode::SUCCESS
                         }
@@ -1706,10 +1711,10 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                 Ok(()) => {
                     if v == "on" {
                         println!(
-                            "{TAG} consent gesture REQUIRED {OK}: releasing your keyring \
+                            "{TAG} head gesture REQUIRED {OK}: releasing your keyring \
                              password now needs {} after the face match. Takes effect on the \
                              next face auth.",
-                            irlume_common::config::consent_gesture_mode().instruction("approve")
+                            irlume_common::config::head_consent_policy().instruction("approve")
                         );
                     } else {
                         println!(
@@ -1732,21 +1737,6 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
             ExitCode::from(2)
         }
     }
-}
-
-/// Confirmation for disabling the consent gesture on a high-privilege service.
-fn confirm_high_privilege_disable(service: &str) -> bool {
-    use std::io::Write as _;
-    println!(
-        "WARNING: Disabling the consent gesture for '{service}' means a face match alone\n\
-         approves this service. If someone holds a print of your face to the camera,\n\
-         they can use '{service}' without your knowledge."
-    );
-    print!("Disable the gesture for '{service}'? [y/N] ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).unwrap_or_default();
-    matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
 }
 
 pub fn reseal(args: &[String]) -> ExitCode {
@@ -2098,9 +2088,7 @@ fn yes_no(q: &str, default_yes: bool) -> bool {
     // by `setup_walks_every_step_noninteractively`: `setup` is the SCRIPTED
     // onboarding path, so a piped run is expected to complete rather than stall
     // on a prompt nobody can answer. Commands where the default would be
-    // destructive refuse instead: `calibrate-closure` will not overwrite an
-    // existing calibration without a terminal, and `models enable` refuses
-    // outright.
+    // destructive refuse instead: `models enable` refuses outright.
     if !std::io::stdin().is_terminal() {
         return default_yes;
     }
@@ -2142,17 +2130,9 @@ SETUP & STATUS
 ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset]   capture a face profile
   profiles [list|add-scan|rename|delete|forget-model|eyes-open off]   manage profiles
-                        (eyes-open can only be turned OFF: the gate refuses the
-                        users it exists to admit, see issue #386)
+                        (one-release migration only: clears the retired gate;
+                        it cannot be turned on, see issue #386)
   identify              1:N \"who is this?\" (all users as root; else scoped to you)
-  calibrate-closure [--rounds N] [--force]   teach the eye-closure gesture for app
-                        prompts; captures N rounds (default 3) and stores the median
-                        (sudo; the head nod is the default and needs no calibration)
-  calibrate-closure --measure-only [--rounds N] [--pose LABEL]
-                        print labelled EAR readings and their median WITHOUT
-                        replacing the stored calibration (sudo; for comparing
-                        states such as glasses on/off before re-calibrating)
-
 KEYRING / TPM
   keyring <arm|status|forget>     TPM-sealed secret so a login opens your wallet
                         (forget takes --force to erase without re-keying back)
@@ -2192,10 +2172,10 @@ SYSTEM INTEGRATION
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)
   credential-release-challenge [<service>] <on|off|status>
-                        the consent gesture: keep nodding to approve, shake your
-                        head to decline. Named with a service (sudo, su, doas,
-                        polkit-1) it sets that service's gesture; sudo-style
-                        elevation and polkit require one by default. Bare, it
+                        optional experimental head gesture: keep nodding to approve;
+                        shake your head to decline. Named with a service (sudo, su,
+                        doas, polkit-1) it adds or removes that service's gesture;
+                        privileged face auth always keeps keyboard confirmation. Bare, it
                         sets the gate on releasing your keyring password, which
                         is OFF by default: a cold login and logout release it on
                         the face match alone

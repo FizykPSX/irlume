@@ -11,6 +11,9 @@
 //!   * default (`auth sufficient pam_irlume.so`): VERIFY only. Sends
 //!     `Authenticate`; a live match grants WITHOUT touching the password. Use for
 //!     `sudo`, polkit, and in-session unlocks where the keyring is already open.
+//!     Shared privileged services first offer one hidden field through PAM:
+//!     `yes` selects one face attempt, while any other non-empty value remains
+//!     the authentication token for the downstream password provider.
 //!   * `unseal` (`auth sufficient pam_irlume.so unseal`): VERIFY + KEYRING
 //!     UNLOCK. Sends `UnsealPassword`; on a live match the daemon releases the
 //!     TPM-sealed login password, which we set as `PAM_AUTHTOK` so a downstream
@@ -29,9 +32,10 @@
 //! cleanly cascades to the password module (never `AUTH_ERR`, which would just
 //! log a failure; the password is always the floor).
 
-use irlume_common::{Request, Response, SecretBytes};
+use irlume_common::pam_service::ServiceKind;
+use irlume_common::{IntentAttestation, Request, Response, SecretBytes};
 use pamsm::{pam_module, Pam, PamError, PamFlags, PamLibExt, PamServiceModule};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::time::{Duration, Instant};
 
 /// How long `wait` keeps retrying before giving up to the password fallback.
@@ -39,6 +43,78 @@ const WAIT_BUDGET: Duration = Duration::from_secs(20);
 /// Pause between attempts in `wait` mode: lets the daemon release the camera
 /// (avoids back-to-back EBUSY) and keeps us from busy-looping.
 const WAIT_RETRY_GAP: Duration = Duration::from_millis(400);
+const FACE_INTENT_INFO: &str = "Type yes to use face authentication";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntentInput {
+    Confirmed,
+    Empty,
+    Password,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntentConfirmation {
+    Confirmed,
+    Fallback,
+    Abort,
+}
+
+fn classify_intent_input(response: Option<&[u8]>) -> IntentInput {
+    let Some(response) = response else {
+        return IntentInput::Empty;
+    };
+    if response.is_empty() {
+        return IntentInput::Empty;
+    }
+    if response.len() <= 16
+        && response.is_ascii()
+        && std::str::from_utf8(response).is_ok_and(|text| text.trim().eq_ignore_ascii_case("yes"))
+    {
+        return IntentInput::Confirmed;
+    }
+    IntentInput::Password
+}
+
+fn resolve_intent_input(
+    input: IntentInput,
+    clear: impl FnOnce() -> pamsm::PamResult<()>,
+) -> IntentConfirmation {
+    match input {
+        IntentInput::Password => IntentConfirmation::Fallback,
+        IntentInput::Empty => match clear() {
+            Ok(()) => IntentConfirmation::Fallback,
+            Err(_) => IntentConfirmation::Abort,
+        },
+        IntentInput::Confirmed => match clear() {
+            Ok(()) => IntentConfirmation::Confirmed,
+            Err(_) => IntentConfirmation::Abort,
+        },
+    }
+}
+
+fn confirm_face_intent_with<'a>(
+    service: ServiceKind,
+    show_info: impl FnOnce() -> pamsm::PamResult<()>,
+    get_token: impl FnOnce() -> pamsm::PamResult<Option<&'a CStr>>,
+    clear: impl FnOnce() -> pamsm::PamResult<()>,
+) -> IntentConfirmation {
+    if !service.requires_face_intent_confirmation() || show_info().is_err() {
+        return IntentConfirmation::Fallback;
+    }
+    let Ok(Some(token)) = get_token() else {
+        return IntentConfirmation::Fallback;
+    };
+    resolve_intent_input(classify_intent_input(Some(token.to_bytes())), clear)
+}
+
+fn confirm_face_intent(pamh: &Pam, service: ServiceKind) -> IntentConfirmation {
+    confirm_face_intent_with(
+        service,
+        || pamh.info(FACE_INTENT_INFO),
+        || pamh.get_authtok(None),
+        || pamh.clear_authtok(),
+    )
+}
 
 /// PAM-data key under which the `reseal` AUTH line stashes the typed password for
 /// the `reseal` SESSION line to pick up. Namespaced to this module.
@@ -256,9 +332,10 @@ impl PamServiceModule for IrlumePam {
             //    read PAM_AUTHTOK if some earlier module/greeter already set it. We must
             //    NOT actively prompt here: in `wait` mode KDE runs us as a PARALLEL
             //    biometric device (kde-fingerprint) and cancels us natively the moment
-            //    a key is pressed, so an echo-off prompt from us would hijack the
-            //    password field; and a TTY `sudo` should keep "just look at the camera"
-            //    working without forcing the user to press Enter past a prompt first.
+            //    a key is pressed, so an echo-off password probe here would hijack the
+            //    password field. A privileged one-shot service offers its explicit
+            //    face-intent choice only after this password-first check, then obtains
+            //    the ordinary PAM token so a non-`yes` password is not asked twice.
             let typed = if unseal && !wait && !facefirst {
                 pamh.get_authtok(Some("Password: "))
             } else {
@@ -270,57 +347,50 @@ impl PamServiceModule for IrlumePam {
                 }
             }
 
-            // On a polkit prompt the daemon requires a deliberate consent gesture,
-            // which is not discoverable from the dialog, so tell the user what to do.
-            // Best-effort text info (the KDE/GNOME agent shows it inline); shown
-            // once, before the capture, only for the polkit service so sudo / lock
-            // screen are unaffected.
-            //
-            // The text comes from the same `consent_gesture_mode` parse the engine
-            // gates on, exactly as the credential-release probe below does. It used
-            // to be a hardcoded string naming both gestures, which told a
-            // `closure`-only user to nod at a gate that would not accept a nod: the
-            // failure `ConsentGesture` was introduced to prevent.
-            // From the shared table, so this cannot drift from the class the
-            // daemon enforces or the window the grace loop uses (#362). Out of
-            // step, this produces the worst version of the bug: a mandatory
-            // gesture the user is never told to make.
-            let is_polkit = pamh
+            let service = pamh
                 .get_service()
                 .ok()
                 .flatten()
-                .and_then(|c| c.to_str().ok().map(str::to_string))
-                .and_then(|s| irlume_common::pam_service::classify(&s))
-                .is_some_and(irlume_common::pam_service::ServiceKind::wants_consent_instruction);
-            if is_polkit && !unseal {
-                let mode = irlume_common::config::consent_gesture_mode();
-                let how = mode.instruction("approve");
-                // Name how to approve, and, ONLY in the modes where a shake is
-                // actually detected, that a head shake declines and closes the
-                // window. The shake-cancel is NOT mode-independent: the daemon's
-                // consent watch reads a Shake only inside `if allow_nod`
-                // (irlume-auth consent_watch), and `gestures_permitted_by` grants
-                // `allow_nod` to Nod and Either only. In Closure mode a shake is
-                // never seen, so the clause is suppressed rather than promising a
-                // gesture that does nothing. Misconfigured already returns a full
-                // diagnostic sentence, so it gets no clause either.
-                let msg = match mode {
-                    irlume_common::config::ConsentGesture::Nod
-                    | irlume_common::config::ConsentGesture::Either => {
-                        // "decline", NOT "closes the window". A shake ends THIS
-                        // attempt; polkit-kde then decides whether to re-prompt, and
-                        // measured on Plasma 6 (2026-08-11) it closes only after its
-                        // own retry count, about three failed attempts. Promising an
-                        // immediate close would be the same false instruction the
-                        // closure-mode clause was corrected for.
-                        format!("irlume: {how}; shake your head to decline")
+                .and_then(|value| value.to_str().ok().map(str::to_string));
+            let service_kind = service
+                .as_deref()
+                .and_then(irlume_common::pam_service::classify);
+            let intent_confirmation = match service_kind {
+                Some(kind) if kind.requires_face_intent_confirmation() => {
+                    // A single response cannot authorize a retry loop or the
+                    // structurally different credential-release request.
+                    if wait || unseal {
+                        return PamError::IGNORE;
                     }
-                    irlume_common::config::ConsentGesture::Closure
-                    | irlume_common::config::ConsentGesture::Misconfigured => {
-                        format!("irlume: {how}")
+                    match confirm_face_intent(&pamh, kind) {
+                        IntentConfirmation::Confirmed => Some(IntentAttestation::PamConversation),
+                        IntentConfirmation::Fallback => return PamError::IGNORE,
+                        IntentConfirmation::Abort => return PamError::ABORT,
+                    }
+                }
+                _ => None,
+            };
+
+            // An explicitly enabled head gesture is an additional gate after
+            // conventional confirmation. Tell the user only when the shared
+            // policy says that extra gate will actually run.
+            if intent_confirmation.is_some()
+                && service
+                    .as_deref()
+                    .is_some_and(irlume_common::config::service_gesture_required)
+            {
+                let policy = irlume_common::config::head_consent_policy();
+                let msg = match policy {
+                    irlume_common::config::HeadConsentPolicy::Ready => {
+                        "irlume: keep nodding your head to approve; shake your head to decline"
+                            .to_string()
+                    }
+                    irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_) => {
+                        format!("irlume: {}", policy.instruction("approve"))
                     }
                 };
-                let _ = pamh.conv(Some(&msg), pamsm::PamMsgStyle::TEXT_INFO);
+                let _ = pamh.info(&msg);
             }
 
             // Same discoverability problem on the credential-release path: by
@@ -331,10 +401,9 @@ impl PamServiceModule for IrlumePam {
             // a parallel biometric device where an unsolicited message competes with
             // the password field.
             //
-            // The instruction names the gesture the daemon will actually accept,
-            // from the same `consent_gesture` parse the engine gates on: telling a
-            // `closure`-only user to nod would cost them the whole watch window and
-            // then the password.
+            // The instruction comes from the same head-consent policy the engine
+            // gates on, so retired or malformed configuration prints its migration
+            // blocker instead of promising a gesture the daemon will refuse.
             //
             // Reading a root-only setting here is best-effort by design. Greeter and
             // lock stacks run as root, so the read normally succeeds; a non-root PAM
@@ -343,12 +412,18 @@ impl PamServiceModule for IrlumePam {
             // credential either way, since the daemon refuses a non-root
             // UnsealPassword.
             if unseal && !wait && irlume_common::config::credential_release_gesture_required() {
-                let how = irlume_common::config::consent_gesture_mode()
-                    .instruction("unlock your keyring");
-                let _ = pamh.conv(
-                    Some(&format!("irlume: {how}")),
-                    pamsm::PamMsgStyle::TEXT_INFO,
-                );
+                let policy = irlume_common::config::head_consent_policy();
+                let how = match policy {
+                    irlume_common::config::HeadConsentPolicy::Ready => format!(
+                        "{}; shake your head to decline",
+                        policy.instruction("unlock your keyring")
+                    ),
+                    irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_) => {
+                        policy.instruction("unlock your keyring")
+                    }
+                };
+                let _ = pamh.info(&format!("irlume: {how}"));
             }
 
             // In `wait` mode, retry until a match or the budget runs out; otherwise
@@ -363,7 +438,10 @@ impl PamServiceModule for IrlumePam {
                 let (mut attempt, mut delivered) = if unseal {
                     try_unseal(&pamh, &user)
                 } else {
-                    (try_verify(&pamh, &user), Released::Failed)
+                    (
+                        try_verify(&pamh, &user, intent_confirmation),
+                        Released::Failed,
+                    )
                 };
                 // GDM and cosmic-greeter each drive BOTH the cold greeter and the
                 // live lock screen through one service. Unsealing is refused on the
@@ -373,7 +451,7 @@ impl PamServiceModule for IrlumePam {
                 // a cold login on a convenience tier still returns Deny here: the
                 // fallback only rescues the identity-only warm-unlock case.
                 if (facefirst || ondemand) && unseal && attempt != PamError::SUCCESS {
-                    attempt = try_verify(&pamh, &user);
+                    attempt = try_verify(&pamh, &user, None);
                     delivered = Released::Failed; // identity only, nothing released
                 }
                 // A polkit shake-decline is terminal: try_verify returned ABORT, so
@@ -746,7 +824,7 @@ fn read_stdout_bounded(
 /// window; and `IGNORE` on anything else so the password fallback survives. Passes
 /// the PAM service so the daemon can apply tier×operation-class gating (an RGB-only
 /// convenience device honours only a screen-unlock service).
-fn try_verify(pamh: &Pam, user: &str) -> PamError {
+fn try_verify(pamh: &Pam, user: &str, intent_confirmation: Option<IntentAttestation>) -> PamError {
     let service = pamh
         .get_service()
         .ok()
@@ -766,6 +844,7 @@ fn try_verify(pamh: &Pam, user: &str) -> PamError {
     match request(&Request::Authenticate {
         user: user.to_string(),
         service,
+        intent_confirmation,
     }) {
         Ok(Response::AuthResult {
             granted: true,
@@ -1004,10 +1083,95 @@ mod tests {
     }
     use super::*;
 
+    /// The local pamsm patch must expose token clearing without leaking the
+    /// opaque raw PAM handle into this module.
+    #[test]
+    fn pamsm_exposes_safe_auth_token_clearing() {
+        fn require_api(pam: &Pam) -> pamsm::PamResult<()> {
+            pam.clear_authtok()
+        }
+        let _: fn(&Pam) -> pamsm::PamResult<()> = require_api;
+    }
+
     #[test]
     fn firewall_passes_normal_returns_through() {
         assert_eq!(firewall(|| PamError::SUCCESS), PamError::SUCCESS);
         assert_eq!(firewall(|| PamError::IGNORE), PamError::IGNORE);
+    }
+
+    /// Only the existing bounded ASCII `yes` spellings are face intent. Empty
+    /// input and password-shaped bytes take separate, camera-free branches.
+    #[test]
+    fn intent_input_separates_confirmation_empty_and_password() {
+        for accepted in [
+            b"yes".as_slice(),
+            b" YES ",
+            b"\tyEs\r\n",
+            b"      yes       ",
+        ] {
+            assert!(matches!(
+                classify_intent_input(Some(accepted)),
+                IntentInput::Confirmed
+            ));
+        }
+        assert!(matches!(classify_intent_input(None), IntentInput::Empty));
+        assert!(matches!(
+            classify_intent_input(Some(b"")),
+            IntentInput::Empty
+        ));
+        for password in [
+            b"no".as_slice(),
+            b"long-local-credential-value",
+            &[0xff, 0xfe],
+            b"yes\0",
+            b"yes             x",
+            b"                 ",
+        ] {
+            assert!(matches!(
+                classify_intent_input(Some(password)),
+                IntentInput::Password
+            ));
+        }
+    }
+
+    #[test]
+    fn empty_and_yes_require_successful_token_clearing() {
+        for input in [IntentInput::Empty, IntentInput::Confirmed] {
+            assert!(matches!(
+                resolve_intent_input(input, || Err(PamError::SYSTEM_ERR)),
+                IntentConfirmation::Abort
+            ));
+        }
+        assert!(matches!(
+            resolve_intent_input(IntentInput::Password, || panic!(
+                "must not clear password input"
+            )),
+            IntentConfirmation::Fallback
+        ));
+    }
+
+    #[test]
+    fn conversation_errors_never_confirm_or_clear() {
+        let token = CString::new("yes").unwrap();
+        let kind = ServiceKind::Elevation;
+        assert!(matches!(
+            confirm_face_intent_with(
+                kind,
+                || Err(PamError::CONV_ERR),
+                || Ok(Some(token.as_c_str())),
+                || panic!("must not clear after info error"),
+            ),
+            IntentConfirmation::Fallback
+        ));
+        assert!(matches!(
+            confirm_face_intent_with(
+                kind,
+                || Ok(()),
+                || Err(PamError::CONV_ERR),
+                || panic!("must not clear after token error"),
+            ),
+            IntentConfirmation::Fallback
+        ));
     }
 
     #[test]
