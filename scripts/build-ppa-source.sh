@@ -19,17 +19,17 @@
 #   dput ppa:archledger/irlume "$HOME/ppa-build/irlume_"*"~resolute1_source.changes"
 # (The deterministic orig below still lets a NEW LTS be added cleanly later.)
 #
-# Env knobs: SERIES (default resolute), PPAREV (0ppa1), ORT_VER (1.24.4),
+# Env knobs: SERIES (default resolute), PPAREV (0ppa1), ORT_VER (1.28.1),
 # BUILDROOT (~/ppa-build), SKIP_BUILD_CHECK=1 to skip the offline test build.
 set -euo pipefail
 
 SERIES="${SERIES:-resolute}"
 PPAREV="${PPAREV:-0ppa1}"
-ORT_VER="${ORT_VER:-1.24.4}"
+ORT_VER="${ORT_VER:-1.28.1}"
 # sha256 of onnxruntime-linux-x64-${ORT_VER}.tgz; the bundled .so runs in the
 # privileged daemon, so verify it rather than trusting HTTPS alone. Update
 # together with ORT_VER.
-ORT_SHA256="${ORT_SHA256:-3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747}"
+ORT_SHA256="${ORT_SHA256:-2529aef968d0ad0603365054bc46ebefa7f0fe3bc12f28c5f729c99ddffe2a81}"
 BUILDROOT="${BUILDROOT:-$HOME/ppa-build}"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
