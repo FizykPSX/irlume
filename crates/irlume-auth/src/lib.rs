@@ -423,6 +423,31 @@ const RETRY_SEAM_ALLOWANCE_MS: u64 = 10_000;
 /// frames say nothing about the person in front of the camera.
 const MAX_CROSS_SPECTRUM_SKEW: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// SecureDark scene gate (ADR-0016): is the RGB frame's own brightness
+/// CONCLUSIVE evidence of a lit scene?
+///
+/// The dark (IR-only) path's legitimacy rests on an ENVIRONMENTAL fact — the
+/// room is too dark for RGB identity — not on a presentation-controllable
+/// one. "RGB found no face" alone is presentation-controllable: an artifact
+/// crafted to reflect 850nm while absorbing visible light (or simply a black
+/// visor over the presentation) produces exactly no-RGB-face + IR-face in a
+/// fully lit room, routing a lit-room attack onto the path with the least
+/// evidence. The gate reuses [`irlume_camera::CONCLUSIVE_SCENE_BRIGHTNESS`],
+/// the repo's existing measured lit/dark boundary: pitch-dark reads ~17,
+/// a dark room ~62 (NexiGo, 2026-07-25), the fault-visible lit arm 117-143;
+/// 100.0 sits between with anchors on both sides. At or above it, the scene
+/// is lit enough that the absence of an RGB face is SUSPICIOUS rather than
+/// environmental, and the dark path refuses: the user still has the RGB path
+/// (a face visible to IR in a conclusively lit scene is nearly always
+/// visible to RGB) and the password below everything.
+///
+/// Uncertain (not Spoof): a genuine user walking up to a lit machine also
+/// produces this shape transiently, and the grace window's retry lets RGB
+/// find them; the refusal is a routing decision, not an attack verdict.
+#[must_use]
+pub fn scene_conclusively_lit(rgb_frame_mean: f32) -> bool {
+    rgb_frame_mean >= irlume_camera::CONCLUSIVE_SCENE_BRIGHTNESS
+}
 /// The same ceiling under the SEQUENTIAL capture schedule, where a machinery
 /// gap between the two windows is NORMAL, not pathological: the second
 /// stream's one-shot capture pays open/negotiate plus its delivered-rate
@@ -5316,6 +5341,27 @@ impl Engine {
         // Dark path: no RGB face, but an IR face -> IR-only liveness + IR
         // recognition (Windows-Hello-style dark operation) across all profiles.
         if let Some(probe) = a.ir_embedding {
+            // SecureDark scene gate (ADR-0016): the dark path requires the
+            // scene to actually BE dark. In a conclusively lit room the
+            // absence of an RGB face is suspicious (an 850nm-reflective /
+            // visibly-dark presentation routes itself here on purpose), so
+            // the IR-only path refuses and the capture retries — a genuine
+            // user walking up gets found by RGB, an artifact gets the
+            // password. Uncertain, not Spoof: this is routing, not a
+            // verdict.
+            if scene_conclusively_lit(a.rgb_frame_mean) {
+                irlume_common::dlog!(
+                    "securedark: refusing IR-only path in a lit scene (rgb mean {:.0} >= {})",
+                    a.rgb_frame_mean,
+                    irlume_camera::CONCLUSIVE_SCENE_BRIGHTNESS
+                );
+                return Ok(Outcome::deny(
+                    OutcomeKind::Uncertain,
+                    "the room is lit but no face is visible to the RGB camera; \
+                     dark (IR-only) authentication requires a dark room — add \
+                     light so the RGB camera can see you, or use your password",
+                ));
+            }
             let m = self.ir_match(enr, &probe);
             if m.n_templates == 0 {
                 let reason = if enr.ir_scans().is_empty() {
@@ -5330,13 +5376,15 @@ impl Engine {
             diagnostics.emit_trace(irlume_liveness::diagnostic_trace_decision(
                 verdict, &a.signals,
             ));
-            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={} ambient={:.0}",
+            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={} ambient={:.0} ir_pad_p_fake={:?} rgb_frame_mean={:.0}",
                 a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio,
                 a.signals
                     .ir_eye_glint
                     .map(|g| format!("{g:.2}"))
                     .unwrap_or_else(|| "n/a".into()),
-                a.signals.ir_ambient);
+                a.signals.ir_ambient,
+                a.shipped_ir_fake,
+                a.rgb_frame_mean);
             if verdict != Verdict::Live {
                 // Dark-path kinds: Uncertain retries under grace, any Spoof
                 // does not (the retryable RGB-yes/IR-no transient cannot occur
@@ -5402,7 +5450,13 @@ impl Engine {
             let ir_base = if self.ir_adapter.is_some() {
                 irlume_core::IR_ADAPTED_MATCH_THRESHOLD
             } else {
-                irlume_core::IR_MATCH_THRESHOLD
+                // SecureDark stage 2 (ADR-0016): the pure-dark grant carries
+                // no RGB evidence at all, so its bar is the STRICTER dark
+                // constant (0.635: deployment-shaped OR-arm FAR 1.24e-4 on
+                // CBSR; live dark-session genuine min 0.884 vs the 0.685
+                // effective bar), never looser than the dim-light fallback
+                // that at least saw an RGB face.
+                irlume_core::IR_DARK_MATCH_THRESHOLD
             };
             let ir_thr = irlume_core::scaled_threshold(ir_base, m.n_templates);
             let (score, who) = (m.best, m.best_who.clone());
@@ -7896,6 +7950,32 @@ mod tests {
     }
 
     #[test]
+    fn the_securedark_scene_gate_separates_the_measured_lighting_landscapes() {
+        // The gate reuses CONCLUSIVE_SCENE_BRIGHTNESS, whose own provenance
+        // anchors both sides: pitch dark ~17 and a dark room ~62 (NexiGo,
+        // 2026-07-25) must pass THROUGH to the dark path; the lit arm
+        // (117-143) must refuse. The boundary itself (100.0) is pinned here
+        // so a camera-crate change cannot silently move the SecureDark gate.
+        assert_eq!(irlume_camera::CONCLUSIVE_SCENE_BRIGHTNESS, 100.0);
+        // Dark and pitch-dark rooms take the dark path.
+        assert!(!scene_conclusively_lit(17.0));
+        assert!(!scene_conclusively_lit(62.0));
+        assert!(
+            !scene_conclusively_lit(83.0),
+            "dim rooms are not conclusively lit"
+        );
+        // The boundary is inclusive-lit: at exactly 100 the scene is lit.
+        assert!(!scene_conclusively_lit(99.9));
+        assert!(scene_conclusively_lit(100.0));
+        assert!(scene_conclusively_lit(117.0));
+        assert!(scene_conclusively_lit(143.0));
+        // A failed/empty RGB frame reads 0.0 (frame_mean of nothing): the
+        // gate must not turn a sensor fault into a lit-scene refusal — the
+        // liveness and match gates behind it decide that case.
+        assert!(!scene_conclusively_lit(0.0));
+    }
+
+    #[test]
     fn a_stale_pair_without_an_ir_face_remains_a_capture_rejection() {
         assert_eq!(
             eligible_pair_evidence(
@@ -8938,6 +9018,15 @@ mod tests {
         // Constant relations the decision paths assume; checked at compile time.
         const { assert!(IR_ADAPTED_MATCH_THRESHOLD < IR_MATCH_THRESHOLD) };
         const { assert!(IR_FALLBACK_MARGIN > 0.0) };
+        // SecureDark (ADR-0016): stage 1 ended the old inversion (less
+        // evidence, looser threshold) by aligning the pure-dark bar with the
+        // dim-light fallback's effective bar; stage 2's live-measured bar
+        // (0.635) must stay AT OR ABOVE that fallback bar — the dark path
+        // carries strictly less evidence and can never be the looser arm.
+        const {
+            assert!(IR_DARK_MATCH_THRESHOLD >= IR_MATCH_THRESHOLD + IR_FALLBACK_MARGIN);
+            assert!(IR_DARK_MATCH_THRESHOLD > IR_MATCH_THRESHOLD);
+        }
         for n in [1usize, 5, 30, 90] {
             let dark = scaled_threshold(IR_MATCH_THRESHOLD, n);
             assert!(dark >= IR_MATCH_THRESHOLD);
@@ -9543,11 +9632,14 @@ mod pad_cue_tests {
         // 0.702 on 2026-07-27 (the reading that denied a real user when the
         // threshold was 0.5), and the vinyl-print attack at 0.998-1.0000
         // medians with a measured floor of 0.941 (2026-07-27, 6/6 flagged at
-        // 0.941-1.000). The operating window is 0.702-0.941; the threshold
-        // must stay inside it. Raising it "to be safer" crosses the attack
-        // floor and drops detections; lowering it crosses the genuine
-        // excursion and denies real faces.
-        const MEASURED_GENUINE_EXCURSION: f32 = 0.702;
+        // 0.941-1.000). The 2026-08-23 SecureDark lit-room control (RGB lens
+        // occluded, room lit, genuine face via IR) measured 0.799 — the
+        // worst genuine excursion on record, an out-of-domain regime (FLIR
+        // trained on emitter-dark NIR), disclosed in ADR-0016. The operating
+        // window is 0.799-0.941; the threshold must stay inside it. Raising
+        // it "to be safer" crosses the attack floor and drops detections;
+        // lowering it crosses the genuine excursion and denies real faces.
+        const MEASURED_GENUINE_EXCURSION: f32 = 0.799;
         const MEASURED_ATTACK_FLOOR: f32 = 0.941;
         const { assert!(IR_PAD_THRESHOLD > MEASURED_GENUINE_EXCURSION) };
         const { assert!(IR_PAD_THRESHOLD < MEASURED_ATTACK_FLOOR) };

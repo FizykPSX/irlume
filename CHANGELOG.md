@@ -5,6 +5,33 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Security
+
+- **SecureDark stage 1 (ADR-0016): the pure-dark (IR-only) path hardens.**
+  The dark path now requires the scene to actually be dark: an RGB frame
+  reading conclusively lit (>= the established 100.0 scene-brightness
+  boundary) refuses IR-only authentication, closing the lit-room routing
+  hole where a presentation crafted to reflect 850nm while absorbing
+  visible light could choose the lowest-evidence path on purpose. The
+  pure-dark match threshold rises 0.55 → 0.60 (CBSR NIR: FAR 1.3e-3 →
+  2.7e-4 for +1.3% FRR), ending the inversion where the dim-light
+  fallback — which verifies an RGB face first — demanded a stricter bar
+  than pure darkness. Per-user IR calibration, FLIR PAD, IR physics, and
+  the per-user center/edge floor are unchanged. **Stage 2 (2026-08-23):**
+  the live dark session ran (30 true-dark auths, minihost NexiGo; genuine
+  best-cosine min 0.884, FLIR p_fake <= 0.005) and the pre-written decision
+  rule passed with 10x margin, so `IR_DARK_MATCH_THRESHOLD` rises
+  0.60 → 0.635 (CBSR deployment-shaped OR-arm FAR 1.24e-4 / FRR 0.68%;
+  Tufts calibrated ~4.9e-5). The session also MEASURED the disclosed
+  residuals: the ASUS Shinetech module's firmware auto-engages its privacy
+  shutter while streaming in darkness (dark auth is firmware-impossible on
+  that host, failing closed), and an occluded RGB lens in a lit room reads
+  ~18 and routes to the dark path (no in-stream discriminator exists; the
+  occlusion attacker still faces the 0.635-effective IR identity bar, FLIR
+  — whose lit-room-via-IR margin thins to p_fake 0.80 — and the per-user
+  floor). Multi-frame consistency stays gated on the next session's
+  in-burst pair-cosine measurement.
+
 ### Removed
 
 - **Third-party / bring-your-own model support (ADR-0015).** The opt-in model
