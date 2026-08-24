@@ -606,16 +606,28 @@ fn synchronization_key(id: &CameraIdentity) -> String {
 
 /// Where a camera's lock file lives.
 ///
-/// `/run/lock`, not beside the records, for the same reason `pamwire` puts its
-/// lock there: a lock's lifetime is a boot, not the machine's. Under the store it
-/// would create `/var/lib/irlume/ir-emitter-journal/` on every machine that ever
-/// opens a camera, including the overwhelming majority that never run `ir-setup`
-/// and have nothing to record, and leave a lock file behind for each camera
+/// `/run/lock/irlume`, not beside the records, for the same reason `pamwire`
+/// puts its lock under `/run/lock`: a lock's lifetime is a boot, not the
+/// machine's. Under the store it would create
+/// `/var/lib/irlume/ir-emitter-journal/` on every machine that ever opens a
+/// camera, including the overwhelming majority that never run `ir-setup` and
+/// have nothing to record, and leave a lock file behind for each camera
 /// forever. `IRLUME_EMITTER_LOCK_DIR` moves it for tests and containers.
+///
+/// The dedicated SUBDIRECTORY is the capability-free half of the #542 fix.
+/// The daemon's unit deliberately excludes `CAP_CHOWN`, so a lock the root
+/// daemon creates under its own umask cannot be re-grouped to the camera's
+/// group in-process. The directory ships as a tmpfiles.d rule (`root:video`,
+/// setgid, mode 2751) so every lock INHERITS the camera group at creation,
+/// which is the only way group-permission hosts (camera node with no uaccess
+/// ACL, tools granted through `video` membership) can share the lock with
+/// non-root camera tools. `mirror_device_access` still applies mode and ACL
+/// at runtime, and tolerates a group it cannot correct on a lock already
+/// restricted to this process.
 fn lock_path(id: &CameraIdentity) -> PathBuf {
     std::env::var_os("IRLUME_EMITTER_LOCK_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/run/lock"))
+        .unwrap_or_else(|| PathBuf::from("/run/lock/irlume"))
         .join(format!("irlume-emitter-{}.lock", synchronization_key(id)))
 }
 
@@ -648,6 +660,30 @@ pub(crate) fn lock_camera(
     let path = lock_path(id);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        // create_dir_all follows symlinks, and /run/lock is writable by root
+        // only — but the lock directory is created by tmpfiles.d at boot in
+        // the packaged lanes, and a silently-failed rule plus a pre-planted
+        // symlink must not turn the root daemon into a file-creation oracle
+        // inside an attacker-chosen directory. Refuse anything that is not a
+        // real directory (symlink_metadata: the symlink itself, not its
+        // target).
+        match std::fs::symlink_metadata(dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "emitter lock directory {} is not a directory; refusing to create \
+                     locks through it (packaged installs: systemd-tmpfiles --create \
+                     irlume.conf repairs it)",
+                    dir.display()
+                ))
+            }
+            Err(e) => {
+                return Err(format!(
+                    "stat emitter lock directory {}: {e}",
+                    dir.display()
+                ))
+            }
+        }
     }
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -718,7 +754,7 @@ fn mirror_device_access(
     // lock is not already locked down to this process: the packaged daemon
     // runs under CapabilityBoundingSet without CAP_CHOWN (the unit documents
     // "nothing chowns"), so on a clean install it CREATES the lock root:root
-    // 0600 and cannot widen it to the device's group/ACL — a root-only lock
+    // 0600 and cannot widen it to the device's group — a root-only lock
     // excludes strictly MORE callers than the mirror target, which is safe
     // for authentication (the mirror exists so user-context dev tools can
     // share the lock, #487; a privileged tool re-runs ir-setup, which
@@ -726,12 +762,23 @@ fn mirror_device_access(
     // still refuses, unchanged. This restores the contract the ignored
     // harness test documents: "it must not make a root-owned lock this
     // process can open (but not chmod) refuse".
+    //
+    // A tolerated failure now CONTINUES to the ACL and mode steps below
+    // instead of returning early (#542): the early return left the lock at
+    // 0600 root:root with no ACL, which no non-root camera tool can open on
+    // any host class. The ACL copy and the mode set both work under the
+    // daemon's bounding set (CAP_FOWNER is present), so a group the process
+    // cannot correct costs only the group bit — the device's uaccess callers
+    // still reach the lock through the copied ACL. Group-only hosts (no ACL
+    // on the camera node) need the group and are covered by the setgid lock
+    // directory from tmpfiles.d, which makes this fchown a no-op skip.
     let lock_meta = file
         .metadata()
         .map_err(|e| format!("stat emitter lock {}: {e}", path.display()))?;
     // SAFETY: geteuid reads this process's own credentials and cannot fail.
     let secure_fallback =
         lock_meta.uid() == unsafe { libc::geteuid() } && lock_meta.mode() & 0o007 == 0;
+    let mut degraded: Vec<&'static str> = Vec::new();
     if lock_meta.gid() != st.st_gid {
         // SAFETY: fchown sets only the group on an owned fd.
         if unsafe { libc::fchown(lock_fd, u32::MAX, st.st_gid) } != 0 {
@@ -744,59 +791,104 @@ fn mirror_device_access(
                     e
                 ));
             }
+            degraded.push("group");
             irlume_common::dlog!(
-                "emitter lock {}: cannot set group {} ({}); proceeding on the                  already-restricted root-owned lock (no world access)",
+                "emitter lock {}: cannot set group {} ({}); continuing without the group bit",
                 path.display(),
                 st.st_gid,
                 e
             );
-            return Ok(());
         }
     }
 
-    // Copy the extended ACL, the part that grants a per-user uaccess caller. A
-    // device with none must REMOVE an ACL left by an earlier session; leaving
-    // stale named-user entries would grant callers who lost device access.
-    let device_acl =
-        read_access_acl(fd).map_err(|e| format!("read camera device fd {fd} access ACL: {e}"))?;
-    if let Err(e) = replace_access_acl(lock_fd, device_acl.as_deref(), path) {
-        if !secure_fallback {
-            return Err(e);
+    // When the group could not be corrected, every group-class grant below
+    // would land on the WRONG group (this process's own, typically the
+    // setgid directory's `video`), handing members of that group a lock for
+    // a camera they cannot open — a lock the module's own invariant says
+    // must open to exactly the device's callers. So a degraded group strips
+    // the group bits from the applied mode and skips the ACL copy entirely
+    // (an ACL's GROUP_OBJ/MASK entries carry the device's group perms onto
+    // the same wrong group). The lock then opens to its owner alone:
+    // stricter than the device, which is the fail-closed direction and
+    // exactly the pre-#542 status quo on such hosts. Hosts whose camera
+    // group is not `video` get the full mirror by shipping the documented
+    // /etc/tmpfiles.d override for the lock directory.
+    let effective_mode = if degraded.contains(&"group") {
+        mode & !0o070
+    } else {
+        mode
+    };
+    let device_acl = if degraded.contains(&"group") {
+        // No copy — but a stale ACL from an earlier session must not survive
+        // either: its named entries may reference callers who lost device
+        // access, and its GROUP_OBJ/MASK would re-grant the wrong group the
+        // mode below just stripped.
+        if let Err(e) = replace_access_acl(lock_fd, None, path) {
+            if !secure_fallback {
+                return Err(e);
+            }
+            degraded.push("ACL");
+            irlume_common::dlog!(
+                "emitter lock {}: cannot strip a stale ACL ({}); continuing",
+                path.display(),
+                e
+            );
         }
-        irlume_common::dlog!(
-            "emitter lock {}: cannot mirror the device ACL ({}); proceeding on              the already-restricted root-owned lock",
-            path.display(),
-            e
-        );
-        return Ok(());
-    }
+        None
+    } else {
+        let acl = read_access_acl(fd)
+            .map_err(|e| format!("read camera device fd {fd} access ACL: {e}"))?;
+        if let Err(e) = replace_access_acl(lock_fd, acl.as_deref(), path) {
+            if !secure_fallback {
+                return Err(e);
+            }
+            degraded.push("ACL");
+            irlume_common::dlog!(
+                "emitter lock {}: cannot mirror the device ACL ({}); continuing without it",
+                path.display(),
+                e
+            );
+        }
+        acl
+    };
 
     // Mode last. The ACL mask (if any) already fixed the group bits; without
-    // an ACL the mode must be set to the device's exactly. Preserve the
-    // world-accessible refusal: a lock any local user can flock cannot be
-    // trusted, and one this process cannot correct must refuse rather than
-    // authenticate behind it.
+    // an ACL the mode must be set to the device's exactly — unless the group
+    // is degraded, where `effective_mode` carries the stripped group bits so
+    // no grant lands on the wrong group. Preserve the world-accessible
+    // refusal: a lock any local user can flock cannot be trusted, and one
+    // this process cannot correct must refuse rather than authenticate
+    // behind it.
     let mut perms = file
         .metadata()
         .map_err(|e| format!("stat {}: {e}", path.display()))?
         .permissions();
     let current = perms.mode() & 0o777;
-    if current != mode {
-        perms.set_mode(mode);
+    if current != effective_mode {
+        perms.set_mode(effective_mode);
         if let Err(e) = file.set_permissions(perms) {
             if current & 0o007 != 0 {
                 return Err(format!(
                     "emitter lock {} has mode {current:o}, which any local user can \
                      flock, and this process cannot correct it ({e}); refusing to \
-                     trust the lock. Fix it as root: chmod {mode:o} {}",
+                     trust the lock. Fix it as root: chmod {effective_mode:o} {}",
                     path.display(),
                     path.display()
                 ));
             }
-            return Err(format!(
-                "set emitter lock {} mode from {current:o} to {mode:o}: {e}",
-                path.display()
-            ));
+            if !secure_fallback {
+                return Err(format!(
+                    "set emitter lock {} mode from {current:o} to {effective_mode:o}: {e}",
+                    path.display()
+                ));
+            }
+            degraded.push("mode");
+            irlume_common::dlog!(
+                "emitter lock {}: cannot set mode {effective_mode:o} ({}); continuing on the \
+                 already-restricted mode {current:o}",
+                path.display(),
+                e
+            );
         }
     }
 
@@ -804,22 +896,67 @@ fn mirror_device_access(
         .metadata()
         .map_err(|e| format!("re-stat emitter lock {}: {e}", path.display()))?;
     let final_mode = final_meta.permissions().mode() & 0o777;
-    if final_meta.gid() != st.st_gid || final_mode != mode {
+    // The unconditional floor of every tolerated failure above: whatever else
+    // could not be mirrored, a lock this process cannot restrict to
+    // non-world access is a lock any local user can flock, and it refuses.
+    if final_mode & 0o007 != 0 {
         return Err(format!(
-            "emitter lock {} access changed while mirroring it (wanted group {} mode \
-             {mode:o}, found group {} mode {final_mode:o})",
+            "emitter lock {} ended at mode {final_mode:o}, which any local user can \
+             flock; refusing to trust the lock. Fix it as root: chmod {mode:o} {}",
+            path.display(),
+            path.display()
+        ));
+    }
+    // Assert only what was supposed to be achieved, so a RACE (someone
+    // changing the lock underneath the mirror) is still caught on every
+    // dimension this process could set, while a tolerated step does not fail
+    // the lock for the state it never reached.
+    if !degraded.contains(&"group") && final_meta.gid() != st.st_gid {
+        return Err(format!(
+            "emitter lock {} access changed while mirroring it (wanted group {}, found {})",
             path.display(),
             st.st_gid,
             final_meta.gid()
         ));
     }
+    if !degraded.contains(&"mode") && final_mode != effective_mode {
+        return Err(format!(
+            "emitter lock {} access changed while mirroring it (wanted mode {effective_mode:o}, found {final_mode:o})",
+            path.display()
+        ));
+    }
     let final_acl = read_access_acl(lock_fd)
         .map_err(|e| format!("verify emitter lock {} access ACL: {e}", path.display()))?;
-    if final_acl != device_acl {
+    if !degraded.contains(&"ACL") && final_acl != device_acl {
         return Err(format!(
             "emitter lock {} access ACL changed while mirroring it",
             path.display()
         ));
+    }
+    if !degraded.is_empty() {
+        // Once per process, not per capture: the packaged daemon holds this
+        // lock on every stream open, and the fleet journals showed the
+        // silent form of this exact defect is what kept #542 hidden through
+        // a release. The remedy is named only for the group case, where it
+        // is true; an ACL or mode degradation alone does not block tools on
+        // ACL-granted hosts.
+        static DEGRADED_MIRROR: std::sync::Once = std::sync::Once::new();
+        DEGRADED_MIRROR.call_once(|| {
+            let group_note = if degraded.contains(&"group") {
+                " non-root camera tools will be unable to open this lock until the \
+                 camera group is inherited at creation (packaged installs: check \
+                 the irlume tmpfiles.d rule for /run/lock/irlume);"
+            } else {
+                ""
+            };
+            eprintln!(
+                "irlume: emitter lock {} could not mirror: {};{} authentication \
+                 itself is unaffected",
+                path.display(),
+                degraded.join(", "),
+                group_note
+            );
+        });
     }
     Ok(())
 }
@@ -913,6 +1050,18 @@ pub(crate) enum Situation {
     SameModelElsewhere(Box<PendingWrite>),
 }
 
+/// Prefix `load` and `all_records` put on errors that mean "the store could
+/// not be examined" (an unreadable directory or record), as opposed to a
+/// record that exists and is damaged. The recovery path maps these to
+/// `Unchecked` ("could not check whether a change is pending") rather than
+/// `Unresolved` ("a change is recorded"): an unreadable store must refuse
+/// writes without claiming a pending change that may not exist. Same
+/// contract as the lock-side #210 fix; the read side resurfaced once #542
+/// let unprivileged tools get past the lock to the store at all (#542 fleet
+/// validation, minihost). Any NEW error path added to either function must
+/// decide explicitly which class it belongs to — this prefix is the contract.
+pub(crate) const STORE_UNEXAMINABLE: &str = "cannot examine the store: ";
+
 /// Classify the store against this camera.
 ///
 /// The exact record is tried first, by name, so the ordinary case costs one
@@ -968,7 +1117,7 @@ pub(crate) fn load(id: &CameraIdentity) -> Result<Situation, String> {
             });
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("read {}: {e}", path.display())),
+        Err(e) => return Err(format!("{STORE_UNEXAMINABLE}read {}: {e}", path.display())),
     }
 
     // EVERY same-model record is examined, not the first one `read_dir` happens
@@ -1009,18 +1158,18 @@ fn all_records() -> Result<Vec<(PathBuf, PendingWrite)>, String> {
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("list {}: {e}", dir.display())),
+        Err(e) => return Err(format!("{STORE_UNEXAMINABLE}list {}: {e}", dir.display())),
     };
     let mut records = Vec::new();
     for entry in entries {
         let path = entry
-            .map_err(|e| format!("list {}: {e}", dir.display()))?
+            .map_err(|e| format!("{STORE_UNEXAMINABLE}list {}: {e}", dir.display()))?
             .path();
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
-        let body =
-            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| format!("{STORE_UNEXAMINABLE}read {}: {e}", path.display()))?;
         let record =
             serde_json::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))?;
         records.push((path, record));
@@ -1253,6 +1402,23 @@ mod tests {
         assert!(
             err.contains("any local user can") && err.contains("chmod 660"),
             "the refusal must say why and how to fix it: {err}"
+        );
+    }
+
+    /// The lock lives in the dedicated setgid directory (#542): the default
+    /// path must be `/run/lock/irlume/`, the directory the tmpfiles.d rule
+    /// creates `root:video` 2751 so daemon-created locks inherit the camera
+    /// group at creation (the daemon's bounding set has no CAP_CHOWN and
+    /// cannot re-group them in-process).
+    #[test]
+    fn lock_path_defaults_to_the_setgid_lock_directory() {
+        let _env = env_lock();
+        let _guard = EnvGuard::unset("IRLUME_EMITTER_LOCK_DIR");
+        let path = lock_path_for_test(&identity());
+        assert_eq!(
+            path.parent(),
+            Some(std::path::Path::new("/run/lock/irlume")),
+            "the default lock directory is the tmpfiles.d-managed setgid dir"
         );
     }
 

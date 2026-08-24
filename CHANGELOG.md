@@ -5,7 +5,35 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
-- Nothing yet.
+### Fixed
+
+- **Non-root camera tools can open the IR-emitter lock again (#542).** The
+  daemon's systemd unit deliberately excludes `CAP_CHOWN`, so the lock it
+  creates on a clean boot could not be re-grouped to the camera's group;
+  the #534 tolerance then returned early, skipping the ACL copy and mode
+  set as well, leaving the lock `root:root 0600` with no ACL — unopenable
+  by `camera-tune`, user-context `ir-setup`, and the hardware stress
+  runner on every host. Two halves fix it: the tolerated mirror failure
+  now continues to the ACL and mode steps (which work under the daemon's
+  bounding set), and the lock moves to a dedicated setgid
+  `/run/lock/irlume` directory (tmpfiles.d, `root:video` 2751) so
+  daemon-created locks inherit the camera group at creation — the only
+  capability-free fix for hosts whose cameras carry no per-user ACL. When
+  the group still cannot be corrected (a camera group no tmpfiles override
+  covers), the mirror now strips every group-class grant from the lock
+  instead of granting the wrong group, so the lock never opens to callers
+  the camera itself would refuse. Authentication was never affected
+  (fail-closed direction); upgrading from an older version and back again
+  during one boot mixes lock paths for the transition window, disclosed
+  here.
+- **An unexaminable emitter journal no longer reports a phantom pending
+  change.** With non-root tools reaching the journal read for the first
+  time (they used to stop at the lock), a permission failure reading the
+  root-owned store was reported as "an emitter control ... was left
+  changed ... and has not been put back" — asserting a record that was
+  never observed. The store-read failure now reports "could not check"
+  (same fail-closed refusal, honest wording), matching the lock-side
+  #210 contract.
 
 ## [0.11.0] - 2026-08-23
 
