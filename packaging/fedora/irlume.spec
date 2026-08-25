@@ -184,10 +184,20 @@ systemctl start irlume-reconcile.timer &>/dev/null || :
 # The timer is NEW in 0.7.0 and %%systemd_post only applies presets on a FRESH
 # install, so an upgrader would never get the backstop. Arm it once, recorded by
 # a marker, leaving a later deliberate disable alone.
+# rpm-ostree runs scriptlets in a bwrap sandbox with /var read-only, and any
+# scriptlet failure aborts the whole `rpm-ostree install` transaction
+# (verified on Silverblue 44, 0.11.1: layering was impossible). Note the
+# touch below must stay `touch`: the old `: > marker` is a redirection on
+# the POSIX special builtin `:`, and a redirection failure there aborts
+# the entire /bin/sh scriptlet, which `|| :` cannot catch.
+# The marker simply stays unwritten on ostree, so this block re-runs on
+# every upgrade (the sandboxed `systemctl enable` is inert there);
+# /var/lib/irlume itself is created on demand by the daemon and the
+# reconcile service, so nothing needs it from this scriptlet.
 if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
-    mkdir -p /var/lib/irlume
     systemctl enable --now irlume-reconcile.timer &>/dev/null || :
-    : > /var/lib/irlume/.reconcile-timer-armed
+    mkdir -p /var/lib/irlume 2>/dev/null || :
+    touch /var/lib/irlume/.reconcile-timer-armed 2>/dev/null || :
 fi
 systemctl start irlume-reconcile.service &>/dev/null || :
 # PAM wiring is opt-in (irlume login enable); never auto-wire auth on install.
