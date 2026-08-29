@@ -311,8 +311,16 @@ Test it in a fresh terminal with `sudo -k` (clear the cached credential) then
 `sudo true`. PAM shows `Type yes to use face authentication` above the normal
 hidden field. Type `yes` for one face attempt, or type the ordinary password
 once for the password/fingerprint path. Empty Enter never starts the camera and
-falls through to the password provider. This confirmation is mandatory and has
-no disable setting.
+falls through to the password provider.
+
+This confirmation is on by default and stays that way unless the machine's
+owner turns it off. `privileged_face_consent=0` in `/etc/irlume/settings.conf`
+(or `IRLUME_PRIVILEGED_FACE_CONSENT=0`) is the owner's waiver of that keyword:
+the scan starts when the privileged PAM prompt appears, with no per-attempt
+word. Do it only if you accept what follows: every
+`sudo` opens the camera, including one typed by someone else at your machine
+and one run from a script. Passive PAD still applies, and the password still
+works.
 
 ## App prompts via polkit (optional)
 
@@ -325,7 +333,8 @@ sudo irlume login enable --with-polkit --apply
 
 The daemon treats polkit as verify-only (it never releases the TPM-sealed
 credential to it). PAM shows `Type yes to use face authentication` above the
-normal hidden field. Type `yes` for one face attempt, or type the ordinary
+normal hidden field, unless `privileged_face_consent=0` waives it as described
+above. Type `yes` for one face attempt, or type the ordinary
 password once for the password/fingerprint path. Empty Enter and cancellation
 never open the camera. An experimental head gesture can be explicitly added as
 a second gate, but defaults off and never replaces keyboard confirmation.
@@ -453,7 +462,7 @@ live in them; sealed envelopes are stored separately (see
 
 | File | Holds | Written by |
 |---|---|---|
-| `/etc/irlume/settings.conf` | `credential_release_challenge=1` opts IN to a head gesture before the login-keyring credential is released (default off); every `service_gesture.<service>` also defaults off, with `=1` adding an experimental gesture after mandatory privileged keyboard confirmation; the legacy `polkit_gesture=1` switch remains an explicit polkit opt-in. `enforce_biopolicy=1` opts into operation-class gating; `forbid_external_cameras=1` restricts face authentication to cameras the kernel reports as `removable: fixed` (internal only; `removable: unknown` fails closed to the password, mirroring Windows ShouldForbidExternalCameras post-CVE-2021-34466); the legacy `third_party_pad` / `third_party_recognizer` keys are ignored with a startup notice (the third-party lane was removed, ADR-0015). During the migration window, `consent_gesture=closure` or malformed values block only a gesture-gated request until removed or changed to `nod` | TUI Settings; `sudo irlume credential-release-challenge [<service>] on\|off` |
+| `/etc/irlume/settings.conf` | `credential_release_challenge=1` opts IN to a head gesture before the login-keyring credential is released (default off); every `service_gesture.<service>` also defaults off, with `=1` adding an experimental gesture after mandatory privileged keyboard confirmation; the legacy `polkit_gesture=1` switch remains an explicit polkit opt-in. `privileged_face_consent=0` is the machine owner's waiver of the literal `yes` on privileged services, so the scan starts when the privileged PAM prompt appears, with no per-attempt word (default on: the confirmation is required, and an unreadable settings file keeps it). `enforce_biopolicy=1` opts into operation-class gating; `forbid_external_cameras=1` restricts face authentication to cameras the kernel reports as `removable: fixed` (internal only; `removable: unknown` fails closed to the password, mirroring Windows ShouldForbidExternalCameras post-CVE-2021-34466); the legacy `third_party_pad` / `third_party_recognizer` keys are ignored with a startup notice (the third-party lane was removed, ADR-0015). During the migration window, `consent_gesture=closure` or malformed values block only a gesture-gated request until removed or changed to `nod` | TUI Settings; `sudo irlume credential-release-challenge [<service>] on\|off` |
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |
@@ -475,6 +484,7 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | Variable | Effect | Default |
 |---|---|---|
 | `IRLUME_MODELS_STRICT` | refuse to start when a model file is missing or fails the checksum manifest, instead of warning | warn and continue |
+| `IRLUME_PRIVILEGED_FACE_CONSENT` | same switch as `privileged_face_consent` in `settings.conf`; the env var wins. `0` waives the literal `yes` on privileged services | on |
 | `IRLUME_ENFORCE_BIOPOLICY` | same switch as `enforce_biopolicy` in `settings.conf`; the env var wins | off |
 | `IRLUME_FORBID_EXTERNAL_CAMERAS` | same switch as `forbid_external_cameras` in `settings.conf`; the env var wins | off |
 | `IRLUME_CREDENTIAL_RELEASE_CHALLENGE` | same switch as `credential_release_challenge` in `settings.conf`. Precedence: `service_gesture.credential_release` has highest priority; when that key is absent, this variable overrides the `settings.conf` key. Set `1` to add a gesture before the keyring password is released | off |

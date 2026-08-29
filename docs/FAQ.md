@@ -169,6 +169,13 @@ password/fingerprint without opening the camera; `yes` authorizes one face
 attempt. Login, logout, lock-screen, and credential-release flows do not gain
 this extra irlume prompt.
 
+That prompt is on by default and can be turned off per machine with
+`privileged_face_consent=0` in `/etc/irlume/settings.conf`, the machine owner's
+waiver: a privileged face attempt then starts when the PAM prompt appears, with
+no per-attempt word. The trade is that
+every `sudo` then opens the camera, including one typed by someone else at the
+machine; passive PAD and the password fallback are unaffected.
+
 An experimental **head gesture** can be explicitly added as a second gate and
 defaults off everywhere. Repeated nodding approves and a head shake declines;
 on Plasma 6 the KDE polkit agent may re-prompt before closing its window
