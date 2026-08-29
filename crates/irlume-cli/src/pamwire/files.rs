@@ -12,7 +12,7 @@
 
 use super::grammar::*;
 use super::stanzas::*;
-use super::{Svc, FP_GREETERS, GREETERS, LOCKSCREEN, POLKIT, SUDO};
+use super::{lock_surface_for, Svc, FP_GREETERS, GREETERS, POLKIT, SUDO};
 use std::path::{Path, PathBuf};
 
 pub(super) fn read(p: &str) -> Result<String, String> {
@@ -67,14 +67,28 @@ pub(crate) fn surface_digest(path: &Path) -> String {
 /// So the paths are checked against the surfaces irlume wires, plus their
 /// `.pre-irlume` sidecars, and nothing else is restorable.
 pub(crate) fn is_managed_path(path: &str) -> bool {
+    is_managed_path_for(
+        irlume_common::platform::omarchy_present(),
+        std::path::Path::new("/etc/pam.d/cinnamon-screensaver").exists(),
+        path,
+    )
+}
+
+/// Testable core of [`is_managed_path`], so the rollback test can pin the
+/// KDE fallback without reading the host filesystem (the live call would
+/// reject `/etc/pam.d/kde` on an Omarchy or Cinnamon box where the
+/// dynamic chooser picks a different lock surface).
+pub(crate) fn is_managed_path_for(omarchy: bool, cinnamon: bool, path: &str) -> bool {
     let bare = path.strip_suffix(BACKUP).unwrap_or(path);
     // Built from the same lists the wiring uses, so a surface added there is
-    // restorable without anyone remembering to update a second list.
+    // restorable without anyone remembering to update a second list. The
+    // lock surface goes through the same dynamic chooser the wiring walks.
+    let (lock_svc, _) = lock_surface_for(omarchy, cinnamon);
     GREETERS
         .iter()
         .chain(FP_GREETERS.iter())
         .map(|s| s.etc)
-        .chain([LOCKSCREEN.etc, POLKIT.etc, SUDO])
+        .chain([lock_svc.etc, POLKIT.etc, SUDO])
         .any(|managed| managed == bare)
 }
 

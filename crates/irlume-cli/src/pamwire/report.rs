@@ -220,13 +220,27 @@ pub(crate) fn login_manager_fact() -> LoginManagerFact {
 }
 
 /// Structured wiring status for the TUI: `(label, present, wired)` per service
-/// plus a trailing SELinux row. Mirrors what `status()` prints.
+/// plus a trailing SELinux row. Mirrors what `status()` prints, lock surface
+/// included: the same dynamic chooser the wiring uses (#587's lesson).
 pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
+    status_report_for(
+        irlume_common::platform::omarchy_present(),
+        std::path::Path::new("/etc/pam.d/cinnamon-screensaver").exists(),
+    )
+}
+
+/// Testable core of [`status_report`], so the TUI row test can pin the
+/// KDE fallback without reading the host filesystem (the live call reads
+/// `/usr/share/omarchy` and `/etc/pam.d/cinnamon-screensaver`, which
+/// would fail the exact-label assertion on an Omarchy or Cinnamon box,
+/// including the self-hosted hardware-suite runner).
+pub(super) fn status_report_for(omarchy: bool, cinnamon: bool) -> Vec<(String, bool, bool)> {
+    let (lock_svc, _) = lock_surface_for(omarchy, cinnamon);
     let mut out = Vec::new();
     for s in GREETERS
         .iter()
         .chain(FP_GREETERS.iter())
-        .chain(std::iter::once(&LOCKSCREEN))
+        .chain(std::iter::once(lock_svc))
     {
         match service_present(s) {
             Some(p) => out.push((label_of(s.etc), true, file_has_module(&p))),
