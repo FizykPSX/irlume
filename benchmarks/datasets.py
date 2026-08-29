@@ -80,8 +80,10 @@ _THREE00W = DatasetSpec(
     ),
     provenance_url="https://huggingface.co/datasets/quoctai219/300W",
     notes=(
-        "This zip is the full canonical 300W set. Mirror identity matters "
-        "(see benchmarks/README.md): numbers are valid only for this mirror."
+        "This mirror ships the 300W common test subset only (600 png+pts "
+        "pairs; no train or AFW images). That subset is the evaluation "
+        "target. Mirror identity matters (see benchmarks/README.md): "
+        "numbers are valid only for this mirror."
     ),
 )
 
