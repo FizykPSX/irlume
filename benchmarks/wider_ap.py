@@ -141,3 +141,62 @@ def evaluate(preds_by_image, gt_by_image) -> dict:
     scores = [s for s, _ in scored]
     tps = [t for _, t in scored]
     return {"ap": voc_ap(scores, tps, n_gt), "tp": tp, "fp": fp, "n_gt": n_gt}
+
+
+def _in_tier(g: dict, min_h: float, strict: bool) -> bool:
+    h = g["box"][3] - g["box"][1]
+    return h > min_h if strict else h >= min_h
+
+
+def _discard_off_tier(preds, gt, tier_gt) -> list:
+    """Official-approximation discard: each prediction is matched to its
+    best-IoU GT among ALL valid boxes of the image; predictions whose
+    best-overlap GT is not in the tier are dropped from evaluation entirely
+    (neither tp nor fp, matching evaluation.m proposal_list=-1). A
+    prediction with zero overlap against every valid GT has no best-overlap
+    GT and is kept as an fp candidate. Invalid-flag boxes never take part
+    in the best-overlap scan."""
+    tier_ids = {id(g) for g in tier_gt}
+    surviving = []
+    for pred in preds:
+        best_iou = 0.0
+        best = None
+        for g in gt:
+            if g["invalid"]:
+                continue
+            v = iou(pred[1], g["box"])
+            if v > best_iou:
+                best_iou = v
+                best = g
+        if best is not None and id(best) not in tier_ids:
+            continue
+        surviving.append(pred)
+    return surviving
+
+
+def evaluate_tier(preds_by_image, gt_by_image, min_h: float, strict: bool) -> dict:
+    """Evaluate one difficulty tier: only GT boxes inside the height cut
+    (h > min_h when strict else h >= min_h) are matchable and counted in
+    n_gt; off-tier predictions are discarded before matching."""
+    tp = fp = n_gt = 0
+    scored: list[tuple[float, int]] = []
+    for key in sorted(set(preds_by_image) | set(gt_by_image)):
+        preds = preds_by_image.get(key, [])
+        gt = gt_by_image.get(key, [])
+        tier_gt = [
+            g for g in gt if not g["invalid"] and _in_tier(g, min_h, strict)
+        ]
+        surviving = _discard_off_tier(preds, gt, tier_gt)
+        order = sorted(
+            range(len(surviving)), key=lambda j: surviving[j][0], reverse=True
+        )
+        flags = _match(surviving, tier_gt, 0.5)
+        for j, is_tp in zip(order, flags):
+            scored.append((surviving[j][0], 1 if is_tp else 0))
+        tp += sum(1 for f in flags if f)
+        fp += sum(1 for f in flags if not f)
+        n_gt += len(tier_gt)
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    scores = [s for s, _ in scored]
+    tps = [t for _, t in scored]
+    return {"ap": voc_ap(scores, tps, n_gt), "tp": tp, "fp": fp, "n_gt": n_gt}

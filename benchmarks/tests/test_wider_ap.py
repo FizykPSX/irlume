@@ -1,6 +1,13 @@
 import pytest
 
-from wider_ap import evaluate, evaluate_image, iou, parse_val_gt, voc_ap
+from wider_ap import (
+    evaluate,
+    evaluate_image,
+    evaluate_tier,
+    iou,
+    parse_val_gt,
+    voc_ap,
+)
 
 
 GT_SNIPPET = """0--Parade/0_Parade_marchingband_1_849.jpg
@@ -100,6 +107,59 @@ def test_evaluate_image_invalid_gt_excluded_from_tp_and_n_gt():
         (0.8, [40.0, 40.0, 50.0, 50.0]),
     ]
     assert evaluate_image(preds, gt) == (1, 1, 1)
+
+
+def test_evaluate_tier_discards_off_tier_predictions():
+    gt = {
+        "a.jpg": [
+            {"box": (0.0, 0.0, 10.0, 60.0), "invalid": False},
+            {"box": (100.0, 100.0, 105.0, 104.0), "invalid": False},
+        ]
+    }
+    preds = {
+        "a.jpg": [
+            (0.9, [0.0, 0.0, 10.0, 60.0]),
+            (0.8, [100.0, 100.0, 105.0, 104.0]),
+        ]
+    }
+    out = evaluate_tier(preds, gt, min_h=10.0, strict=False)
+    assert out["tp"] == 1
+    assert out["fp"] == 0
+    assert out["n_gt"] == 1
+    assert out["ap"] == pytest.approx(1.0)
+
+
+def test_evaluate_tier_zero_overlap_pred_stays_fp():
+    gt = {
+        "a.jpg": [{"box": (0.0, 0.0, 10.0, 60.0), "invalid": False}]
+    }
+    preds = {
+        "a.jpg": [
+            (0.9, [0.0, 0.0, 10.0, 60.0]),
+            (0.8, [500.0, 500.0, 510.0, 520.0]),
+        ]
+    }
+    out = evaluate_tier(preds, gt, min_h=10.0, strict=False)
+    assert out["tp"] == 1
+    assert out["fp"] == 1
+    assert out["n_gt"] == 1
+
+
+def test_evaluate_tier_strict_cut_and_invalid_excluded():
+    gt = {
+        "a.jpg": [
+            {"box": (0.0, 0.0, 10.0, 50.0), "invalid": False},
+            {"box": (100.0, 100.0, 110.0, 180.0), "invalid": True},
+        ]
+    }
+    preds = {"a.jpg": [(0.9, [0.0, 0.0, 10.0, 50.0])]}
+    strict = evaluate_tier(preds, gt, min_h=50.0, strict=True)
+    assert strict["n_gt"] == 0
+    assert strict["tp"] == 0
+    assert strict["fp"] == 0
+    loose = evaluate_tier(preds, gt, min_h=50.0, strict=False)
+    assert loose["n_gt"] == 1
+    assert loose["tp"] == 1
 
 
 def test_voc_ap_perfect_ranking_is_one():

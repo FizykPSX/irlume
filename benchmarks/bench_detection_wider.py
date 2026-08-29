@@ -8,8 +8,11 @@ dataset, OpenCV YuNet) end to end.
 
 --ap: full WIDER FACE val AP at the operating point (640 square letterbox,
 score_threshold 0.6) using the official-protocol evaluator in wider_ap.py.
-Easy/medium/hard follow the standard GT height bands (easy >= 50, medium
->= 20, hard = all); predictions are unchanged across bands.
+Difficulty tiers use official-approximation tier cuts (h>50/h>30/h>=10),
+off-tier predictions discarded: each prediction is first matched to its
+best-IoU GT among all valid boxes of its image, and predictions whose
+best-overlap GT is outside the tier are dropped (neither tp nor fp);
+invalid-flag GT boxes stay excluded everywhere.
 
 --sweep: stratified val sample (every k-th image of the sorted list, nearest
 stride-integer approximation of a 2000-image target) across input sizes
@@ -37,7 +40,7 @@ import numpy as np
 import onnxruntime as ort
 
 from letterbox import letterbox_image, restore_boxes
-from wider_ap import _match, evaluate as ap_evaluate, parse_val_gt, voc_ap
+from wider_ap import _match, evaluate_tier, parse_val_gt, voc_ap
 
 OP_INPUT = 640
 OP_SCORE = 0.6
@@ -47,7 +50,8 @@ SWEEP_TARGET = 2000
 CASCADE_TRAIN_TARGET = 4000
 IOU_THR = 0.5
 EASY_MIN_H = 50.0
-MEDIUM_MIN_H = 20.0
+MEDIUM_MIN_H = 30.0
+HARD_MIN_H = 10.0
 YUNET_MODEL = "face_detection_yunet_2023mar.onnx"
 BLAZE_MODEL = "blaze_face_short_range.onnx"
 
@@ -100,13 +104,6 @@ def detect_letterbox(det, img, target: int) -> list[tuple[float, list[float]]]:
     return [(s, b) for (s, _), b in zip(raw, boxes)]
 
 
-def filter_gt_by_height(gt_by_image: dict, min_h: float) -> dict:
-    out = {}
-    for key, boxes in gt_by_image.items():
-        out[key] = [b for b in boxes if (b["box"][3] - b["box"][1]) >= min_h]
-    return out
-
-
 def _read_progress(i: int, total: int, tag: str) -> None:
     if i % 200 == 0:
         print(f"[{tag}] {i}/{total} images", flush=True)
@@ -131,11 +128,11 @@ def run_ap(args) -> dict:
             continue
         preds_by_image[rel] = detect_letterbox(det, img, OP_INPUT)
         _read_progress(i, len(vals), "ap")
-    hard = ap_evaluate(preds_by_image, gt_all)
-    medium = ap_evaluate(
-        preds_by_image, filter_gt_by_height(gt_all, MEDIUM_MIN_H)
+    hard = evaluate_tier(preds_by_image, gt_all, HARD_MIN_H, strict=False)
+    medium = evaluate_tier(
+        preds_by_image, gt_all, MEDIUM_MIN_H, strict=True
     )
-    easy = ap_evaluate(preds_by_image, filter_gt_by_height(gt_all, EASY_MIN_H))
+    easy = evaluate_tier(preds_by_image, gt_all, EASY_MIN_H, strict=True)
     elapsed = time.time() - t0
     section = {
         "easy": easy["ap"],
@@ -146,12 +143,23 @@ def run_ap(args) -> dict:
         "n_gt": hard["n_gt"],
         "images": len(vals),
     }
-    notes = (
-        f"ap run: {len(vals)} val images in {elapsed:.1f}s at the operating "
-        f"point (letterbox {OP_INPUT}, score {OP_SCORE}); easy/medium/hard "
-        f"use GT height bands >= {EASY_MIN_H:g} / >= {MEDIUM_MIN_H:g} / all "
-        "with predictions unchanged; tp/fp/n_gt are the hard-band totals."
-    )
+    notes = [
+        (
+            f"ap run: {len(vals)} val images in {elapsed:.1f}s at the "
+            f"operating point (letterbox {OP_INPUT}, score {OP_SCORE}); "
+            "official-approximation tier cuts (h>50/h>30/h>=10), off-tier "
+            "predictions discarded (best-overlap valid GT outside the tier "
+            "drops the prediction; zero-overlap predictions stay fp "
+            "candidates); invalid-flag GT boxes excluded everywhere; "
+            "tp/fp/n_gt are the hard-tier totals."
+        ),
+        (
+            "height-band approximation run superseded by tier semantics: "
+            "the earlier h>=50/h>=20/all-valid bands scored easy "
+            "0.6859 / medium 0.6866 / hard 0.3964 (tp 15826, fp 2366, "
+            "n_gt 39123)."
+        ),
+    ]
     return section, notes
 
 
@@ -245,8 +253,9 @@ def _gen_anchors() -> np.ndarray:
 
 class BlazeRescue:
     """Single-face rescue mirroring the shipped Rust decode: bottom-right
-    square pad, 128x128 input, sigmoid scores over 896+64=960 anchors,
-    argmax anchor, box restored in original image coords and clipped."""
+    square pad, 128x128 input, sigmoid scores over 16x16x2 + 8x8x6 = 896
+    anchors, argmax anchor, box restored in original image coords and
+    clipped."""
 
     def __init__(self, model_path: Path):
         self.sess = ort.InferenceSession(
@@ -432,15 +441,15 @@ def main(argv: list[str] | None = None) -> int:
     result["runtime"] = runtime
     result["operating_point"] = {"input": OP_INPUT, "score_threshold": OP_SCORE}
     if args.ap:
-        section, note = run_ap(args)
+        section, new_notes = run_ap(args)
         result["ap"] = section
     elif args.sweep:
-        section, note = run_sweep(args)
+        section, new_notes = run_sweep(args)
         result["sweep"] = section
     else:
-        section, note = run_cascade(args)
+        section, new_notes = run_cascade(args)
         result["cascade"] = section
-    notes.append(note)
+    notes.extend(new_notes if isinstance(new_notes, list) else [new_notes])
     result["notes"] = notes
     args.out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(section))
