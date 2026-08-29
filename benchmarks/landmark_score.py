@@ -149,3 +149,37 @@ def iou(a, b) -> float:
     if union <= 0.0:
         return 0.0
     return inter / union
+
+
+def mesh_plausible(pts, win) -> bool:
+    """The runtime's mesh_output_plausible gate, ported: EVERY point must
+    be finite (a NaN coordinate would otherwise sort past the band check
+    and escape into the anchor errors), at least half the points must sit
+    inside the sampled window plus a 25% slop margin, and the central 80%
+    span must be at least 2px on both axes.
+
+    `win` is the sampled window (x, y, w, h) in original image
+    coordinates, as returned by the bench's crop_square.
+    """
+    x0, y0, w, h = (float(v) for v in win)
+    sx, sy = w * 0.25, h * 0.25
+    inside = 0
+    for p in pts:
+        x, y = float(p[0]), float(p[1])
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return False
+        if x0 - sx <= x <= x0 + w + sx and y0 - sy <= y <= y0 + h + sy:
+            inside += 1
+    if inside * 2 < len(pts):
+        return False
+
+    def central_span(vals):
+        v = sorted(vals)
+        lo = len(v) // 10
+        hi = len(v) - 1 - lo
+        return v[hi] - v[lo] if hi > lo else 0.0
+
+    return (
+        central_span([float(p[0]) for p in pts]) >= 2.0
+        and central_span([float(p[1]) for p in pts]) >= 2.0
+    )

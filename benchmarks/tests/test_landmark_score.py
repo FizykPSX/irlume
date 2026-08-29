@@ -6,6 +6,7 @@ from landmark_score import (
     ANCHOR_MESH_IDX,
     iou,
     mesh_eye_centers,
+    mesh_plausible,
     nme,
     point_bounds,
 )
@@ -130,3 +131,22 @@ class TestGeomHelpers:
     def test_iou_known_overlap(self):
         got = iou((0.0, 0.0, 10.0, 10.0), (0.0, 0.0, 10.0, 5.0))
         assert math.isclose(got, 0.5)
+
+
+def _spread_points(n=478):
+    return [
+        (float(i % 100) + 1.0, float((i * 7) % 200) + 1.0)
+        for i in range(n)
+    ]
+
+
+class TestMeshPlausible:
+    WIN = (0.0, 0.0, 256.0, 256.0)
+
+    def test_nan_at_non_anchor_index_refused(self):
+        pts = _spread_points()
+        assert mesh_plausible(pts, self.WIN) is True
+        idx = 17
+        assert idx not in ANCHOR_MESH_IDX
+        pts[idx] = (float("nan"), pts[idx][1])
+        assert mesh_plausible(pts, self.WIN) is False

@@ -14,9 +14,10 @@ standalone paths crop a square of CROP_SCALE x the box side, centered on the
 box, edge-replicated at the frame border (the shipped Rust mesh samples its
 crop square with edge clamping; the copyMakeBorder crop reproduces that
 without rescaling), resize to 256, and run the mesh ([1,256,256,3] RGB in
-[0,1]; output [1,1,1434] = 478 x,y,z in input space). Mapped-back points are
-gated by the same plausibility rule as the runtime (>=half the points within
-the crop plus 25% slop, central 80% span >= 2px on both axes) before scoring.
+[0,1]; output [1,1,1434] = 478 x,y,z in input space). Mapped-back points
+are gated by the same plausibility rule as the runtime (every point
+finite, >=half the points within the crop plus 25% slop, central 80% span
+>= 2px on both axes) before scoring.
 
 GT face box: the tight bounds of the GT landmarks. WFLW's shipped rect is a
 loose region (2.1-5.4x the landmark extent wide on the first test rows), too
@@ -52,6 +53,7 @@ import onnxruntime as ort
 from landmark_score import (
     iou,
     mesh_eye_centers,
+    mesh_plausible,
     nme,
     point_bounds,
 )
@@ -154,32 +156,6 @@ def map_mesh(pts2d, win) -> np.ndarray:
     window."""
     x0, y0, w, h = win
     return pts2d / MESH_INPUT * np.array([w, h]) + np.array([x0, y0])
-
-
-def mesh_plausible(pts: np.ndarray, win) -> bool:
-    """The runtime's mesh_output_plausible, ported: at least half the
-    points inside the sampled window plus a 25% slop margin, and a central
-    80% span of at least 2px on both axes."""
-    x0, y0, w, h = win
-    sx, sy = w * 0.25, h * 0.25
-    inside = int(
-        (
-            (pts[:, 0] >= x0 - sx)
-            & (pts[:, 0] <= x0 + w + sx)
-            & (pts[:, 1] >= y0 - sy)
-            & (pts[:, 1] <= y0 + h + sy)
-        ).sum()
-    )
-    if inside * 2 < len(pts):
-        return False
-
-    def central_span(v):
-        v = np.sort(v)
-        lo = len(v) // 10
-        hi = len(v) - 1 - lo
-        return v[hi] - v[lo] if hi > lo else 0.0
-
-    return central_span(pts[:, 0]) >= 2.0 and central_span(pts[:, 1]) >= 2.0
 
 
 def parse_pts(path: Path) -> np.ndarray:
