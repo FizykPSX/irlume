@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Landmark bench: the 478-point face mesh vs sparse GT landmarks.
 
-Datasets: WFLW test split (2,500 annotation rows over 2,118 images, 98-pt)
-and the 300W common test subset (600 png+pts pairs, 68-pt). AFLW2000 stays
-deferred: scoring its MATLAB mat files needs scipy, which the pinned bench
-venv does not carry and this script will not install.
+Datasets: WFLW test split (2,500 annotation rows over 2,118 images, 98-pt),
+the 300W common test subset (600 png+pts pairs, 68-pt), and AFLW2000
+(2,000 jpg+mat pairs, 68-pt read from the mat's pt3d_68 x/y, which the
+controller approved scipy 1.18.1 in the bench venv for; pinned in
+requirements-bench.txt).
 
 Protocol per row: YuNet at the operating point (640 square letterbox, score
 threshold 0.6) proposes faces; the best detection by IoU against the GT face
@@ -213,11 +214,32 @@ def load_300w(root: Path):
 
 
 def load_aflw2000(root: Path):
-    raise RuntimeError(
-        "aflw2000 deferred: reading its MATLAB mat files needs scipy, "
-        "which the pinned bench venv does not carry; installing it "
-        "requires controller approval"
-    )
+    """2,000 annotation mats at the dataset root (flat glob only: the
+    mirror's Code/ tree holds unrelated morphology mats under rglob).
+
+    68-pt GT comes from pt3d_68 (3x68, x/y rows in image pixel space; zero
+    NaNs across all 2,000 mats, 3 mats have landmarks at the image edge).
+    The mat's roi is a loose detection region (landmark centroid outside it
+    on 885 of the first-pass check), so it is ignored: the GT face box is
+    the tight landmark bounds, the shared convention across all three sets.
+    """
+    try:
+        from scipy.io import loadmat
+    except ImportError as e:
+        raise RuntimeError(
+            "aflw2000 needs scipy (pinned in requirements-bench.txt)"
+        ) from e
+    rows = []
+    for p in sorted(root.glob("*.mat")):
+        img = p.with_suffix(".jpg")
+        if not img.exists():
+            raise FileNotFoundError(f"mat without jpg: {p}")
+        m = loadmat(str(p))
+        if "pt3d_68" not in m:
+            raise KeyError(f"no pt3d_68 in {p}")
+        pts = np.array(m["pt3d_68"][:2].T, float)
+        rows.append((img, pts))
+    return rows, "pts68"
 
 
 LOADERS = {
@@ -395,15 +417,22 @@ def main(argv: list[str] | None = None) -> int:
             "68-pt scheme scores 6 anchors (its topology has no separate "
             "inner-corner points for mesh 133/362), wflw98 scores 8."
         ),
-        (
-            "aflw2000 deferred: its MATLAB mat files need scipy, which the "
-            "pinned bench venv lacks; installing requires controller "
-            "approval (dataset present on archhost: 2,000 jpg+mat pairs)."
-        ),
     ]
     for name, root in enabled:
         loader, _ = LOADERS[name]
         rows, scheme = loader(root)
+        if name == "aflw2000":
+            import scipy
+
+            notes.append(
+                "aflw2000 gt: 68-pt from mat pt3d_68 x/y in image pixel "
+                f"space (flat glob of 2,000 mats; the mirror's Code/ tree "
+                "holds unrelated mats, excluded); roi ignored as a loose "
+                "detection region, tight landmark bounds per the shared "
+                f"convention; parsed with scipy {scipy.__version__}; pts68 "
+                "eye/anchor constants reused, geometry re-verified over "
+                "the first 20 mats (two tight clusters above the mouth)."
+            )
         section, audit = score_dataset(
             name, rows, scheme, det, mesh, args.limit
         )
