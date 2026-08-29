@@ -29,6 +29,8 @@ def parse_val_gt(path: Path) -> dict[str, list[dict]]:
         boxes: list[dict] = []
         for _ in range(count):
             cols = [c.strip() for c in lines[i].split(",")]
+            if len(cols) == 1:
+                cols = lines[i].split()
             x1 = float(cols[0])
             y1 = float(cols[1])
             w = float(cols[2])

@@ -43,6 +43,29 @@ def test_parse_val_gt_structure(tmp_path):
     assert gt["0--Parade/0_Parade_marchingband_1_799.jpg"] == []
 
 
+def test_parse_val_gt_space_separated_lines(tmp_path):
+    p = tmp_path / "wider_face_val_bbx_gt.txt"
+    p.write_text(
+        "0--Parade/0_Parade_marchingband_1_849.jpg\n"
+        "1\n"
+        "449 330 122 149 0 0 0 0 0 0 \n"
+        "\n"
+        "0--Parade/0_Parade_Parade_0_452.jpg\n"
+        "2\n"
+        "361 99 60 71 0 0 0 1 0 0\n"
+        "123 456 50 60 0 0 0 0 0 0\n"
+        "\n",
+        encoding="utf-8",
+    )
+    gt = parse_val_gt(p)
+    first = gt["0--Parade/0_Parade_marchingband_1_849.jpg"]
+    assert first[0]["box"] == (449.0, 330.0, 571.0, 479.0)
+    assert first[0]["invalid"] is False
+    second = gt["0--Parade/0_Parade_Parade_0_452.jpg"]
+    assert second[0]["invalid"] is True
+    assert second[1]["box"] == (123.0, 456.0, 173.0, 516.0)
+
+
 def test_iou_identity_overlap_disjoint():
     box = (0.0, 0.0, 10.0, 10.0)
     assert iou(box, box) == 1.0
