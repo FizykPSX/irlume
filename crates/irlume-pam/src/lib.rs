@@ -362,10 +362,20 @@ impl PamServiceModule for IrlumePam {
                     if wait || unseal {
                         return PamError::IGNORE;
                     }
-                    match confirm_face_intent(&pamh, kind) {
-                        IntentConfirmation::Confirmed => Some(IntentAttestation::PamConversation),
-                        IntentConfirmation::Fallback => return PamError::IGNORE,
-                        IntentConfirmation::Abort => return PamError::ABORT,
+                    // The machine's owner can put privileged services on the
+                    // same footing as screen unlock, where the PAM wiring is
+                    // itself the consent. Off by default; the daemon checks the
+                    // same key before it honours the waiver.
+                    if !irlume_common::config::privileged_face_consent_required() {
+                        Some(IntentAttestation::PolicyWaived)
+                    } else {
+                        match confirm_face_intent(&pamh, kind) {
+                            IntentConfirmation::Confirmed => {
+                                Some(IntentAttestation::PamConversation)
+                            }
+                            IntentConfirmation::Fallback => return PamError::IGNORE,
+                            IntentConfirmation::Abort => return PamError::ABORT,
+                        }
                     }
                 }
                 _ => None,

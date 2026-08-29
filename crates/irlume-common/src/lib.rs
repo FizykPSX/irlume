@@ -428,6 +428,11 @@ pub fn write_atomic_reporting(
 pub enum IntentAttestation {
     /// A root PAM client reports collecting the conventional confirmation.
     PamConversation,
+    /// A root PAM client reports that this machine's policy waives the
+    /// confirmation (`privileged_face_consent=0`). Never trusted on its own:
+    /// the daemon re-reads the same policy before honouring it, so a client
+    /// cannot waive a confirmation the machine still requires.
+    PolicyWaived,
 }
 
 /// Request from an (untrusted) client to the (privileged) daemon.

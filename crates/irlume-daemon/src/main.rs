@@ -2888,11 +2888,18 @@ fn intent_confirmation_gate(req: &Request, peer: &Peer) -> Option<Response> {
         .as_deref()
         .and_then(irlume_common::pam_service::classify)
         .is_some_and(ServiceKind::requires_face_intent_confirmation);
+    // A waiver is honoured only when the daemon's own read of the policy agrees
+    // with the client's. The client is root, but "root said so" is not the
+    // guarantee here: the guarantee is that the machine's configuration waived
+    // the confirmation, and the daemon is the one that decides it did.
     let has_trusted_confirmation = peer.uid == 0
-        && matches!(
-            intent_confirmation,
-            Some(IntentAttestation::PamConversation)
-        );
+        && match intent_confirmation {
+            Some(IntentAttestation::PamConversation) => true,
+            Some(IntentAttestation::PolicyWaived) => {
+                !irlume_common::config::privileged_face_consent_required()
+            }
+            None => false,
+        };
     let valid = if requires_confirmation {
         has_trusted_confirmation
     } else {
@@ -8251,6 +8258,57 @@ mod tests {
     /// A uid outside any account database (same sentinel the identify-scope
     /// test uses): authorized_for() is false for every user.
     const NOBODY: u32 = 0xfffe_fffe;
+
+    /// A waiver is a claim about the machine's policy, not about the caller, so
+    /// the daemon has to agree with it independently. A root PAM client saying
+    /// "policy waived this" on a machine whose policy did not waive anything is
+    /// refused exactly like a missing confirmation, which is what stops the
+    /// waiver from becoming a way for a root client to skip the gate.
+    #[test]
+    fn policy_waiver_is_honoured_only_when_the_daemon_reads_the_same_policy() {
+        let _g = env_lock();
+        let sudo_with = |attestation| Request::Authenticate {
+            user: "root".into(),
+            service: Some("sudo".into()),
+            intent_confirmation: attestation,
+        };
+
+        std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", "1");
+        assert!(
+            intent_confirmation_gate(&sudo_with(Some(IntentAttestation::PolicyWaived)), &peer(0))
+                .is_some(),
+            "a waiver must be refused while the policy still requires confirmation"
+        );
+        assert!(
+            intent_confirmation_gate(
+                &sudo_with(Some(IntentAttestation::PamConversation)),
+                &peer(0)
+            )
+            .is_none(),
+            "a real confirmation still passes"
+        );
+
+        std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", "0");
+        assert!(
+            intent_confirmation_gate(&sudo_with(Some(IntentAttestation::PolicyWaived)), &peer(0))
+                .is_none(),
+            "a waiver passes once the policy waives the confirmation"
+        );
+        assert!(
+            intent_confirmation_gate(
+                &sudo_with(Some(IntentAttestation::PolicyWaived)),
+                &peer(NOBODY)
+            )
+            .is_some(),
+            "a waiver from a non-root peer is refused whatever the policy says"
+        );
+        assert!(
+            intent_confirmation_gate(&sudo_with(None), &peer(0)).is_some(),
+            "a waived policy is not an invitation to send no attestation at all"
+        );
+
+        std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT");
+    }
 
     fn peer(uid: u32) -> Peer {
         Peer {

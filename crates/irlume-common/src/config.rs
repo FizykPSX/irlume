@@ -953,10 +953,76 @@ pub fn forbid_external_cameras_visible() -> Option<bool> {
     }
 }
 
+/// Whether privileged services must collect the literal `yes` before a face
+/// attempt (`privileged_face_consent`), or `None` when settings.conf exists and
+/// this process may not read it.
+///
+/// The odd one out among these keys: it defaults **on**, so an absent file or an
+/// absent key means the confirmation is required, and the key exists to turn a
+/// protection off rather than on. That asymmetry is deliberate. No surface
+/// irlume wires runs hands-free by default, and this key does not make one: it
+/// puts privileged prompts on a standing-consent footing as the machine owner's
+/// own choice, distinct from every default surface, without moving that line
+/// for anyone who does not ask (ADR-0018).
+///
+/// Read by both sides. The PAM module skips the prompt, and the daemon consults
+/// it again before honouring [`crate::IntentAttestation::PolicyWaived`], so a client
+/// cannot waive a confirmation the machine's own policy still requires.
+pub fn privileged_face_consent_visible() -> Option<bool> {
+    if let Ok(v) = std::env::var("IRLUME_PRIVILEGED_FACE_CONSENT") {
+        return Some(truthy(&v));
+    }
+    match observe_kv("settings.conf", "privileged_face_consent") {
+        KvObservation::Value(v) => Some(truthy(&v)),
+        // Absent is unambiguous here too, but the default is ON.
+        KvObservation::Absent => Some(true),
+        KvObservation::Unknown(_) => None,
+    }
+}
+
+/// [`privileged_face_consent_visible`] resolved for a decision: unreadable
+/// settings keep the confirmation, because a policy this process cannot read is
+/// not a policy that waived anything.
+#[must_use]
+pub fn privileged_face_consent_required() -> bool {
+    privileged_face_consent_visible().unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testenv;
+
+    /// The privileged-consent key reads env-over-settings like its neighbours,
+    /// but Absent means ON: it exists to switch a protection off, so anything
+    /// that fails to say otherwise has to leave it standing.
+    #[test]
+    fn privileged_face_consent_defaults_on_and_env_wins_over_settings() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-consent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT");
+
+        // Absent key: required, and unambiguously so.
+        assert_eq!(privileged_face_consent_visible(), Some(true));
+        assert!(privileged_face_consent_required());
+
+        // Settings file turns it off.
+        write_kv("settings.conf", "privileged_face_consent", "0").unwrap();
+        assert_eq!(privileged_face_consent_visible(), Some(false));
+        assert!(!privileged_face_consent_required());
+
+        // The env override wins over the file, in both directions.
+        std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", "1");
+        assert_eq!(privileged_face_consent_visible(), Some(true));
+        std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", "no");
+        assert_eq!(privileged_face_consent_visible(), Some(false));
+
+        std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The external-camera prohibition reads env-over-settings with Absent
     /// meaning off, exactly like the biopolicy gate it mirrors.
