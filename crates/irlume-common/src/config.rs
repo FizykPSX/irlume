@@ -562,6 +562,41 @@ pub fn privileged_face_consent_required() -> bool {
     privileged_face_consent_visible().unwrap_or(true)
 }
 
+/// Whether privileged services (`sudo`/`su`/`doas` and polkit app prompts) may
+/// run the bounded sequential PAD collection the greeter and lock screen already
+/// use (`privileged_grouped_pad_evidence`).
+///
+/// Defaults **off**, and an unreadable settings.conf reads as off, so without the
+/// key privileged surfaces behave exactly as they do upstream.
+///
+/// It exists for a camera pair that cannot capture RGB and IR concurrently.
+/// There one authentication attempt scores exactly one RGB frame, so it casts
+/// one ViT vote, and the retry loop needs `VIT_PAD_VOTE_N` observed-cost
+/// attempts to fill the vote ring. That fits a budget large enough for them —
+/// the ordinary path does complete when it fits — but not the privileged
+/// default, and not the login window either on a pair whose attempt costs
+/// several seconds: the request settles as `RgbPadPending` with the ring part
+/// filled. The greeter and lock screen avoid the arithmetic entirely because the
+/// grouped collector gathers the whole vote window inside one transaction, at
+/// one attempt's cost; this key lets `sudo` and polkit use the same collector
+/// rather than pay for five.
+///
+/// Turning it on changes WHICH SERVICES may collect the evidence, never how much
+/// evidence a grant needs: the full vote window still has to close, and every
+/// liveness and PAD threshold is untouched.
+#[must_use]
+pub fn privileged_grouped_pad_evidence_enabled() -> bool {
+    // Opt-in, so only an explicit affirmative turns it on: a typo, an empty or a
+    // non-Unicode value leaves the upstream scope in place.
+    if let Some(v) = std::env::var_os("IRLUME_PRIVILEGED_GROUPED_PAD") {
+        return v.to_str().is_some_and(truthy);
+    }
+    matches!(
+        observe_kv("settings.conf", "privileged_grouped_pad_evidence"),
+        KvObservation::Value(v) if truthy(&v)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,6 +630,38 @@ mod tests {
         assert_eq!(privileged_face_consent_visible(), Some(false));
 
         std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The grouped-PAD scope key is the mirror image of the consent one: it
+    /// widens which services may collect evidence, so only an explicit
+    /// affirmative turns it on and everything else leaves upstream scope alone.
+    #[test]
+    fn privileged_grouped_pad_defaults_off_and_env_wins_over_settings() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-grouped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_PRIVILEGED_GROUPED_PAD");
+
+        // Absent key and absent file: upstream scope.
+        assert!(!privileged_grouped_pad_evidence_enabled());
+
+        // An unrecognized value is not an opt-in.
+        write_kv("settings.conf", "privileged_grouped_pad_evidence", "maybe").unwrap();
+        assert!(!privileged_grouped_pad_evidence_enabled());
+
+        write_kv("settings.conf", "privileged_grouped_pad_evidence", "1").unwrap();
+        assert!(privileged_grouped_pad_evidence_enabled());
+
+        // The env override wins over the file, in both directions.
+        std::env::set_var("IRLUME_PRIVILEGED_GROUPED_PAD", "0");
+        assert!(!privileged_grouped_pad_evidence_enabled());
+        std::env::set_var("IRLUME_PRIVILEGED_GROUPED_PAD", "on");
+        assert!(privileged_grouped_pad_evidence_enabled());
+
+        std::env::remove_var("IRLUME_PRIVILEGED_GROUPED_PAD");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

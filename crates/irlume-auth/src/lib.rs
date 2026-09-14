@@ -924,13 +924,13 @@ fn pair_admitted_sequentially(skew: std::time::Duration, paired: bool) -> bool {
 /// every login/lock service (and an unknown/absent service) gets the full
 /// login window.
 fn grace_window_ms(service: Option<&str>) -> u64 {
-    if let Some(v) = std::env::var("IRLUME_GRACE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v <= MAX_GRACE_OVERRIDE_MS)
-    {
+    if let Some(v) = grace_window_override_ms() {
         return v;
     }
+    default_grace_window_ms(service)
+}
+
+fn default_grace_window_ms(service: Option<&str>) -> u64 {
     // From the shared table, not a local list. The list this replaced was
     // missing `doas`, which is Elevation for the policy, so a doas prompt held
     // the camera for the 15s login window instead of the 5s one (#362).
@@ -938,6 +938,73 @@ fn grace_window_ms(service: Option<&str>) -> u64 {
         Some(kind) if kind.wants_short_grace() => SUDO_GRACE_WINDOW_MS,
         _ => GRACE_WINDOW_MS,
     }
+}
+
+/// The privileged budget a request actually needs, once its capture route is
+/// known: `Some(ms)` to replace a short privileged window, `None` to keep it.
+///
+/// The short window is sized for an attempt that casts the whole ViT vote window
+/// in one capture session (#362 measured what a needlessly long one costs: a
+/// refused attempt holds the camera and the worker before the password prompt).
+/// A pair that can only capture sequentially casts one vote per attempt, so the
+/// owner who opts into `privileged_grouped_pad_evidence` needs the grouped
+/// collector — and that collector is itself gated on
+/// `window >= GRACE_WINDOW_MS`, so nothing would change without this.
+///
+/// `candidate` contains the inexpensive policy/model checks. The metadata-only
+/// hint is lazy: excluded requests never read camera metadata or stored records.
+/// A true hint reserves time only, not capture or grant authority. Stale stream
+/// contracts or later runtime degradation can still prevent grouped capture.
+///
+/// Only the DEFAULT short window is replaced. An explicit `IRLUME_GRACE_MS`
+/// still decides the budget on its own, including a smaller one and the legacy
+/// one-shot zero, because an operator who names a number has named it for every
+/// service.
+///
+/// The caller anchors the resulting window before these reads. Capture and
+/// response admission retain that same window; routing does not reset its origin.
+fn privileged_budget_for_route(
+    window_ms: u64,
+    explicit_override: bool,
+    candidate: bool,
+    hint: impl FnOnce() -> bool,
+) -> Option<u64> {
+    (!explicit_override && window_ms == SUDO_GRACE_WINDOW_MS && candidate && hint())
+        .then_some(GRACE_WINDOW_MS)
+}
+
+/// The route decision itself, as a value: testable without a qualification
+/// store, a models directory or a process-wide config file.
+///
+/// IR-only is excluded because it returns on its own route before grouped
+/// collection is ever consulted, and credential release because its scope is
+/// the recognized local login and lock services either way.
+fn grouped_route_possible_from(
+    service: Option<&str>,
+    purpose: AuthenticationPurpose,
+    policy: irlume_common::config::FaceSensorPolicy,
+    models_ready: bool,
+    stored_sequential: bool,
+    opt_in: bool,
+) -> bool {
+    use irlume_common::pam_service::ServiceKind;
+    opt_in
+        && policy != irlume_common::config::FaceSensorPolicy::IrOnlyExperimental
+        && !matches!(purpose, AuthenticationPurpose::CredentialRelease)
+        && matches!(
+            service.and_then(irlume_common::pam_service::classify),
+            Some(ServiceKind::Elevation | ServiceKind::AppConsent)
+        )
+        && models_ready
+        && stored_sequential
+}
+
+/// The operator's explicit window, when set and within bounds.
+fn grace_window_override_ms() -> Option<u64> {
+    std::env::var("IRLUME_GRACE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v <= MAX_GRACE_OVERRIDE_MS)
 }
 
 /// What this authentication is FOR, which decides what has to happen on top of
@@ -5358,6 +5425,69 @@ impl Engine {
         self.authenticate_for_with_diagnostics(user, service, purpose, &())
     }
 
+    /// One request window anchored before non-probing budget selection.
+    /// Capture and response admission retain the same deadline, including time
+    /// spent reading configuration and the metadata-only hint. A hint reserves
+    /// time only; live stream qualification can still refuse grouped capture.
+    /// Use this rather than the service-only [`AuthenticationWindow::for_service`].
+    #[must_use]
+    pub fn authentication_window_for(
+        &self,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        policy: irlume_common::config::FaceSensorPolicy,
+    ) -> AuthenticationWindow {
+        self.authentication_window_from(std::time::Instant::now(), service, purpose, policy)
+    }
+
+    fn authentication_window_from(
+        &self,
+        started: std::time::Instant,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        policy: irlume_common::config::FaceSensorPolicy,
+    ) -> AuthenticationWindow {
+        self.authentication_window_from_with_hint(started, service, purpose, policy, || {
+            irlume_camera::capture_qualification::sequential_budget_hint(
+                &self.rgb_dev,
+                &self.ir_dev,
+            )
+        })
+    }
+
+    fn authentication_window_from_with_hint(
+        &self,
+        started: std::time::Instant,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        policy: irlume_common::config::FaceSensorPolicy,
+        hint: impl FnOnce() -> bool,
+    ) -> AuthenticationWindow {
+        // Snapshot the explicit override once and count all routing reads in
+        // the one window later retained by both capture and response admission.
+        let override_ms = grace_window_override_ms();
+        let base = override_ms.unwrap_or_else(|| default_grace_window_ms(service));
+        // Passing `true` for stored availability screens the cheap facts only.
+        // The actual hint is deferred until every exclusion has passed.
+        let candidate = override_ms.is_none()
+            && base == SUDO_GRACE_WINDOW_MS
+            && std::env::var("IRLUME_SEQUENTIAL_CAPTURE").is_err()
+            && grouped_route_possible_from(
+                service,
+                purpose,
+                policy,
+                self.ir_available && self.has_vit_pad() && self.has_pad_ir(),
+                true,
+                true,
+            )
+            && irlume_common::config::privileged_grouped_pad_evidence_enabled();
+        AuthenticationWindow::from_started(
+            started,
+            privileged_budget_for_route(base, override_ms.is_some(), candidate, hint)
+                .unwrap_or(base),
+        )
+    }
+
     /// [`Self::authenticate_for`] while publishing bounded, structurally
     /// share-safe capture decisions to the caller-owned operation scope.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
@@ -5368,11 +5498,23 @@ impl Engine {
         purpose: AuthenticationPurpose,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
-        self.authenticate_for_in_window(
+        let started = std::time::Instant::now();
+        self.last_attempt_situation = None;
+        self.check_request_cancelled()?;
+        let policy = irlume_common::config::observe_face_sensor_policy().resolve()?;
+        let window = self.authentication_window_from(started, service, purpose, policy);
+        if let Err(error) = self.check_authentication_completion(window) {
+            if matches!(error, irlume_common::Error::DeadlineExpired) {
+                self.last_attempt_situation = Some(AttemptSituation::TimedOut);
+            }
+            return Err(error);
+        }
+        self.authenticate_for_in_window_with_policy(
             user,
             service,
             purpose,
-            AuthenticationWindow::for_service(service),
+            window,
+            policy,
             diagnostics,
         )
     }
@@ -8836,6 +8978,129 @@ mod tests {
         );
     }
 
+    /// The route decision admits exactly the privileged services whose stored
+    /// verdict is sequential, with the models loaded and the owner's opt-in on.
+    /// Everything else keeps the short window, which is what the daemon also
+    /// admits the response against.
+    #[test]
+    fn grouped_route_possible_admits_only_privileged_sequential_requests() {
+        use irlume_common::config::FaceSensorPolicy;
+        let dual = FaceSensorPolicy::Dual;
+        let ready = |service, purpose, policy, models, stored, opt_in| {
+            grouped_route_possible_from(service, purpose, policy, models, stored, opt_in)
+        };
+        // The admitted shape, for each privileged service and its own purpose.
+        for (service, purpose) in [
+            (Some("sudo"), AuthenticationPurpose::Verify),
+            (Some("su"), AuthenticationPurpose::Verify),
+            (Some("doas"), AuthenticationPurpose::Verify),
+            (Some("polkit-1"), AuthenticationPurpose::AppConsent),
+        ] {
+            assert!(
+                ready(service, purpose, dual, true, true, true),
+                "{service:?} with a sequential verdict and models loaded"
+            );
+            // Every single requirement is load-bearing.
+            assert!(
+                !ready(service, purpose, dual, true, true, false),
+                "opt-in off"
+            );
+            assert!(
+                !ready(service, purpose, dual, true, false, true),
+                "a concurrent or unqualified stored verdict"
+            );
+            assert!(
+                !ready(service, purpose, dual, false, true, true),
+                "PAD models absent"
+            );
+            assert!(
+                !ready(
+                    service,
+                    purpose,
+                    FaceSensorPolicy::IrOnlyExperimental,
+                    true,
+                    true,
+                    true
+                ),
+                "IR-only takes its own route before this collector"
+            );
+            assert!(
+                !ready(
+                    service,
+                    AuthenticationPurpose::CredentialRelease,
+                    dual,
+                    true,
+                    true,
+                    true
+                ),
+                "credential release keeps its own scope"
+            );
+        }
+        // Login, lock, remote and unknown services are untouched by the key:
+        // they either hold the long window already or must not gain one.
+        for service in [
+            Some("login"),
+            Some("sddm"),
+            Some("omarchy-lock-face"),
+            Some("sshd"),
+            Some("service-invented-tomorrow"),
+            None,
+        ] {
+            assert!(
+                !ready(
+                    service,
+                    AuthenticationPurpose::Verify,
+                    dual,
+                    true,
+                    true,
+                    true
+                ),
+                "{service:?} is not a privileged surface"
+            );
+        }
+    }
+
+    /// The privileged budget replacement is keyed on the request's own capture
+    /// route, so the service table and every window that was not the default
+    /// short one are left exactly as they were.
+    #[test]
+    fn privileged_budget_replaces_only_the_default_short_window() {
+        let _g = env_guard();
+        std::env::remove_var("IRLUME_GRACE_MS");
+        // Ready for the collector: the default short window is replaced.
+        assert_eq!(
+            privileged_budget_for_route(SUDO_GRACE_WINDOW_MS, false, true, || true),
+            Some(GRACE_WINDOW_MS)
+        );
+        // Not ready (concurrent, unqualified, demoted, models absent,
+        // credential release, IR-only): nothing moves.
+        assert_eq!(
+            privileged_budget_for_route(SUDO_GRACE_WINDOW_MS, false, false, || panic!(
+                "excluded hint"
+            )),
+            None
+        );
+        // A login/lock request is already on the long window.
+        assert_eq!(
+            privileged_budget_for_route(GRACE_WINDOW_MS, false, true, || panic!(
+                "long window hint"
+            )),
+            None
+        );
+        // An explicit override decides on its own, in both directions, and the
+        // legacy one-shot zero is only reachable that way.
+        for value in ["8000", "0", "30000"] {
+            std::env::set_var("IRLUME_GRACE_MS", value);
+            let named = grace_window_ms(Some("sudo"));
+            assert_eq!(
+                privileged_budget_for_route(named, true, true, || panic!("override hint")),
+                None,
+                "IRLUME_GRACE_MS={value} must keep deciding the budget"
+            );
+        }
+        std::env::remove_var("IRLUME_GRACE_MS");
+    }
+
     /// Every service the policy calls Elevation must also take the SHORT
     /// window, which is the invariant the two hard-coded lists broke (#362).
     ///
@@ -11188,6 +11453,7 @@ mod pad_cue_tests {
 /// build (the 512-D recognizer session), so one instance is shared.
 #[cfg(test)]
 mod engine_tests {
+    mod budget_suggestion_tests;
     mod grouped_tests;
     mod managed_pad_tests;
     mod pair_identity_tests;

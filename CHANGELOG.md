@@ -45,6 +45,21 @@ All notable changes to irlume are documented here. This project adheres to
 - Human camera census and doctor output clarify that paired-camera support does
   not establish experimental IR-only readiness.
 
+- `privileged_grouped_pad_evidence=1` in `/etc/irlume/settings.conf` (or
+  `IRLUME_PRIVILEGED_GROUPED_PAD=1`) lets `sudo`, `su`, `doas` and polkit use the
+  bounded sequential PAD collection the greeter and lock screen already use, and
+  reserves that collection's login grace window only after cheap eligibility
+  checks and a matching stored sequential budget hint, without opening cameras.
+  Live capture qualification remains mandatory. Default off, so privileged
+  surfaces are unchanged without it. On a camera pair that cannot capture RGB and
+  IR concurrently one attempt casts a single ViT vote, so filling the five-vote
+  RGB PAD ring takes five observed-cost attempts: affordable for the ordinary
+  retry loop only on a budget that fits them, which the privileged default is
+  not, so those requests settled as `collecting RGB PAD evidence`. Grouped
+  collection gathers the whole vote window at one attempt's cost instead.
+  Credential release keeps its existing scope: a sealed secret still requires a
+  recognized local login or lock service.
+
 ## [0.12.0] - 2026-09-11
 
 ### Added
