@@ -7,6 +7,26 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Secondary-camera authentication wiring in the matching engine (ADR-0024
+  Phase 2): an attempt whose live camera pair does not match the primary
+  binding now resolves through the secondary coordinator - an active group
+  pins, and matching runs on exactly that group's scoped bridge (its
+  complete pair as the anti-swap binding, its scans and calibrations as the
+  only candidates), with the grant-decision boundary re-validating BOTH
+  stores before any grant arm can fire. Primary-pair attempts are
+  unchanged, a stale or absent secondary store keeps today's refusal UX,
+  and a mid-attempt primary rewrite or revocation-by-publication refuses
+  the grant. The IR-only experimental path remains primary-only.
+
+- Multi-camera storage completion (ADR-0024 Phase 2): secondary groups
+  carry their own per-recognizer IR calibrations (a group borrows no
+  primary calibration), the secondary store has a fixed location outside
+  the legacy enrollment namespace (`cameras/{user}.json`, never discovered
+  by legacy per-user loaders), and a camera group's validated view can
+  bridge into a scoped enrollment so the matching engine consumes exactly
+  one group's data. Storage and views only: no authentication behavior
+  changes yet.
+
 - Evidence-grade measurement records for camera tuning (ADR-0023): a
   bounded, strictly parsed data model that keeps wall-clock fill duration,
   delivered delta count and timestamp span, and the production
