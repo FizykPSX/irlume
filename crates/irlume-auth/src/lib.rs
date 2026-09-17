@@ -4254,6 +4254,41 @@ impl Engine {
             stage: irlume_common::diagnostics::TraceStage::RgbCapture,
             elapsed_us: u64::try_from(capture_started.elapsed().as_micros()).unwrap_or(u64::MAX),
         });
+        let DeferredAssessment {
+            mut assessment,
+            identity: (rgb_image, _),
+        } = self.assess_rgb_only_frame_deferred(rgb, diagnostics)?;
+        self.check_request_active()?;
+        let embedding = match rgb_image {
+            Some(image) => {
+                let view = align::RgbView {
+                    data: &image.data,
+                    width: image.width,
+                    height: image.height,
+                };
+                Some(
+                    self.emb
+                        .embed_tta(&align::align_to_arcface(&view, &image.face.landmarks)?)?,
+                )
+            }
+            None => None,
+        };
+        self.check_request_active()?;
+        assessment.embedding = embedding;
+        Ok(assessment)
+    }
+
+    /// Frame-level RGB-only assessment with the identity input DEFERRED: the
+    /// convenience tier's grouped collector assesses every sample's liveness
+    /// and PAD evidence before any identity inference, mirroring the pair
+    /// group's deferral contract. The eager single-attempt path materializes
+    /// immediately above. Liveness, PAD vote arithmetic and diagnostics are
+    /// byte-identical to the former inline body.
+    fn assess_rgb_only_frame_deferred(
+        &mut self,
+        rgb: irlume_camera::Frame,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<DeferredAssessment<PairIdentity>> {
         let rgb_view = align::RgbView {
             data: &rgb.data,
             width: rgb.width,
@@ -4364,20 +4399,13 @@ impl Engine {
             _ => (verdict, reason, deny_cause),
         };
         self.check_request_active()?;
-        let embedding = match &rgb_top {
-            Some(f) => Some(
-                self.emb
-                    .embed_tta(&align::align_to_arcface(&rgb_view, &f.landmarks)?)?,
-            ),
-            None => None,
-        };
-        self.check_request_active()?;
-        Ok(Assessment {
+        let rgb_frame_mean = irlume_camera::frame_mean(&rgb.data);
+        let assessment = Assessment {
             verdict,
             reason,
             deny_cause,
-            embedding,
-            rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
+            embedding: None,
+            rgb_frame_mean,
             ir_embedding: None,
             signals,
             ir_center_edge_ratio: 0.0,
@@ -4387,6 +4415,18 @@ impl Engine {
             rgb_pad,
             ir_pad: PadEvidence::NotApplicable,
             sequential_pair: false, // RGB-only path: no pair exists
+        };
+        Ok(DeferredAssessment {
+            assessment,
+            identity: (
+                rgb_top.map(|face| IdentityImage {
+                    data: rgb.data,
+                    width: rgb.width,
+                    height: rgb.height,
+                    face,
+                }),
+                None,
+            ),
         })
     }
 
@@ -5869,12 +5909,25 @@ impl Engine {
         // cannot overflow queues retained from an earlier capture.
         self.check_request_active()?;
         let camera_open_started = std::time::Instant::now();
-        let resolved_cams = match (
-            camera_operation.open_rgb(&rgb_dev),
-            camera_operation.open_ir(&ir_dev),
-        ) {
-            (Ok(rgb), Ok(ir)) => Some((rgb, ir)),
-            _ => None,
+        // On an RGB-only (convenience-tier) box the IR node may still OPEN
+        // (forced-off is an engine tier, not device absence), so keying the
+        // pair match on open success would consume the RGB handle into a pair
+        // nobody can use. When no IR is available, never open the IR node and
+        // keep the negotiated RGB handle for the grouped convenience
+        // collector; otherwise the pair semantics are unchanged.
+        let (resolved_cams, rgb_only_cam) = if self.ir_available {
+            match (
+                camera_operation.open_rgb(&rgb_dev),
+                camera_operation.open_ir(&ir_dev),
+            ) {
+                (Ok(rgb), Ok(ir)) => (Some((rgb, ir)), None),
+                _ => (None, None),
+            }
+        } else {
+            match camera_operation.open_rgb(&rgb_dev) {
+                Ok(rgb) => (None, Some(rgb)),
+                Err(_) => (None, None),
+            }
         };
         self.check_request_active()?;
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
@@ -5905,6 +5958,15 @@ impl Engine {
             purpose,
             service,
         );
+        let grouped_rgb_only = !grouped
+            && rgb_only_cam.is_some()
+            && grouped_auth::rgb_only_eligible(
+                self.ir_available,
+                self.has_vit_pad(),
+                window,
+                purpose,
+                service,
+            );
         let (grouped_cams, resolved_cams) = if grouped {
             (resolved_cams, None)
         } else {
@@ -5990,6 +6052,36 @@ impl Engine {
         }
         if held_cams.is_none() || !self.ir_available {
             drop(held_cams);
+            // Convenience tier: the grouped RGB-only collector completes the
+            // five-sample PAD vote inside one camera session, where the eager
+            // per-attempt loop pays full stream setup per sample and cannot
+            // finish inside the presence window on slow RGB sensors.
+            if let Some(rgb_cam) = rgb_only_cam.as_ref().filter(|_| grouped_rgb_only) {
+                let mut costliest_attempt = std::time::Duration::ZERO;
+                return self
+                    .authentication_attempt_loop_with(
+                        deadline,
+                        window,
+                        &mut costliest_attempt,
+                        |engine| {
+                            (
+                                Self::run_camera_operation(&camera_operation, || {
+                                    engine.authenticate_grouped_rgb_only_once(
+                                        &enr,
+                                        purpose,
+                                        service,
+                                        rgb_cam,
+                                        deadline,
+                                        diagnostics,
+                                    )
+                                }),
+                                false,
+                            )
+                        },
+                        std::time::Instant::now,
+                    )
+                    .0;
+            }
             let mut costliest_attempt = std::time::Duration::ZERO;
             return self
                 .authentication_attempt_loop(
