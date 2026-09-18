@@ -13,6 +13,7 @@
 mod actions;
 mod activity;
 mod freshness;
+mod launch;
 use freshness::{Freshness, Source, Worker};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -638,6 +639,15 @@ struct App {
     identify_checked_at: Option<Instant>,
     screen: usize,
     sel: usize,
+    /// Bound by the single-instance guard; `None` when the guard is off.
+    /// Polled each event-loop tick for handoff navigation from a later
+    /// `irlume tui` launch.
+    handoff_listener: Option<std::os::unix::net::UnixListener>,
+    /// A pending deep-link destination (`--page` or a handoff): (screen the
+    /// TUI started on, requested screen). Applied by `recompute_visible`
+    /// once the requested screen is actually visible; ANY user input
+    /// cancels it. Capability-gated screens therefore never yank the user.
+    launch_destination: Option<(usize, usize)>,
     profiles: Vec<ProfileSummary>,
     camera_groups: Vec<irlume_common::CameraGroupSummary>,
     camera_store_error: Option<String>,
@@ -1161,6 +1171,37 @@ impl LightState {
 
 pub fn run(args: &[String]) -> std::io::Result<()> {
     use std::io::IsTerminal;
+    // Argument errors come first so `irlume tui --page bogus` prints usage
+    // (and exits 2) even where the TUI could never draw. Drop the leading
+    // "tui" subcommand word the dispatcher passed along.
+    let tui_args: &[String] = if args.first().is_some_and(|a| a == "tui") {
+        args.get(1..).unwrap_or(&[])
+    } else {
+        args
+    };
+    let launch = launch::parse_launch(tui_args).map_err(|usage| {
+        eprintln!("{usage}");
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage")
+    })?;
+    // Single-instance guard BEFORE the TTY check: handing off to the
+    // running TUI needs no terminal of its own (a script or a launcher can
+    // navigate it), while a failed acquisition before the TTY error just
+    // releases the kernel-held lock with the process. The guard is keyed by
+    // the TARGET ACCOUNT the TUI manages, so `irlume tui --user bob` never
+    // hands bob's page to alice's running window.
+    let target_user = crate::user_arg(args);
+    let guard = match launch::acquire_guard(&target_user, launch.page, launch.new_instance) {
+        launch::GuardOutcome::Acquired(guard) => Some(guard),
+        launch::GuardOutcome::HandedOff(message) => {
+            println!("{message}");
+            return Ok(());
+        }
+        launch::GuardOutcome::ProceedWithoutLock(message) => {
+            eprintln!("irlume: {message}");
+            None
+        }
+        launch::GuardOutcome::Disabled => None,
+    };
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return Err(std::io::Error::other(
             "irlume tui needs an interactive terminal (TTY). Run it directly in a terminal.",
@@ -1172,6 +1213,21 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         ratatui::crossterm::event::EnableMouseCapture
     );
     let mut app = App::new(crate::user_arg(args));
+    if let Some(page) = launch.page {
+        // Applied by recompute_visible once the screen is visible (a
+        // capability- or advanced-gated page waits instead of being
+        // snapped away), and cancelled by any user input.
+        let start = app.screen;
+        app.launch_destination = Some((start, page));
+    }
+    if let Some(guard) = guard {
+        app.handoff_listener = Some(guard.listener().try_clone()?);
+        // The guard must outlive the terminal session: its flock IS the
+        // single-instance property, so it is intentionally never dropped
+        // (the kernel releases both the flock and the abstract socket when
+        // the process exits).
+        std::mem::forget(guard);
+    }
     app.log('·', format!("irlume: managing '{}' (live)", app.user));
     app.refresh();
     let res = app.main_loop(&mut terminal);
@@ -1769,6 +1825,8 @@ impl App {
             identify_checked_at: None,
             screen,
             sel: 0,
+            handoff_listener: None,
+            launch_destination: None,
             profiles: Vec::new(),
             camera_groups: Vec::new(),
             camera_store_error: None,
@@ -1944,6 +2002,14 @@ impl App {
         let rows = self.hub_rows().len();
         if rows > 0 && self.hub_sel >= rows {
             self.hub_sel = rows - 1;
+        }
+        // A launch deep link lands as soon as its screen is visible and the
+        // user has not navigated anywhere in the meantime.
+        if let Some((start, dest)) = self.launch_destination {
+            if self.screen == start && self.visible.contains(&dest) {
+                self.launch_destination = None;
+                self.enter_screen(dest);
+            }
         }
     }
 
@@ -3742,6 +3808,8 @@ impl App {
                 let size = terminal.size()?;
                 self.on_window_event(input, Rect::new(0, 0, size.width, size.height));
             }
+            // Serve any pending single-instance handoff (navigate-only).
+            self.drain_handoff();
             self.spin = (self.spin + 1) % SPIN.len();
             self.poll();
             self.refresh_due(self.now());
@@ -3817,6 +3885,9 @@ impl App {
     /// Terminal boundary: keep hidden controls inactive until this exact size
     /// has been drawn. Internal page handlers retain their ordinary behavior.
     fn on_window_event(&mut self, input: Event, area: Rect) {
+        // Any user input cancels a pending launch deep link: from here on,
+        // the user owns the navigation.
+        self.launch_destination = None;
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
         if !window_fits(area) || self.window_area.get() != Some(area) {
             self.click_targets.borrow_mut().clear();
@@ -4713,6 +4784,66 @@ impl App {
         }
         if self.screen == SC_REPAIR || self.screen == SC_KEYRING {
             self.refresh_keyring_diagnostic();
+        }
+    }
+
+    /// Serves pending handoff connections from the single-instance guard's
+    /// listener. One message per connection, navigate-only vocabulary,
+    /// same-uid peers only.
+    fn drain_handoff(&mut self) {
+        let Some(listener) = self.handoff_listener.take() else {
+            return;
+        };
+        // Lazy so every install site (run, tests) needs no ordering
+        // agreement; repeated calls are cheap no-ops.
+        let _ = listener.set_nonblocking(true);
+        loop {
+            let Ok((stream, _)) = listener.accept() else {
+                break; // EWOULDBLOCK: nothing pending
+            };
+            self.serve_handoff(stream);
+        }
+        self.handoff_listener = Some(listener);
+    }
+
+    /// One accepted handoff connection: check the peer's credentials, read
+    /// one bounded message, navigate if it parses. Never errors: a bad or
+    /// unreadable peer is dropped, the TUI keeps running.
+    fn serve_handoff(&mut self, mut stream: std::os::unix::net::UnixStream) {
+        use std::io::Read;
+        if !launch::stream_peer_is_self(&stream) {
+            return;
+        }
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(150)));
+        let mut buf = [0u8; 128];
+        let mut len = 0usize;
+        loop {
+            match stream.read(&mut buf[len..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    len += n;
+                    if len == buf.len() || buf[..len].contains(&b'\n') {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let Ok(message) = std::str::from_utf8(&buf[..len]) else {
+            return;
+        };
+        match launch::parse_handoff(message) {
+            Some(launch::Navigation::Goto(screen)) => {
+                self.enter_screen(screen);
+                self.log(
+                    '·',
+                    format!(
+                        "another irlume launch switched to {}",
+                        launch::page_name(screen).unwrap_or("?")
+                    ),
+                );
+            }
+            Some(launch::Navigation::Focus) | None => {}
         }
     }
 
@@ -9795,6 +9926,55 @@ mod tests {
     use ratatui::Terminal;
     use std::sync::atomic::AtomicUsize;
 
+    /// A `--page` deep link is a REQUEST, not a command: it lands when the
+    /// screen is actually visible, waits when capability-gated, and any
+    /// user input cancels it. Nothing yanks the user to a hidden screen.
+    #[test]
+    fn launch_destination_lands_only_when_visible_and_input_cancels_it() {
+        let _socket = dead_socket();
+        let mut app = test_app();
+        inert_workers(&mut app);
+        let start = app.screen;
+        // test_app reports no camera and no fingerprint reader, so the
+        // Faces screen (needs RGB) is invisible.
+        assert!(!app.visible.contains(&SC_PROFILES));
+        app.launch_destination = Some((start, SC_PROFILES));
+        app.recompute_visible();
+        assert_eq!(app.screen, start, "an invisible destination does not yank");
+
+        // Capability lands: the destination applies on the next recompute.
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.recompute_visible();
+        assert_eq!(
+            app.screen, SC_PROFILES,
+            "the destination lands when visible"
+        );
+
+        // User input cancels a still-pending destination.
+        let mut app = test_app();
+        inert_workers(&mut app);
+        let start = app.screen;
+        app.launch_destination = Some((start, SC_REPAIR));
+        use ratatui::crossterm::event::{KeyCode as TestKeyCode, KeyEvent, KeyModifiers};
+        app.on_window_event(
+            Event::Key(KeyEvent::new(TestKeyCode::Esc, KeyModifiers::NONE)),
+            Rect::new(0, 0, 80, 24),
+        );
+        app.recompute_visible();
+        assert_eq!(app.screen, start, "input owns the navigation from then on");
+
+        // A visible destination with no interference lands on recompute.
+        let mut app = test_app();
+        inert_workers(&mut app);
+        let start = app.screen;
+        app.launch_destination = Some((start, SC_REPAIR));
+        app.recompute_visible();
+        assert_eq!(app.screen, SC_REPAIR);
+    }
+
     /// The TUI must resolve its target account the way the rest of the CLI does.
     ///
     /// Reading $USER here pointed every request in this file at `root` under
@@ -9820,6 +10000,78 @@ mod tests {
             app.on_key(key);
             assert!(app.suspend.is_none() && app.op.is_none() && app.confirm.is_none());
         }
+    }
+
+    /// Make navigation side-effect-free in tests: `enter_screen` fires
+    /// refresh workers (light poll, probes, profiles, cameras, keyring
+    /// diagnostic) that send REAL daemon requests on background threads,
+    /// which can outlive this test's isolation window and land on a later
+    /// test's mock socket (observed as its server loop breaking early).
+    /// Pre-filling each worker receiver makes every refresh early-return.
+    fn inert_workers(app: &mut App) {
+        let (_t, r) = mpsc::channel();
+        app.light_load = Some(r);
+        let (_t, r) = mpsc::channel();
+        app.probes_load = Some(r);
+        let (_t, r) = mpsc::channel();
+        app.profiles_load = Some(r);
+        let (_t, r) = mpsc::channel();
+        app.camera_load = Some(r);
+        let (_t, r) = mpsc::channel();
+        app.keyring_load = Some(r);
+    }
+
+    /// The single-instance guard's listener: a later `irlume tui --page X`
+    /// hands its page over this channel and the running TUI navigates.
+    /// Anything outside the navigate-only vocabulary (including an unknown
+    /// page name) must leave the screen untouched. The same-uid credential
+    /// check on accept is the channel's access control; its cross-uid
+    /// rejection cannot run in-process and is unit-pinned in
+    /// `launch::peer_credentials_must_match_the_current_user`.
+    #[test]
+    fn handoff_listener_navigates_and_ignores_non_navigation_messages() {
+        use std::io::Write;
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+
+        // Navigation side effects are production behavior: landing on Faces
+        // polls the daemon. Take the same dead-socket + env isolation every
+        // other screen-navigating test uses, or this poll races whichever
+        // concurrent test owns IRLUME_SOCKET and corrupts its mock server
+        // (observed as the guided-enrollment test's sequence check failing).
+        let _socket = dead_socket();
+        let mut app = test_app();
+        inert_workers(&mut app);
+        let name = format!("irlume-tui-test-{}", std::process::id());
+        let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = UnixListener::bind_addr(&addr).unwrap();
+        app.handoff_listener = Some(listener);
+
+        let send = |payload: &str| {
+            let mut stream = UnixStream::connect_addr(&addr).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        };
+
+        send("goto:faces\n");
+        app.drain_handoff();
+        assert_eq!(app.screen, SC_PROFILES, "a handoff navigates");
+
+        send("goto:bogus\n");
+        send("enroll:faces\n");
+        app.drain_handoff();
+        assert_eq!(
+            app.screen, SC_PROFILES,
+            "non-navigation and unknown pages leave the screen alone"
+        );
+
+        send("goto:recovery\n");
+        app.drain_handoff();
+        assert_eq!(app.screen, SC_RECOVERY, "navigation works again after junk");
+
+        // No pending connection: draining is a no-op.
+        app.drain_handoff();
+        assert_eq!(app.screen, SC_RECOVERY);
     }
 
     #[test]
@@ -10894,6 +11146,8 @@ mod tests {
             user: "testuser".into(),
             screen: SC_WELCOME,
             sel: 0,
+            handoff_listener: None,
+            launch_destination: None,
             profiles: Vec::new(),
             camera_groups: Vec::new(),
             camera_store_error: None,
