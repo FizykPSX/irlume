@@ -1,7 +1,7 @@
 Source: irlume
 Section: admin
 Priority: optional
-Maintainer: archledger <archledger236@gmail.com>
+Maintainer: Wisbendji Fimerlus <archledger236@gmail.com>
 Build-Depends: debhelper-compat (= 13),
                cargo,
                rustc (>= 1.88),
@@ -23,7 +23,7 @@ Package: irlume
 Architecture: amd64
 Depends: ${shlibs:Depends}, ${misc:Depends}, libpam0g, libpam-modules, polkitd | policykit-1
 Recommends: fprintd
-Description: Windows Hello-style face login for Linux
+Description: Face authentication for Linux
  IR (Windows Hello) cameras get the secure tier: login, sudo, and TPM-sealed
  keyring unlock with algorithmic IR liveness. Regular RGB webcams get screen
  unlock; a fingerprint reader can join as a companion factor. Thin PAM module
