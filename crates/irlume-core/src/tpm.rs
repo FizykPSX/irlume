@@ -272,6 +272,97 @@ fn persistent_srk_handle() -> Result<PersistentTpmHandle> {
     PersistentTpmHandle::new(raw).map_err(tpm_err)
 }
 
+/// Outcome of an uninstall-time attempt to evict the persisted SRK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrkEviction {
+    /// Nothing occupies our persistent handle (already clean).
+    Absent,
+    /// Our SRK was there and has been evicted.
+    Evicted,
+    /// The handle is occupied by a key that is not ours (another stack
+    /// squatting irlume's handle); left untouched.
+    Foreign,
+}
+
+/// The RSA modulus (the public area's "unique" field) of `public`, or `None`
+/// for a non-RSA key.
+fn rsa_modulus(public: &Public) -> Option<&[u8]> {
+    match public {
+        Public::Rsa { unique, .. } => Some(unique.value()),
+        _ => None,
+    }
+}
+
+/// Evict irlume's persisted SRK from its owner-hierarchy persistent handle.
+///
+/// The uninstall path calls this only after every sealed envelope on the host
+/// is provably gone, because envelopes are children of this key: evicting
+/// while any remain would orphan secrets nothing could unseal again.
+///
+/// Identity is exact, not shape-level: the shape check used for parent
+/// selection (`is_irlume_srk`: attributes + empty policy + RSA-2048) also
+/// matches another stack's plain RSA-2048 primary, which is acceptable when
+/// choosing a parent to USE but not when destroying a key. `create_primary`
+/// over our SRK template is deterministic on a given
+/// TPM, so our persisted SRK's modulus equals a fresh derivation bit-for-bit;
+/// the eviction compares those moduli. The cost is one extra primary
+/// derivation (seconds; the same one-time cost first use pays), acceptable at
+/// uninstall time. A key at our handle with any other modulus is never
+/// touched, and a missing handle is a success (the clean state), not an error.
+///
+/// # Errors
+///
+/// `Error::Tpm` when the TPM cannot be opened, its capabilities or public
+/// areas cannot be read, the comparison primary cannot be derived, or the
+/// eviction command itself is refused; callers treat this as a non-fatal
+/// orphan (the key is harmless without irlume's data).
+pub fn evict_persistent_srk() -> Result<SrkEviction> {
+    let mut ctx = open_context()?;
+    let persistent = persistent_srk_handle()?;
+    let wanted = TpmHandle::Persistent(persistent);
+    if !tpm_handle_exists(&mut ctx, TPM2_HR_PERSISTENT, wanted)? {
+        return Ok(SrkEviction::Absent);
+    }
+    let object = ctx.tr_from_tpm_public(wanted).map_err(tpm_err)?;
+    let key_handle = KeyHandle::from(ESYS_TR::from(object));
+    // A read failure is a transport error, not evidence about identity (the
+    // #757 review caught every-error-is-foreign): propagate it, so the
+    // uninstall reports a failed check instead of a preserved foreign key.
+    let (persisted_public, _, _) = ctx.read_public(key_handle).map_err(tpm_err)?;
+    let transient = create_srk(&mut ctx)?;
+    let (transient_public, _, _) = match ctx.read_public(transient) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = ctx.flush_context(transient.into());
+            return Err(tpm_err(e));
+        }
+    };
+    let _ = ctx.flush_context(transient.into());
+    let ours = match (
+        rsa_modulus(&persisted_public),
+        rsa_modulus(&transient_public),
+    ) {
+        (Some(persisted), Some(derived)) => persisted == derived,
+        _ => false,
+    };
+    if !ours {
+        // A persistent object is never flushed (the load path's rule); the
+        // ESYS reference goes away with the context.
+        return Ok(SrkEviction::Foreign);
+    }
+    ctx.execute_with_nullauth_session(|ctx| {
+        ctx.evict_control(
+            Provision::Owner,
+            key_handle.into(),
+            Persistent::Persistent(persistent),
+        )
+    })
+    .map_err(tpm_err)?;
+    // No flush: evict_control already destroyed the object, so an ESYS flush
+    // of the stale handle would log the exact ERROR noise #601 removed.
+    Ok(SrkEviction::Evicted)
+}
+
 /// True iff `public` is irlume's own SRK: RSA, our [`srk_template`] attributes,
 /// SHA-256 name hash, an empty authPolicy, and a 2048-bit key. A non-match means
 /// another stack's key is squatting our persistent handle (clevis /
@@ -1933,6 +2024,108 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let env = seal_with_pcrs(secret, &[7]).expect("seal");
         let got = unseal(&env).expect("unseal");
         assert_eq!(&*got, secret, "round-trip must match");
+    }
+
+    /// The uninstall path's TPM cleanup (audit F4, 2026-09-17): after a seal
+    /// persisted the SRK, eviction must remove exactly our key, and a second
+    /// call must report the already-clean state. The Foreign arm is exercised
+    /// for real: an ordinary RSA key CREATED under a parent carries an
+    /// RNG-drawn modulus while sharing our exact public template - the
+    /// same-template different-modulus key the #757 review asked for - and it
+    /// must be left untouched.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0 (root), or swtpm via IRLUME_TCTI (CI does this)"]
+    fn evict_persistent_srk_removes_ours_then_reports_absent() {
+        // Persist the SRK the way production does: first seal derives and
+        // evict-controls it to the persistent handle.
+        let env = seal_with_pcrs(b"srk-eviction-probe", &[7]).expect("seal to persist the SRK");
+        drop(unseal(&env).expect("unseal probe"));
+        assert_eq!(
+            evict_persistent_srk().expect("evict after persisting"),
+            SrkEviction::Evicted,
+            "our persisted SRK must be evicted"
+        );
+        assert_eq!(
+            evict_persistent_srk().expect("second evict"),
+            SrkEviction::Absent,
+            "a clean handle must report Absent, not an error"
+        );
+    }
+
+    /// A foreign RSA-2048 key with our exact template at our handle must
+    /// survive an eviction attempt (the destructive-path identity contract).
+    /// Built with `create` + `load` under a transient SRK: an ordinary child
+    /// key's modulus comes from the TPM RNG, so it cannot match the
+    /// deterministic primary's - exactly the discriminator the #757 review
+    /// demanded a test for.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0 (root), or swtpm via IRLUME_TCTI (CI does this)"]
+    fn evict_persistent_srk_never_touches_a_same_template_foreign_key() {
+        // The CI lane serializes many irlume tests through one swtpm, and an
+        // earlier test (any seal) may already have persisted OUR SRK at the
+        // handle; the fixture below must own the handle, so clear our key
+        // first. Every occupant this lane can produce is irlume's own, so a
+        // Foreign here means the fixture cannot run, not a product defect.
+        match evict_persistent_srk().expect("pre-test handle probe") {
+            SrkEviction::Evicted | SrkEviction::Absent => {}
+            SrkEviction::Foreign => panic!("handle already holds a foreign key"),
+        }
+        let mut ctx = open_context().expect("context");
+        let parent = create_srk(&mut ctx).expect("transient SRK parent");
+        // Child creation and loading run under the parent's (empty) auth, the
+        // same nullauth-session pattern the seal path uses.
+        let foreign = ctx
+            .execute_with_nullauth_session(|ctx| {
+                let created = ctx.create(
+                    parent,
+                    srk_template().expect("template"),
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+                ctx.load(parent, created.out_private, created.out_public)
+            })
+            .expect("foreign fixture");
+        let persistent = persistent_srk_handle().expect("handle");
+        ctx.execute_with_nullauth_session(|ctx| {
+            ctx.evict_control(
+                Provision::Owner,
+                foreign.into(),
+                Persistent::Persistent(persistent),
+            )
+        })
+        .expect("place foreign key at irlume's handle");
+        let _ = ctx.flush_context(parent.into());
+        let _ = ctx.flush_context(foreign.into());
+        drop(ctx);
+
+        assert_eq!(
+            evict_persistent_srk().expect("evict probe"),
+            SrkEviction::Foreign,
+            "a same-template key with a foreign modulus must be reported, never evicted"
+        );
+
+        // The foreign key is still there; remove it so the instance is clean,
+        // then the handle reports Absent as the post-uninstall state.
+        let mut ctx = open_context().expect("context");
+        let wanted = TpmHandle::Persistent(persistent);
+        let object = ctx
+            .tr_from_tpm_public(wanted)
+            .expect("foreign key still present");
+        ctx.execute_with_nullauth_session(|ctx| {
+            ctx.evict_control(
+                Provision::Owner,
+                ObjectHandle::from(ESYS_TR::from(object)),
+                Persistent::Persistent(persistent),
+            )
+        })
+        .expect("manual foreign cleanup");
+        drop(ctx);
+        assert_eq!(
+            evict_persistent_srk().expect("post-cleanup probe"),
+            SrkEviction::Absent
+        );
     }
 
     #[test]
