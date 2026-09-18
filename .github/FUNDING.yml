@@ -1,3 +1,6 @@
-# Renders the repo's Sponsor button. Ko-fi is the one channel that exists;
-# adding a platform here is a maintainer decision, not a housekeeping edit.
+# Renders the repo's Sponsor button. Ko-fi plus the custom PayPal link are the
+# channels that exist; adding a platform here is a maintainer decision, not a
+# housekeeping edit. GitHub has no `paypal` key - the PayPal.Me URL must ride
+# the `custom` field (quoted, since it contains ':').
 ko_fi: archledger
+custom: ["https://www.paypal.me/WisbendjiFimerlus"]
