@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# KCM build lane: compiles the Plasma System Settings module and runs its
+# headless load test in the two KF6 lanes that ship it (Fedora rpm via
+# Copr, Arch). The universal deb and NixOS carry no KCM yet (see
+# docs/superpowers/specs/2026-09-18-kcm-plasma-settings-design.md).
+#
+# No `uses:` beyond one SHA-pinned checkout: everything runs inside the
+# distro containers, so there is nothing else to pin.
+name: kcm
+
+on:
+  pull_request:
+    paths:
+      - "kcm/**"
+      - ".github/workflows/kcm.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "kcm/**"
+      - ".github/workflows/kcm.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "kcm build + loadtest (${{ matrix.container }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        container:
+          - fedora:44
+          - archlinux:base-devel
+    steps:
+      - name: Install git (checkout runs inside the container)
+        run: |
+          if command -v dnf >/dev/null; then
+            dnf install -y -q git
+          else
+            pacman -Sy --noconfirm git
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install KF6/Qt6 build dependencies
+        run: |
+          if command -v dnf >/dev/null; then
+            dnf install -y -q cmake extra-cmake-modules gcc-c++ \
+              qt6-qtbase-devel qt6-qtdeclarative-devel \
+              kf6-kcmutils-devel kf6-kcoreaddons-devel kf6-kio-devel kf6-kirigami
+          else
+            pacman -Sy --noconfirm cmake extra-cmake-modules gcc \
+              qt6-base qt6-declarative kcmutils kcoreaddons kio kirigami
+          fi
+
+      - name: Build the module and its load test
+        run: |
+          cmake -S kcm -B kcm-build -DBUILD_TESTING=ON
+          cmake --build kcm-build -j"$(nproc)"
+
+      - name: Headless load test (plugin metadata, factory, bridge)
+        run: |
+          # The bridge prefers /usr/bin/irlume; this container has no real
+          # CLI, so a contract-shaped stub exercises the exec/parse paths.
+          # (The real CLI + daemon path runs on the maintainer's KDE
+          # hardware and in the packaging lanes.)
+          cat > /usr/bin/irlume <<'STUB'
+          #!/bin/sh
+          case "$1 ${2:-}" in
+            "version "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"version","ok":true,"data":{"capabilities":["version-json","status-json","doctor-json","camera-census","login-status-json"],"contract_versions":{"min":1,"max":1},"limits":{"max_profiles":3}}}' ;;
+            "status "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"status","ok":true,"data":{"daemon":"running"}}' ;;
+            "doctor "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"doctor","ok":true,"data":{"checks":[{"id":"platform","state":"info","detail":"stub"}]}}' ;;
+            "camera census") printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"camera.census","ok":true,"data":{"entries":[]}}' ;;
+            "login "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"login.status","ok":true,"data":{"surfaces":[]}}' ;;
+            *) exit 2 ;;
+          esac
+          STUB
+          chmod +x /usr/bin/irlume
+          ./kcm-build/bin/kcm_loadtest "$(pwd)/kcm-build/bin/plasma/kcms/systemsettings/kcm_irlume.so"
+
+      - name: QML syntax check
+        run: |
+          if [ -x /usr/lib64/qt6/bin/qmllint ]; then
+            QMLLINT=/usr/lib64/qt6/bin/qmllint
+          elif [ -x /usr/lib/qt6/bin/qmllint ]; then
+            QMLLINT=/usr/lib/qt6/bin/qmllint
+          else
+            echo "qmllint not available; skipped"
+            exit 0
+          fi
+          status=0
+          for f in kcm/src/ui/*.qml; do
+            # GitHub Actions runs steps with pipefail: piping qmllint into
+            # grep would mask a nonzero linter exit behind || handling, so
+            # capture first, judge the exit code, then scan the output.
+            if ! out="$("$QMLLINT" "$f" 2>&1)"; then
+              status=1
+            fi
+            if printf '%s\n' "$out" | grep -qE "Error|Warning: .*:(missing-property|syntax)"; then
+              status=1
+              printf '%s\n' "$out"
+            fi
+          done
+          exit $status
