@@ -912,15 +912,63 @@ fn load_external_pubkey(ctx: &mut Context, pubkey_pem: &str) -> Result<KeyHandle
         .map_err(tpm_err)
 }
 
+/// Parse a SubjectPublicKeyInfo PEM into the RSA modulus and exponent.
+///
+/// Pure and unit-tested against a real key fixture. This deliberately parses
+/// only the public SPKI/PKCS#1 structure: the systemd PCR-signing key is
+/// public data, no RSA operation of any kind runs here, and the TPM performs
+/// every verification. Using the der/spki parsers (the same RustCrypto stack,
+/// without the rsa crate) keeps the dependency tree free of the Marvin
+/// timing-side-channel advisory, whose risk lived entirely in private-key
+/// operations this project never performs.
+fn rsa_spki_parts(pubkey_pem: &str) -> Result<(Vec<u8>, u32)> {
+    use der::asn1::ObjectIdentifier;
+    use der::asn1::UintRef;
+    use der::{Decode, DecodePem, Sequence};
+    use spki::SubjectPublicKeyInfoOwned;
+
+    /// PKCS#1 RSAPublicKey: SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+    #[derive(Sequence)]
+    struct RsaPublicKey<'a> {
+        n: UintRef<'a>,
+        e: UintRef<'a>,
+    }
+
+    let spki = SubjectPublicKeyInfoOwned::from_pem(pubkey_pem)
+        .map_err(|e| Error::Policy(format!("parse PCR public key: {e}")))?;
+    // The previous decoder (the rsa crate) rejected non-RSA AlgorithmIdentifiers;
+    // keep that strictness: a non-RSA SPKI whose BIT STRING happened to hold a
+    // PKCS#1 sequence must never load as an RSA TPM key. RFC 3279 requires
+    // rsaEncryption parameters to be NULL (absent-or-NULL is what the
+    // RustCrypto decoders accept).
+    const RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+    if spki.algorithm.oid != RSA_ENCRYPTION {
+        return Err(Error::Policy(
+            "PCR public key is not an RSA key (unexpected algorithm OID)".into(),
+        ));
+    }
+    if let Some(params) = &spki.algorithm.parameters {
+        if !params.is_null() {
+            return Err(Error::Policy(
+                "PCR public key has non-NULL rsaEncryption parameters".into(),
+            ));
+        }
+    }
+    let key = RsaPublicKey::from_der(spki.subject_public_key.raw_bytes())
+        .map_err(|e| Error::Policy(format!("parse PCR public key: {e}")))?;
+    let e = key.e.as_bytes();
+    if e.is_empty() || e.len() > 4 {
+        return Err(Error::Policy("PCR key exponent too large".into()));
+    }
+    let mut buf = [0u8; 4];
+    buf[4 - e.len()..].copy_from_slice(e);
+    Ok((key.n.as_bytes().to_vec(), u32::from_be_bytes(buf)))
+}
+
 /// Build a tss-esapi `Public` for an external RSA verification key from a
 /// SubjectPublicKeyInfo PEM.
 fn rsa_pem_to_public(pubkey_pem: &str) -> Result<Public> {
-    use rsa::pkcs8::DecodePublicKey;
-    use rsa::traits::PublicKeyParts;
-
-    let key = rsa::RsaPublicKey::from_public_key_pem(pubkey_pem)
-        .map_err(|e| Error::Policy(format!("parse PCR public key: {e}")))?;
-    let modulus = key.n().to_bytes_be();
+    let (modulus, exponent_raw) = rsa_spki_parts(pubkey_pem)?;
     let key_bits = match modulus.len() * 8 {
         2048 => RsaKeyBits::Rsa2048,
         3072 => RsaKeyBits::Rsa3072,
@@ -931,15 +979,7 @@ fn rsa_pem_to_public(pubkey_pem: &str) -> Result<Public> {
             )))
         }
     };
-    let exponent = {
-        let e = key.e().to_bytes_be();
-        if e.len() > 4 {
-            return Err(Error::Policy("PCR key exponent too large".into()));
-        }
-        let mut buf = [0u8; 4];
-        buf[4 - e.len()..].copy_from_slice(&e);
-        RsaExponent::create(u32::from_be_bytes(buf)).map_err(tpm_err)?
-    };
+    let exponent = RsaExponent::create(exponent_raw).map_err(tpm_err)?;
 
     let attrs = ObjectAttributesBuilder::new()
         .with_user_with_auth(true)
@@ -1541,6 +1581,56 @@ pub(crate) mod tests {
         );
     }
     use super::*;
+
+    /// A real 2048-bit RSA SubjectPublicKeyInfo PEM (openssl-generated
+    /// fixture). The parser must extract the exact modulus and exponent the
+    /// old rsa-crate path produced; the TPM object builder is downstream.
+    const RSA_PUB_FIXTURE: &str = "-----BEGIN PUBLIC KEY-----\n\
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0Dy2Frte+nNi0s3s87c9\n\
+Q2Yv0uUlU4IlQ1/SAQj6I4lavYxqJ+SQmuaMfFkbnr3Vf4AHdvAV6XNKkXSCGAZ7\n\
+45srB7lPO8TDVvH6adrsp7+HNQej78c6ziCb2dMjWrT05NOAsao9Daa+ImDZypwG\n\
+plgUyLAK6Wzhjp36v32/oVodM4otWAnuDETOrbOnrY/xMu2wtpAyZ+tpoNUFZjr0\n\
+WoTuNvyFOHwal/HAnsZ3agxc0OsF45deIAmduBgkmIWw+Ygz40oT1B6na1fht+JK\n\
+D14jcv73sDp39RHVWoW+y2rcpDZL9RQUJ3gFraMptBVpK8zlVEkQWkqH35cjKZJ1\n\
+awIDAQAB\n\
+-----END PUBLIC KEY-----\n";
+
+    #[test]
+    fn rsa_spki_parts_extracts_modulus_and_exponent() {
+        let (modulus, exponent) = rsa_spki_parts(RSA_PUB_FIXTURE).expect("fixture parses");
+        assert_eq!(modulus.len(), 256, "2048-bit key has a 256-byte modulus");
+        assert_eq!(exponent, 65537, "the conventional RSA exponent");
+        // Pin the EXACT modulus: sha256 of its big-endian bytes (openssl
+        // "Modulus=" hex for this fixture). Length and top bit alone would
+        // let a regression in the central extraction logic pass unnoticed.
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(&modulus);
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, "bada6228f1aa0d2473962e0b416fb151261b2427bba568c6c48aa6be822e9c9c",
+            "modulus bytes changed"
+        );
+    }
+
+    #[test]
+    fn rsa_spki_parts_refuses_malformed_and_unsupported_keys() {
+        assert!(rsa_spki_parts("not a pem").is_err());
+        assert!(
+            rsa_spki_parts("-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n").is_err()
+        );
+        // A structurally valid EC P-256 SPKI must be refused by the algorithm
+        // check even though the container decodes. (openssl-generated fixture.)
+        const EC_PUB_FIXTURE: &str = "-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE7egDfPRHj1TgRtw9ppW19+K1I/7j
+UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
+-----END PUBLIC KEY-----
+";
+        let err = rsa_spki_parts(EC_PUB_FIXTURE).unwrap_err();
+        assert!(
+            err.to_string().contains("not an RSA key"),
+            "EC key must be refused by the algorithm check: {err}"
+        );
+    }
 
     #[test]
     fn srk_identity_match_accepts_ours_rejects_foreign() {
