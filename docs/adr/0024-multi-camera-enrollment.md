@@ -9,10 +9,10 @@ review. The Windows observation below is maintainer-reported.
 
 Implementation status: Phase 1 (secondary store foundation) merged in #732 and
 Phase 2 (secondary authentication wiring, `enroll --add-camera`,
-`profiles remove-camera`) shipped in v0.13.0. **Known deviation from s1.2:** the
-secondary store is currently persisted as root-only plaintext JSON (see the
-note in section 1.2); either the confidentiality clause is implemented or the
-deviation is formally accepted, but the shipped state is as described there.
+`profiles remove-camera`) shipped in v0.13.0. The s1.2 confidentiality clause
+was initially shipped unimplemented (v0.13.0 wrote plaintext secondary stores)
+and is now implemented: secondary stores persist as an encrypted envelope
+under the account template key (see the note in section 1.2).
 Numbered after ADR-0023; independent of ADR-0022's acceptance.
 
 ## Context
@@ -90,17 +90,18 @@ credential. An encrypted enrollment cannot become plaintext because a key
 is unavailable. Owner, store type, format version, snapshot binding, and
 authorization-bearing records are validated as part of the protected state.
 
-> **Deviation note (2026-09-18, still open):** the shipped implementation
-> satisfies the integrity, ownership, parsing, and failure clauses above, but
-> NOT the confidentiality clause: `save_secondary` persists plain
-> `serde_json` bytes under `cameras/<user>.json` (mode is umask-dependent:
-> 0640 under the shipped unit's `UMask=0027`, typically 0644 under a plain
-> root shell; the 0700 state dir still blocks ordinary users) with no
-> sealing layer, and the commit journal carries the
-> same bytes. Primary-store embeddings remain AES-256-GCM under the
-> TPM-sealed key. Closing this gap (encrypting the secondary store under the
-> account template key) or formally accepting the deviation is a pending
-> maintainer decision; the ADR text above remains the requirement.
+> **Implementation note (2026-09-19):** the s1.2 confidentiality clause is
+> now implemented. Secondary stores persist as an encrypted envelope
+> (`format_version` 2: `key_id` + AES-256-GCM `enc` over the version-1 store
+> JSON) under the account template key - the same lifecycle as the primary
+> store, with no separate credential. Files are created owner-only (0600),
+> the commit journal carries the encrypted bytes (never plaintext), and a
+> key that is unavailable fails closed (`EncryptedNoKey`-class refusals); a
+> store never becomes plaintext because a key is missing. Stores written by
+> 0.13.0 (plaintext JSON inside the 0700 state dir) are migrated
+> upgrade-on-write: they remain readable until their next authorized
+> publication, which rewrites them encrypted. On no-TPM hosts the secondary
+> store remains root-only plaintext, exactly like the primary there.
 
 Unsupported versions or invalid supported-version records reject the
 secondary store as a whole. Unknown fields, duplicate identifiers,
