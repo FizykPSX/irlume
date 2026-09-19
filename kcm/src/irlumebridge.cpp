@@ -8,6 +8,11 @@
 #include <QJsonParseError>
 #include <QStandardPaths>
 
+#include <fcntl.h>
+#include <pwd.h>
+#include <sys/file.h>
+#include <unistd.h>
+
 namespace
 {
 // The fixed machine-API command table. Arguments are literals from this
@@ -106,6 +111,73 @@ void IrlumeBridge::request(const QString &name)
     timeout->start(it->timeoutMs);
     m_inflight.emplace(name, std::move(in));
     m_inflight[name].process->start(QIODevice::ReadOnly);
+}
+
+bool IrlumeBridge::tuiProbablyRunning()
+{
+    // Same path contract as the TUI guard: $XDG_RUNTIME_DIR/irlume/<lock>,
+    // keyed by the invoking user's login name (the KCM never passes
+    // --user, so the target account is the desktop session's own).
+    const QByteArray runtimeDir = qgetenv("XDG_RUNTIME_DIR");
+    if (runtimeDir.isEmpty()) {
+        return false;
+    }
+    // SAFETY: geteuid cannot fail and touches no memory.
+    const uid_t uid = geteuid();
+    const struct passwd *pw = getpwuid(uid);
+    if (pw == nullptr || pw->pw_name == nullptr) {
+        return false;
+    }
+    QString user = QString::fromLatin1(pw->pw_name);
+    for (QChar &ch : user) {
+        // Must match the Rust guard's target_key exactly: ASCII
+        // alphanumerics only (Unicode letters are underscores there).
+        if (!((ch.unicode() < 128) && ch.isLetterOrNumber())
+            && ch != u'-' && ch != u'_' && ch != u'.') {
+            ch = u'_';
+        }
+    }
+    const QString lockPath = QString::fromLatin1(runtimeDir)
+        + QStringLiteral("/irlume/tui-%1.lock").arg(user);
+    // Open an existing lock only: creating one here would fabricate state.
+    const int fd = open(QFile::encodeName(lockPath).constData(), O_RDWR);
+    if (fd < 0) {
+        return false;
+    }
+    // SAFETY: fd is valid and owned by this scope; flock touches only it.
+    const int rc = flock(fd, LOCK_EX | LOCK_NB);
+    close(fd); // releasing here also undoes a lock this probe took
+    return rc != 0; // EWOULDBLOCK: someone holds it -> a TUI is live
+}
+
+IrlumeBridge::HandoffResult IrlumeBridge::handoffTuiAndWait(const QString &page, int timeoutMs)
+{
+    if (m_irlumePath.isEmpty()) {
+        return HandoffResult::Unknown;
+    }
+    QStringList args{QStringLiteral("tui")};
+    if (!page.isEmpty()) {
+        args << QStringLiteral("--page") << page;
+    }
+    QProcess child;
+    child.setProgram(m_irlumePath);
+    child.setArguments(args);
+    child.setProcessChannelMode(QProcess::SeparateChannels);
+    child.start(QIODevice::ReadOnly);
+    if (!child.waitForStarted(2000)) {
+        return HandoffResult::Unknown;
+    }
+    if (!child.waitForFinished(timeoutMs)) {
+        child.kill();
+        child.waitForFinished(1000);
+        return HandoffResult::Unknown;
+    }
+    if (child.exitStatus() != QProcess::NormalExit) {
+        return HandoffResult::Unknown;
+    }
+    // Exit 0 is the TUI's documented "handed off to the running instance"
+    // outcome; any other code means no live TUI accepted the handoff.
+    return child.exitCode() == 0 ? HandoffResult::Done : HandoffResult::NotAccepted;
 }
 
 bool IrlumeBridge::launchTuiDetached(const QString &page)

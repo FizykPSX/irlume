@@ -48,9 +48,34 @@ public:
 
     /// Launch `irlume tui` (optionally deep-linked to a page) via
     /// xdg-terminal-exec. Returns false when that launcher is unavailable
-    /// (the caller then falls back to the desktop entry, without a deep
-    /// link).
+    /// (the caller then falls back to the shipped desktop entry, without a
+    /// deep link).
     bool launchTuiDetached(const QString &page);
+
+    /// Whether a TUI for this user's target account appears to be running:
+    /// the single-instance guard's lock file exists and its kernel lock is
+    /// held by someone. A UX probe only (the guard stays authoritative in
+    /// the TUI; a stale guess worst case opens a terminal that hands off).
+    bool tuiProbablyRunning();
+
+    /// Outcome of a terminal-less handoff attempt.
+    enum class HandoffResult {
+        /// The child exited 0: the running TUI navigated to the page.
+        Done,
+        /// The child ran but did not report success: no live TUI accepted
+        /// the handoff (it took the guard and hit the TTY check). The
+        /// caller should fall back to opening a terminal.
+        NotAccepted,
+        /// The child crashed or did not finish within the budget.
+        Unknown,
+    };
+
+    /// Run `irlume tui --page <page>` WITHOUT a terminal and WAIT for the
+    /// verdict. When a TUI is already running the child performs the
+    /// handoff and exits 0; when none is running it exits nonzero after
+    /// taking the guard and hitting the TTY check. Deliberately
+    /// synchronous: the caller must know whether a window is warranted.
+    HandoffResult handoffTuiAndWait(const QString &page, int timeoutMs);
 
 Q_SIGNALS:
     /// `doc` is the parsed machine-API envelope, including ok/data/error.

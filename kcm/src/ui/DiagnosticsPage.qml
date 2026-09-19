@@ -10,7 +10,7 @@ import QtQuick.Controls as Controls
 import org.kde.kirigami as Kirigami
 import org.kde.kcmutils as KCMUtils
 
-KCMUtils.ScrollViewKCM {
+KCMUtils.SimpleKCM {
     id: root
 
     property var doc: ({})
@@ -25,7 +25,7 @@ KCMUtils.ScrollViewKCM {
             {title: "Failing", states: ["fail"], color: Kirigami.Theme.negativeTextColor},
             {title: "Warnings", states: ["warn"], color: Kirigami.Theme.neutralTextColor},
             {title: "Passing", states: ["pass"], color: Kirigami.Theme.positiveTextColor},
-            {title: "Informational", states: ["info"], color: Kirigami.Theme.secondaryTextColor},
+            {title: "Informational", states: ["info"], color: Kirigami.Theme.disabledTextColor},
             // "unknown" is a contract state of its own: the check could not be
             // performed, and presenting that as an informational fact lies.
             {title: "Not determined", states: ["unknown"], color: Kirigami.Theme.disabledTextColor},
@@ -67,6 +67,10 @@ KCMUtils.ScrollViewKCM {
     }
 
     ColumnLayout {
+        // Same centered column as the Overview page.
+        width: Math.min(parent.width - 2 * Kirigami.Units.largeSpacing,
+                        Kirigami.Units.gridUnit * 46)
+        x: Math.round((parent.width - width) / 2)
         spacing: Kirigami.Units.largeSpacing
 
         Kirigami.InlineMessage {
@@ -112,14 +116,13 @@ KCMUtils.ScrollViewKCM {
                             Controls.Label {
                                 text: modelData.id
                                 font.weight: Font.DemiBold
-                                font.family: "monospace"
                             }
                             Controls.Label {
                                 visible: modelData.detail !== undefined && modelData.detail !== null
                                 Layout.fillWidth: true
                                 text: modelData.detail === undefined ? "" : String(modelData.detail)
                                 wrapMode: Text.Wrap
-                                color: Kirigami.Theme.secondaryTextColor
+                                color: Kirigami.Theme.disabledTextColor
                             }
                         }
                     }
