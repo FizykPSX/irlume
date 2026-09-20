@@ -76,8 +76,8 @@ pub(crate) struct PendingWrite {
     pub(crate) schema_version: u32,
     /// Which build wrote the record. Descriptive, not a gate.
     pub(crate) engine_version: String,
-    /// Hex sha256 of the camera's USB descriptor blob, and this record's
-    /// filename.
+    /// Configuration-bound digest of all USB descriptor bytes, used in this
+    /// record's filing key. Single-configuration cameras retain their raw SHA.
     ///
     /// The descriptor is what `override_is_published` and `control_is_documented`
     /// already reason about, so binding the record to it means a record can only
@@ -289,14 +289,17 @@ pub(crate) fn record_path(descriptor_sha256: &str) -> PathBuf {
     store_dir().join(format!("{descriptor_sha256}.json"))
 }
 
-/// The digest of the camera's PUBLISHED DESCRIPTION: model, not unit.
+/// The digest of the complete published description and its active
+/// configuration, not physical unit. Single-configuration observations keep
+/// the historical full-blob digest; multi-configuration digests additionally
+/// bind the selected value and cannot authorize one another's control records.
 ///
 /// Two units of one model produce the same value, by construction. That is what
 /// makes it the right key for "is this record about a camera like the one in
 /// front of me" and the wrong key for "is this record about THIS camera", which
 /// is [`filing_key`].
 pub(crate) fn fingerprint(id: &CameraIdentity) -> String {
-    irlume_common::sha256_hex(&id.descriptors)
+    id.descriptor_fingerprint()
 }
 
 /// The name a record for this exact camera is filed under.
@@ -309,6 +312,69 @@ pub(crate) fn fingerprint(id: &CameraIdentity) -> String {
 /// what looks like a path cannot produce the same key as a different pairing.
 pub(crate) fn filing_key(id: &CameraIdentity) -> String {
     key_of(&fingerprint(id), id.serial.as_deref(), &id.usb_devpath)
+}
+
+/// Historical filename, also retained for stream-lock exclusion across builds
+/// and configurations. This raw digest never authorizes a multi-configuration
+/// restore; only `fingerprint` supplies that authority.
+pub(crate) fn legacy_filing_key(id: &CameraIdentity) -> String {
+    key_of(
+        &irlume_common::sha256_hex(&id.descriptors),
+        id.serial.as_deref(),
+        &id.usb_devpath,
+    )
+}
+
+/// Find pre-configuration-binding records without granting them restore
+/// authority. Both persistence stores share these identity fields. Scan even
+/// when a current-key record exists: it cannot make older undo data disappear.
+/// A changed serial observation or filename must not hide a legacy record.
+pub(crate) fn legacy_records(
+    id: &CameraIdentity,
+    dir: &std::path::Path,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    if id.descriptors.get(17).is_none_or(|count| *count <= 1) {
+        return Ok(Vec::new());
+    }
+    #[derive(Deserialize)]
+    struct StoredIdentity {
+        descriptor_sha256: String,
+        #[serde(default)]
+        usb_devpath: String,
+    }
+    let legacy_digest = irlume_common::sha256_hex(&id.descriptors);
+    let exact = dir.join(format!("{}.json", legacy_filing_key(id)));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{STORE_UNEXAMINABLE}list {}: {e}", dir.display())),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("{STORE_UNEXAMINABLE}list {}: {e}", dir.display()))?
+            .path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        if path == exact {
+            // Even damaged contents at the old exact key are not absence.
+            found.push((path, id.usb_devpath.clone()));
+            continue;
+        }
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| format!("{STORE_UNEXAMINABLE}read {}: {e}", path.display()))?;
+        let record: StoredIdentity = serde_json::from_str(&body).map_err(|e| {
+            format!(
+                "parse {} while checking legacy records: {e}",
+                path.display()
+            )
+        })?;
+        if record.descriptor_sha256 == legacy_digest {
+            found.push((path, record.usb_devpath));
+        }
+    }
+    Ok(found)
 }
 
 /// The one place a filing key is built, so a record is always written where a
@@ -590,13 +656,14 @@ pub(crate) fn lock_path_for_test(id: &CameraIdentity) -> PathBuf {
 /// `flock` excludes on the open file description, so two names are two locks.
 ///
 /// The descriptor pins the model and the device path pins which attached unit of
-/// that model this is. Neither can quietly become unavailable the way the serial
-/// can.
+/// that model this is. Keep the historical raw-blob hash: changing active
+/// configuration or upgrading must not create a second lock for a live writer.
+/// This is exclusion, not permission to restore a configuration-bound record.
 fn synchronization_key(id: &CameraIdentity) -> String {
     irlume_common::sha256_hex(
         format!(
             "descriptors:{}|devpath:{}:{}",
-            fingerprint(id),
+            irlume_common::sha256_hex(&id.descriptors),
             id.usb_devpath.len(),
             id.usb_devpath
         )
@@ -1064,14 +1131,22 @@ pub(crate) const STORE_UNEXAMINABLE: &str = "cannot examine the store: ";
 
 /// Classify the store against this camera.
 ///
-/// The exact record is tried first, by name, so the ordinary case costs one
-/// failed open. Only when that misses is the directory scanned, which is what
-/// finds a same-model record filed under a different port.
+/// Single-configuration cameras try the exact record first. Multi-configuration
+/// cameras first check for legacy records, which lack configuration authority
+/// but must still block writes. The normal fallback scan finds same-model
+/// records filed under a different port.
 ///
 /// An unreadable record that exists is an error rather than "no record":
 /// treating a permission or IO failure as absence would silently drop the one
 /// description of how to undo a firmware write.
 pub(crate) fn load(id: &CameraIdentity) -> Result<Situation, String> {
+    if let Some((path, _)) = legacy_records(id, &store_dir())?.first() {
+        return Err(format!(
+            "legacy multi-configuration undo record {} does not identify the active \
+             configuration; preserving it and refusing recovery and new writes",
+            path.display()
+        ));
+    }
     // The filename is a fast path, never the authority. Two things make it
     // unreliable on its own, and both were found by review:
     //
@@ -1685,6 +1760,7 @@ mod tests {
     fn identity() -> CameraIdentity {
         CameraIdentity {
             descriptors: include_bytes!("../tests/fixtures/asus-3277-0059.descriptors").to_vec(),
+            active_configuration: 1,
             interface_number: 2,
             vid: 0x3277,
             pid: 0x0059,
@@ -1857,9 +1933,9 @@ mod tests {
 
         let first = identity();
         let mut second = identity();
-        // A different descriptor blob is a different camera, which is the whole
-        // basis of the filing.
-        second.descriptors.push(0x00);
+        // A different firmware revision changes the descriptor digest without
+        // introducing malformed trailing data into the control fixture.
+        second.descriptors[12] ^= 1; // bcdDevice, low byte
 
         save(&record_for(&first)).expect("save first");
         save(&record_for(&second)).expect("save second");

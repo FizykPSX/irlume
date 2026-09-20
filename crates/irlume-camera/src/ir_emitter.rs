@@ -712,7 +712,20 @@ impl std::fmt::Display for XuError {
 
 type XuResult<T> = std::result::Result<T, XuError>;
 
+fn validate_query_configuration(fd: c_int) -> XuResult<()> {
+    #[cfg(test)]
+    if let Some(result) = fake_camera::check_configuration() {
+        return result;
+    }
+    crate::uvc_descriptor::validate_fd_configuration(fd)
+        .map_err(|_| XuError::Unresponsive(libc::ESTALE))
+}
+
 fn xu_query(fd: c_int, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> XuResult<()> {
+    // A unit/interface number is meaningful only in the fd's active USB
+    // configuration. Recheck before every ioctl, including restoration reads
+    // and writes, so a configuration transition cannot reuse earlier evidence.
+    validate_query_configuration(fd)?;
     // Every read is traced HERE, not in `get_of`, because `get_len` and
     // `get_info` have fixed widths and call this directly. The trace used to sit
     // in `get_of` under a comment calling it "the single choke point for every
@@ -800,6 +813,9 @@ pub(crate) mod fake_camera {
     // needs it to.
     #[derive(Default)]
     pub(crate) struct Camera {
+        /// A fake sysfs observation at the same pre-ioctl boundary as production.
+        /// None preserves the ordinary valid-configuration fixture.
+        pub(crate) configuration_check: Option<Box<dyn FnMut() -> XuResult<()>>>,
         /// What `GET_CUR` answers. Updated by an accepted `SET_CUR`, like a real
         /// control, so a read-back reflects what was written.
         pub(crate) current: Vec<u8>,
@@ -861,6 +877,19 @@ pub(crate) mod fake_camera {
 
     pub(crate) fn installed() -> bool {
         CAMERA.with(|camera| camera.borrow().is_some())
+    }
+
+    pub(crate) fn check_configuration() -> Option<XuResult<()>> {
+        CAMERA.with(|camera| {
+            let mut camera = camera.borrow_mut();
+            let camera = camera.as_mut()?;
+            Some(
+                camera
+                    .configuration_check
+                    .as_mut()
+                    .map_or(Ok(()), |check| check()),
+            )
+        })
     }
 
     /// Install a fake for the rest of this test, and take it back at the end.
@@ -1080,6 +1109,7 @@ fn validate_write_lease(fd: c_int) -> XuResult<()> {
 
 fn set_cur(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> XuResult<()> {
     validate_write_lease(fd)?;
+    validate_query_configuration(fd)?;
     if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
         eprintln!("irlume: SET_CUR unit{unit}/sel{selector}: {payload:02x?}");
     }
@@ -1117,7 +1147,11 @@ pub(crate) fn info_allows_set(info: u8) -> bool {
         && info & DISABLED_BY_COMMIT_STATE == 0
 }
 
-/// Raw, guard-free extension-unit access, for TEST TOOLING ONLY.
+/// Raw extension-unit access, for TEST TOOLING ONLY.
+///
+/// Payload and restoration policy are the caller's responsibility. The fd must
+/// still name an interface in the active USB configuration, and writes require
+/// the existing camera-operation lease.
 ///
 /// Hidden from the documented API on purpose. Everything else in this module
 /// wraps a write in evidence and an undo path; these wrappers exist so
@@ -1307,6 +1341,10 @@ fn write_if_different_inner(
                 "irlume: not driving unit{unit}/sel{selector}: another live irlume stream \
                  owns this camera's emitter"
             );
+            return Ok(CaptureWrite::refused());
+        }
+        Err(crate::stream_record::AcquireError::Protected(why)) => {
+            eprintln!("irlume: not driving unit{unit}/sel{selector}: {why}");
             return Ok(CaptureWrite::refused());
         }
         // Machine trouble, nobody contesting: proceed without bookkeeping,
@@ -1621,8 +1659,12 @@ pub fn microsoft_xu_report(device: &str) -> irlume_common::Result<String> {
     let id = crate::uvc_descriptor::identity_from_fd(fd)
         .map_err(|e| crate::Error::Hardware(format!("{device}: identity: {e}")))?;
     let mut out = format!(
-        "{device}: vid {:04x} pid {:04x}, interface {}\n",
-        id.vid, id.pid, id.interface_number
+        "{device}: vid {:04x} pid {:04x}, configuration {}, interface {}\n",
+        id.vid,
+        id.pid,
+        id.configuration_value()
+            .map_or_else(|| "unknown".into(), |value| value.to_string()),
+        id.interface_number
     );
     let units = id.extension_units();
     if units.is_empty() {
@@ -2449,7 +2491,13 @@ fn planned_action(
         }
     }
 
-    match known_control(id.vid, id.pid).filter(|c| control_is_documented(id, c)) {
+    // The literal recipes carry no configuration selector. Disambiguating a
+    // multi-configuration descriptor must not silently extend their scope.
+    // Its current device-default path can be discovered
+    // and validated instead; no compiled payload is extrapolated to it.
+    match known_control(id.vid, id.pid)
+        .filter(|c| id.descriptors.get(17) == Some(&1) && control_is_documented(id, c))
+    {
         Some(ctrl) => CaptureAction::KnownPayload(ctrl),
         None => CaptureAction::Nothing,
     }
@@ -2600,6 +2648,7 @@ pub(crate) fn override_is_published(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct OverrideKey {
     rdev: libc::dev_t,
+    configuration: u8,
     interface_number: u8,
     vid: u16,
     pid: u16,
@@ -2678,6 +2727,12 @@ fn override_key(
     }
     Ok(OverrideKey {
         rdev: st.st_rdev,
+        configuration: id.configuration_value().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unscoped USB configuration",
+            )
+        })?,
         interface_number: id.interface_number,
         vid: id.vid,
         pid: id.pid,
@@ -5172,6 +5227,411 @@ pub fn describe_units(device: &str) -> std::io::Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    fn legacy_configuration_record(
+        id: &crate::uvc_descriptor::CameraIdentity,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1, "engine_version": "pre-configuration-binding",
+            "descriptor_sha256": irlume_common::sha256_hex(&id.descriptors),
+            "usb_id": id.usb_id(), "interface_number": id.interface_number,
+            "unit": 14, "selector": 6, "len": 9,
+            "original": "010001000000000000", "attempted": "010002000000000000",
+            "state": "applied", "displaced": "010001000000000000",
+            "applied": "010002000000000000", "restore_attempts": 0,
+            "serial": id.serial, "usb_devpath": id.usb_devpath,
+        })
+    }
+
+    fn multi_configuration_identity() -> crate::uvc_descriptor::CameraIdentity {
+        let mut id = identity(0x3277, 0x0059);
+        let mut second = id.descriptors[18..].to_vec();
+        second[5] = 2;
+        id.descriptors[17] = 2;
+        id.descriptors.extend(second);
+        assert!(id.microsoft_xu().is_some());
+        id
+    }
+
+    #[test]
+    fn legacy_configuration_journal_blocks_recovery_and_new_capture_plans() {
+        use crate::emitter_journal as journal;
+        let _lock = crate::testenv::env_lock();
+        let fixture = ConfigurationFixture::new("legacy-journal");
+        let _state = EnvGuard::set("IRLUME_STATE_DIR", &fixture.root);
+        let _locks = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &fixture.root);
+        let mut id = multi_configuration_identity();
+        let legacy: journal::PendingWrite =
+            serde_json::from_value(legacy_configuration_record(&id)).unwrap();
+        let path = journal::save(&legacy).unwrap();
+        let body = std::fs::read(&path).unwrap();
+        let _fake = fake_camera::install(a_working_camera());
+        for coexist in [false, true] {
+            if coexist {
+                let mut scoped = legacy.clone();
+                scoped.descriptor_sha256 = id.descriptor_fingerprint();
+                journal::save(&scoped).unwrap();
+                // The scan must still find the legacy record after a serial
+                // observation changes, even with a current-key record present.
+                id.serial = None;
+                scoped.serial = None;
+                journal::save(&scoped).unwrap();
+            }
+            let outcome = recover_pending_write(-1, &id);
+            assert!(
+                matches!(&outcome, RecoveryOutcome::Unresolved(why) if why.contains("legacy")),
+                "{outcome:?}"
+            );
+            assert!(outcome.blocks_discovery());
+            assert!(!outcome.permits_capture_write());
+            assert_eq!(
+                planned_action(&outcome, Some(ctrl(14, 6, vec![1; 9])), &id),
+                CaptureAction::Nothing
+            );
+            assert_eq!(planned_action(&outcome, None, &id), CaptureAction::Nothing);
+            assert!(fake_camera::log().is_empty(), "no recovery query or write");
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn legacy_configuration_stream_blocks_forward_writes_without_claiming() {
+        use crate::emitter_journal as journal;
+        let _lock = crate::testenv::env_lock();
+        let fixture = ConfigurationFixture::new("legacy-stream");
+        let _state = EnvGuard::set("IRLUME_STATE_DIR", &fixture.root);
+        let mut id = multi_configuration_identity();
+        let mut legacy = legacy_configuration_record(&id);
+        let pending: journal::PendingWrite = serde_json::from_value(legacy.clone()).unwrap();
+        let dir = fixture.root.join("ir-emitter-stream");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.json", pending.filing_key()));
+        let wanted = [1, 0, 2, 0, 0, 0, 0, 0, 0];
+        for state in ["prepared", "applied"] {
+            legacy["state"] = state.into();
+            let body = serde_json::to_vec(&legacy).unwrap();
+            std::fs::write(&path, &body).unwrap();
+            for current in [vec![1, 0, 1, 0, 0, 0, 0, 0, 0], wanted.to_vec()] {
+                let _fake = fake_camera::install(fake_camera::Camera {
+                    len: 9,
+                    info: 3,
+                    current,
+                    ..Default::default()
+                });
+                let write =
+                    write_if_different_guarded(-1, 14, 6, 9, &wanted, &id, &mut || Ok(())).unwrap();
+                assert_eq!(write.outcome, Applied::Nothing);
+                assert!(
+                    fake_camera::log().is_empty(),
+                    "no claim, query or forward write"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), body);
+            }
+            id.serial = None;
+        }
+    }
+
+    #[test]
+    fn legacy_configuration_stream_protects_coexisting_scoped_save_and_claim() {
+        use crate::{emitter_journal as journal, stream_record as stream};
+        let _lock = crate::testenv::env_lock();
+        let fixture = ConfigurationFixture::new("legacy-coexisting");
+        let _state = EnvGuard::set("IRLUME_STATE_DIR", &fixture.root);
+        let id = multi_configuration_identity();
+        let applied = [1, 0, 2, 0, 0, 0, 0, 0, 0];
+        let displaced = [1, 0, 1, 0, 0, 0, 0, 0, 0];
+        let scoped_path = plant_record(&fixture.root, &id, 14, 6, &applied, &displaced, true);
+        let scoped_body = std::fs::read(&scoped_path).unwrap();
+        let legacy = legacy_configuration_record(&id);
+        let pending: journal::PendingWrite = serde_json::from_value(legacy.clone()).unwrap();
+        let path = fixture
+            .root
+            .join("ir-emitter-stream")
+            .join(format!("{}.json", pending.filing_key()));
+        let body = serde_json::to_vec(&legacy).unwrap();
+        for claim in [false, true] {
+            // Exercise each store entry point even if a caller already holds
+            // the lock when a legacy record is put back on disk.
+            let lock = stream::acquire(&id).unwrap();
+            std::fs::write(&path, &body).unwrap();
+            if claim {
+                assert!(stream::claim(lock, &id, 14, 6, &applied).is_none());
+            } else {
+                assert!(matches!(
+                    stream::save(lock, &id, 14, 6, &applied, &displaced),
+                    Err(stream::SaveError::Protected { .. })
+                ));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+            assert_eq!(std::fs::read(&scoped_path).unwrap(), scoped_body);
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_configuration_damaged_records_never_allow_unrecorded_writes() {
+        use crate::emitter_journal as journal;
+        let _lock = crate::testenv::env_lock();
+        let fixture = ConfigurationFixture::new("legacy-damaged");
+        let _state = EnvGuard::set("IRLUME_STATE_DIR", &fixture.root);
+        let id = multi_configuration_identity();
+        let pending: journal::PendingWrite =
+            serde_json::from_value(legacy_configuration_record(&id)).unwrap();
+        let dir = fixture.root.join("ir-emitter-stream");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exact = dir.join(format!("{}.json", pending.filing_key()));
+        let misfiled = dir.join("misfiled.json");
+        for (path, unreadable) in [(&exact, false), (&misfiled, false), (&misfiled, true)] {
+            if unreadable {
+                std::fs::create_dir(path).unwrap();
+            } else {
+                std::fs::write(path, b"{").unwrap();
+            }
+            let _fake = fake_camera::install(a_working_camera());
+            let result =
+                write_if_different_guarded(-1, 14, 6, 3, &[1, 3, 2], &id, &mut || Ok(())).unwrap();
+            assert_eq!(result.outcome, Applied::Nothing);
+            assert!(fake_camera::log().is_empty());
+            if unreadable {
+                assert!(path.is_dir());
+                std::fs::remove_dir(path).unwrap();
+            } else {
+                assert_eq!(std::fs::read(path).unwrap(), b"{");
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_configuration_other_cameras_stream_records_do_not_block() {
+        use crate::emitter_journal as journal;
+        let _lock = crate::testenv::env_lock();
+        for different_port in [false, true] {
+            let fixture = ConfigurationFixture::new(if different_port {
+                "legacy-other-port"
+            } else {
+                "legacy-other-model"
+            });
+            let _state = EnvGuard::set("IRLUME_STATE_DIR", &fixture.root);
+            let id = multi_configuration_identity();
+            let mut other = multi_configuration_identity();
+            if different_port {
+                other.usb_devpath.push_str("-other");
+            } else {
+                other.descriptors[12] ^= 1;
+            }
+            let legacy = legacy_configuration_record(&other);
+            let pending: journal::PendingWrite = serde_json::from_value(legacy.clone()).unwrap();
+            let dir = fixture.root.join("ir-emitter-stream");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{}.json", pending.filing_key()));
+            let body = serde_json::to_vec(&legacy).unwrap();
+            std::fs::write(&path, &body).unwrap();
+            let _fake = fake_camera::install(a_working_camera());
+            let result =
+                write_if_different_guarded(-1, 14, 6, 3, &[1, 3, 2], &id, &mut || Ok(())).unwrap();
+            assert_eq!(result.outcome, Applied::Wrote);
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn legacy_configuration_live_locks_still_exclude_new_writers() {
+        use crate::emitter_journal as journal;
+        use std::os::fd::AsRawFd as _;
+        let _lock = crate::testenv::env_lock();
+        let fixture = ConfigurationFixture::new("legacy-locks");
+        let _state = EnvGuard::set("IRLUME_STATE_DIR", &fixture.root);
+        let _locks = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &fixture.root);
+        let mut id = multi_configuration_identity();
+        let legacy: journal::PendingWrite =
+            serde_json::from_value(legacy_configuration_record(&id)).unwrap();
+        let sync_key = irlume_common::sha256_hex(
+            format!(
+                "descriptors:{}|devpath:{}:{}",
+                legacy.descriptor_sha256,
+                id.usb_devpath.len(),
+                id.usb_devpath
+            )
+            .as_bytes(),
+        );
+        let journal_lock = fixture.root.join(format!("irlume-emitter-{sync_key}.lock"));
+        let stream_dir = fixture.root.join("ir-emitter-stream");
+        std::fs::create_dir_all(&stream_dir).unwrap();
+        let stream_lock = stream_dir.join(format!("{}.lock", legacy.filing_key()));
+        let files = [journal_lock, stream_lock].map(|path| {
+            let file = std::fs::File::create(path).unwrap();
+            assert_eq!(
+                // SAFETY: the file owns the descriptor and is kept alive below.
+                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            file
+        });
+        for active in [1, 2] {
+            id.active_configuration = active;
+            assert!(journal::lock_camera(None, &id).unwrap().is_none());
+            assert!(matches!(
+                crate::stream_record::acquire(&id),
+                Err(crate::stream_record::AcquireError::Busy)
+            ));
+        }
+        drop(files);
+        assert!(journal::lock_camera(None, &id).unwrap().is_some());
+        assert!(crate::stream_record::acquire(&id).is_ok());
+    }
+
+    struct ConfigurationFixture {
+        root: std::path::PathBuf,
+        device: std::path::PathBuf,
+        interface: std::path::PathBuf,
+    }
+
+    impl ConfigurationFixture {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "irlume-xu-configuration-{label}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let device = root.join("3-5");
+            let interface = device.join("3-5:1.0");
+            std::fs::create_dir_all(&interface).unwrap();
+            std::fs::write(device.join("bConfigurationValue"), "1\n").unwrap();
+            std::fs::write(interface.join("bInterfaceNumber"), "00\n").unwrap();
+            Self {
+                root,
+                device,
+                interface,
+            }
+        }
+
+        fn probe(&self) -> Box<dyn FnMut() -> XuResult<()>> {
+            let device = self.device.clone();
+            let interface = self.interface.clone();
+            Box::new(move || {
+                crate::uvc_descriptor::configuration_from_dirs(&interface, &device)
+                    .map(|_| ())
+                    .map_err(|_| XuError::Unresponsive(libc::ESTALE))
+            })
+        }
+    }
+
+    impl Drop for ConfigurationFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn configuration_change_refuses_reads_forward_writes_and_restore_io() {
+        let fixture = ConfigurationFixture::new("transition");
+        let original = vec![1, 0, 1, 0, 0, 0, 0, 0, 0];
+        let applied = vec![1, 0, 2, 0, 0, 0, 0, 0, 0];
+        let _camera = fake_camera::install(fake_camera::Camera {
+            configuration_check: Some(fixture.probe()),
+            current: original.clone(),
+            len: 9,
+            info: 3,
+            ..Default::default()
+        });
+        assert_eq!(get_cur(-1, 14, 6, 9).unwrap(), original);
+        let before = fake_camera::log();
+        std::fs::write(fixture.device.join("bConfigurationValue"), "2\n").unwrap();
+        assert!(get_cur(-1, 14, 6, 9).is_err());
+        assert!(set_cur(-1, 14, 6, &applied).is_err());
+        let mut mode = UvcMode {
+            handle: None,
+            unit: 14,
+            selector: 6,
+            restore: original,
+            applied,
+            armed: true,
+            active: true,
+            record: None,
+            _lock: None,
+        };
+        assert!(mode.restore().is_err());
+        assert_eq!(
+            fake_camera::log(),
+            before,
+            "stale configuration must reach no ioctl"
+        );
+    }
+
+    #[test]
+    fn configuration_is_rechecked_at_the_final_ioctl_boundary() {
+        let fixture = ConfigurationFixture::new("last-boundary");
+        let device = fixture.device.clone();
+        let mut probe = fixture.probe();
+        let mut first = true;
+        let _camera = fake_camera::install(fake_camera::Camera {
+            configuration_check: Some(Box::new(move || {
+                let result = probe();
+                if first {
+                    first = false;
+                    std::fs::write(device.join("bConfigurationValue"), "2\n").unwrap();
+                }
+                result
+            })),
+            current: vec![1, 0, 1, 0, 0, 0, 0, 0, 0],
+            len: 9,
+            info: 3,
+            ..Default::default()
+        });
+        assert!(set_cur(-1, 14, 6, &[1, 0, 2, 0, 0, 0, 0, 0, 0]).is_err());
+        assert!(
+            fake_camera::log().is_empty(),
+            "configuration moved after preflight; no SET_CUR may reach transport"
+        );
+    }
+
+    #[test]
+    fn configuration_scopes_the_override_memo() {
+        use std::os::fd::AsRawFd;
+        let (fd, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut first = identity(0x3277, 0x0059);
+        let mut other_configuration = first.descriptors[18..].to_vec();
+        other_configuration[5] = 2;
+        first.descriptors[17] = 2;
+        first.descriptors.extend(other_configuration);
+        let mut second = identity(0x3277, 0x0059);
+        second.descriptors = first.descriptors.clone();
+        second.active_configuration = 2;
+        let control = ctrl(14, 6, vec![1, 3, 2, 0, 0, 0, 0, 0, 0]);
+        assert_ne!(
+            override_key(fd.as_raw_fd(), &first, &control).unwrap(),
+            override_key(fd.as_raw_fd(), &second, &control).unwrap()
+        );
+    }
+
+    #[test]
+    fn configuration_disambiguation_does_not_expand_literal_payload_qualification() {
+        let _lock = crate::testenv::env_lock();
+        let _env = EnvGuard::set(
+            "IRLUME_IR_EMITTER_CONF",
+            "/definitely/missing/ms02-emitter.conf",
+        );
+        let mut id = identity(0x3277, 0x0059);
+        assert!(matches!(
+            planned_action(&RecoveryOutcome::NothingPending, None, &id),
+            CaptureAction::KnownPayload(_)
+        ));
+        // Both configurations publish the same MS unit. Selecting one must
+        // not extend a literal recipe that has no configuration selector.
+        let mut other_configuration = id.descriptors[18..].to_vec();
+        other_configuration[5] = 2;
+        id.descriptors[17] = 2;
+        id.descriptors.extend(other_configuration);
+        assert!(control_is_documented(
+            &id,
+            &known_control(id.vid, id.pid).unwrap()
+        ));
+        assert_eq!(
+            planned_action(&RecoveryOutcome::NothingPending, None, &id),
+            CaptureAction::Nothing
+        );
+    }
+
     #[cfg(feature = "capture-timing")]
     #[test]
     fn teardown_timing_records_failed_restore_without_error_payload() {
@@ -9565,6 +10025,7 @@ mod tests {
     fn identity(vid: u16, pid: u16) -> crate::uvc_descriptor::CameraIdentity {
         crate::uvc_descriptor::CameraIdentity {
             descriptors: include_bytes!("../tests/fixtures/asus-3277-0059.descriptors").to_vec(),
+            active_configuration: 1,
             interface_number: 2,
             vid,
             pid,
@@ -9905,6 +10366,7 @@ mod tests {
         // guessed payloads to both of them.
         let no_ms = crate::uvc_descriptor::CameraIdentity {
             descriptors: include_bytes!("../tests/fixtures/asus-3277-0059.descriptors").to_vec(),
+            active_configuration: 1,
             interface_number: 0,
             vid: 0x3277,
             pid: 0x0059,
