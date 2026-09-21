@@ -84,7 +84,7 @@ const GREETERS: &[Svc] = &[
     }, // Plasma 6
     Svc {
         etc: "/etc/pam.d/cosmic-greeter",
-        vendor: None,
+        vendor: Some("/usr/lib/pam.d/cosmic-greeter"),
     }, // COSMIC (Pop!_OS / System76)
     Svc {
         etc: "/etc/pam.d/greetd",
@@ -780,7 +780,8 @@ fn gdm_uses_ondemand(gnome_major: Option<u32>) -> bool {
 /// their lock screens differently, and those differences we've validated on
 /// hardware live here rather than scattered across the wiring code.
 struct DmProfile {
-    /// Face engages on an empty-field Enter (`ondemand`) vs GDM's
+    /// Face engages on explicit input (`ondemand`: yes on COSMIC, empty Enter
+    /// on other supported frontends) vs GDM's
     /// scan-immediately (`facefirst`). For GDM this is gated by GNOME version.
     /// The cold-login-vs-warm-lock control tension (keyring unlock) is handled
     /// uniformly by the module's `kr` arg, so it needs no per-DM field here.
@@ -791,7 +792,8 @@ struct DmProfile {
 /// detected GNOME Shell major (for GDM's version gate).
 fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
     match greeter_etc.rsplit('/').next().unwrap_or("") {
-        // COSMIC (System76 / Pop!_OS): answers the probe on submit → ondemand.
+        // COSMIC drops empty submits. The PAM module's service-specific hidden
+        // prompt accepts an explicit nonempty yes; no ambient face-first switch.
         "cosmic-greeter" => DmProfile { ondemand: true },
         // GDM (GNOME): modern gnome-shell submits the empty field (ondemand);
         // older gnome-shell blocked the probe → facefirst.
@@ -1511,7 +1513,7 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
                 println!(
                     "  face trigger: {}",
                     if dm_profile(&format!("/etc/pam.d/{greeter}"), gnome_shell_major()).ondemand {
-                        format!("on-demand; {ONDEMAND_HINT}")
+                        format!("on-demand; {}", ondemand_hint(greeter))
                     } else {
                         "face-first; the camera verifies as soon as your account is selected"
                             .to_string()
@@ -2633,7 +2635,7 @@ mod tests {
 
     #[test]
     fn cosmic_greeter_wires_ondemand_not_facefirst() {
-        // ondemand=true → on-demand probe line (face only on empty-Enter), placed
+        // ondemand=true → explicit on-demand choice (yes on COSMIC), placed
         // before the password include so the password stays a fallback.
         let (w, changed) = wire_greeter_impl(COSMIC, true, false, true);
         assert!(changed);
@@ -2686,7 +2688,7 @@ mod tests {
 
     #[test]
     fn dm_profile_tailors_per_login_manager() {
-        // COSMIC answers the probe on submit → ondemand.
+        // COSMIC answers a nonempty yes selection → ondemand.
         assert!(dm_profile("/etc/pam.d/cosmic-greeter", Some(50)).ondemand);
         // GDM: ondemand is version-gated (modern GNOME) → facefirst below.
         assert!(dm_profile("/etc/pam.d/gdm-password", Some(50)).ondemand);
@@ -3076,6 +3078,7 @@ mod tests {
             ("/etc/pam.d/sddm", "/usr/lib/pam.d/sddm"),
             ("/etc/pam.d/gdm-password", "/usr/lib/pam.d/gdm-password"),
             ("/etc/pam.d/lightdm", "/usr/lib/pam.d/lightdm"),
+            ("/etc/pam.d/cosmic-greeter", "/usr/lib/pam.d/cosmic-greeter"),
         ] {
             let svc = GREETERS
                 .iter()
@@ -3086,11 +3089,7 @@ mod tests {
         // No accidental over-reach: greeters without a verified vendor-only
         // layout keep vendor: None (the /etc file is the only copy families
         // ship for these today).
-        for etc in [
-            "/etc/pam.d/greetd",
-            "/etc/pam.d/ly",
-            "/etc/pam.d/cosmic-greeter",
-        ] {
+        for etc in ["/etc/pam.d/greetd", "/etc/pam.d/ly"] {
             let svc = GREETERS
                 .iter()
                 .find(|s| s.etc == etc)
@@ -3127,6 +3126,45 @@ mod tests {
             materialized.contains("substack       common-auth"),
             "the vendor stack's carrier line survives: {materialized}"
         );
+    }
+
+    #[test]
+    fn fedora_cosmic_vendor_service_materializes_and_removes_only_its_override() {
+        let dir = TestDir::new("fedora-cosmic-vendor");
+        let declared = GREETERS
+            .iter()
+            .find(|service| service.etc == "/etc/pam.d/cosmic-greeter")
+            .unwrap();
+        let etc = dir.0.join(declared.etc.trim_start_matches('/'));
+        let vendor = dir.0.join("usr/lib/pam.d/cosmic-greeter");
+        std::fs::create_dir_all(etc.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+        // Exact vendor file from cosmic-greeter-1.8.0-1.fc44.x86_64.
+        let fixture = include_str!("../tests/fixtures/pam/fedora/cosmic-greeter");
+        std::fs::write(&vendor, fixture).unwrap();
+        let service = Svc {
+            etc: leak(&etc),
+            vendor: declared
+                .vendor
+                .map(|path| leak(&dir.0.join(path.trim_start_matches('/')))),
+        };
+        let profile = dm_profile(declared.etc, None);
+        let wire = |content: &str| wire_greeter_impl(content, true, true, profile.ondemand);
+        wire_service(&service, true, true, &wire).unwrap();
+        let first = std::fs::read_to_string(&etc).expect("vendor-only COSMIC must be wired");
+        assert!(first.contains("pam_irlume.so unseal ondemand"));
+        assert!(
+            first.contains("pam_oo7.so"),
+            "keep the vendor's wallet module"
+        );
+        wire_service(&service, true, true, &wire).unwrap();
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), first);
+        wire_service(&service, false, true, &wire).unwrap();
+        assert!(
+            !etc.exists(),
+            "disable must expose the original vendor stack"
+        );
+        assert_eq!(std::fs::read_to_string(&vendor).unwrap(), fixture);
     }
 
     /// Self-cleaning scratch dir for the wire_service file tests.
