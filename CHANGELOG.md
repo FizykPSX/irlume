@@ -7,6 +7,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- PCR-signing public keys are decoded from complete DER containers after PEM
+  label validation. Keys hidden inside the algorithm identifier, trailing DER
+  fields and non-byte-aligned key bits are rejected. Valid RSA keys with NULL
+  or absent algorithm parameters retain their existing interpretation.
 - Camera warm-up can retry a dequeue timeout without requeueing a buffer still
   owned by the kernel. Capture now tracks the last successfully dequeued buffer
   explicitly, preserving the existing retry budget, cancellation, deadlines and
