@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `release_probe` example in `irlume-camera`: arms a paired RGB+IR session
+  through the crate's real paths and times the two stream releases
+  separately, in either order, with an optional idle pause between rounds.
+  Used to attribute the NexiGo N930W's ~0.8 s `stream_owner_release`
+  (#797): the camera stalls once per session cycle wherever the sequence
+  hits it, so the order of the two stops moves the cost rather than
+  removing it.
 - Diagnostic trace schema 4 adds two stage timings: `capture_setup`, from the
   completed enrollment load to the first capture route starting to stream, and
   `finalization`, from the release of the owned streaming sessions to the
@@ -17,6 +24,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- On the concurrent capture path the authentication decision is handed to
+  the connection thread before the two camera streams are torn down
+  (ADR-0027). The teardown costs 1.0–1.2 s on the NexiGo N930W after the
+  identity decision, and reordering the two stops only moved that cost
+  (`release_probe`); now it runs after the reply. The camera LED and the IR
+  emitter therefore turn off about a second later than before after a
+  decision. Nothing about the decision's inputs, the admission checks or the
+  camera lease changes; the pair is still released before the next request.
 - The TPM is reached through the raw device (`/dev/tpm0`) first, with the
   kernel resource manager (`/dev/tpmrm0`) as the per-call fallback (ADR-0026).
   The manager saves and flushes every session and object after every command,

@@ -127,6 +127,10 @@ pub struct Engine {
     /// read-only as the label the daemon wires onto `AuthResult` for
     /// pam_irlume's prompt wording. Reporting only: it gates nothing.
     last_attempt_situation: Option<AttemptSituation>,
+    /// The costliest deferred pair release this request has measured
+    /// (ADR-0027), the retry estimator's allowance for a teardown that has
+    /// not run yet. Reset at request entry.
+    last_release_cost: Option<std::time::Duration>,
     /// Start of the `CaptureSetup` interval: taken once the enrollment has
     /// resolved and consumed by the first capture route to start streaming.
     capture_setup_started: Option<std::time::Instant>,
@@ -1019,6 +1023,12 @@ const SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW: std::time::Duration = std::time::Durat
 /// fallback can still finish inside the remaining window before it starts
 /// re-opening cameras.
 const SEQUENTIAL_PAIR_ATTEMPT_COST: std::time::Duration = std::time::Duration::from_secs(7);
+
+/// What a deferred pair release is assumed to cost before this request has
+/// measured one (ADR-0027): above the 1.0–1.2 s measured on the NexiGo N930W,
+/// so the retry estimator never admits a retry the teardown would push past
+/// the window.
+const RELEASE_ALLOWANCE_FLOOR: std::time::Duration = std::time::Duration::from_millis(1500);
 
 #[derive(Debug, Eq, PartialEq)]
 enum EligiblePairEvidence<T> {
@@ -3487,6 +3497,40 @@ mod capture_mode_switch_tests {
     }
 }
 
+/// The two streaming owners of a concurrent attempt, kept alive past the
+/// decision so the decision can be delivered first (ADR-0027). Nothing reads
+/// from either session after it is deferred; the handle only chooses WHEN the
+/// teardown (STREAMOFF, buffer release, emitter and control restore) runs,
+/// and its drop measures it as `stream_owner_release` exactly as the
+/// immediate path does. RGB is released first, then IR: the tuple order,
+/// which is where the NexiGo N930W's per-cycle stall is deterministic
+/// (`release_probe`); releasing IR first moved that stall onto the next
+/// stream start and was measured worse in the daemon.
+pub(crate) struct DeferredPairRelease<'d, R, I> {
+    pair: Option<(R, I)>,
+    diagnostics: &'d dyn irlume_common::diagnostics::DiagnosticSink,
+}
+
+/// The production instance: the two camera sessions of one attempt.
+pub(crate) type DeferredSessionRelease<'c, 'd> =
+    DeferredPairRelease<'d, irlume_camera::RgbSession<'c>, irlume_camera::IrSession<'c>>;
+
+impl<R, I> Drop for DeferredPairRelease<'_, R, I> {
+    fn drop(&mut self) {
+        let _timing = TraceStageTimer::new(
+            self.diagnostics,
+            irlume_common::diagnostics::TraceStage::StreamOwnerRelease,
+        );
+        drop(self.pair.take());
+    }
+}
+
+/// The decision hook of ADR-0027: called with the final outcome of a request
+/// after every engine-side admission check, while the concurrent pair (if
+/// any) is still held, so the daemon can hand the reply to its connection
+/// thread before the camera teardown. It cannot change the outcome.
+pub type DecisionDelivery<'a> = &'a mut dyn FnMut(&Engine, &Outcome);
+
 /// Own streaming queues only for one assessment. The result cannot borrow
 /// either session, so both drop before matching, consent or another attempt.
 fn with_owned_pair<R, I, T>(
@@ -3600,6 +3644,7 @@ impl Engine {
             authentication_deadline: None,
             last_attempt_facts: AttemptFacts::default(),
             last_attempt_situation: None,
+            last_release_cost: None,
             capture_setup_started: None,
             request_key: std::sync::Arc::new(std::sync::Mutex::new(
                 irlume_core::template_key::RequestTemplateKey::production(),
@@ -3679,6 +3724,51 @@ impl Engine {
 
     /// Completed refusals retain their established accounting classification.
     /// Expiry prevents granting, not recording evidence already obtained.
+    /// Release a deferred pair now (ADR-0027, the non-final paths: a retried
+    /// round, an error, an expired grant). Arms finalization after the drop
+    /// exactly as the immediate release used to, so the trace keeps its
+    /// shape, and reports how long the release took for the retry estimator.
+    fn release_deferred<D>(
+        &mut self,
+        deferred: Option<D>,
+        now: &impl Fn() -> std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let deferred = deferred?;
+        let started = now();
+        drop(deferred);
+        self.arm_finalization();
+        let cost = now().duration_since(started);
+        self.last_release_cost = Some(self.last_release_cost.map_or(cost, |c| c.max(cost)));
+        Some(cost)
+    }
+
+    /// ADR-0027, the final step of a request whose decision is in hand: hand
+    /// the outcome over, then release what the attempt deferred, then arm the
+    /// finalization interval. The completion check mirrors the one the public
+    /// entry runs afterwards, so a request cancelled or expired by now is not
+    /// delivered as a grant. The release measures `stream_owner_release`
+    /// (RGB first, as always), and finalization starts only after it, which
+    /// is the schema 4 meaning of that stage. An error result is returned
+    /// untouched, after the same release.
+    fn deliver_then_release<R, I>(
+        &mut self,
+        result: irlume_common::Result<Outcome>,
+        deferred: Option<DeferredPairRelease<'_, R, I>>,
+        deliver: DecisionDelivery<'_>,
+    ) -> irlume_common::Result<Outcome> {
+        if let Ok(outcome) = &result {
+            if self.check_completed_attempt(&result).is_ok() {
+                deliver(&*self, outcome);
+            }
+        }
+        let released = deferred.is_some();
+        drop(deferred);
+        if released {
+            self.arm_finalization();
+        }
+        result
+    }
+
     fn check_completed_attempt(
         &mut self,
         result: &irlume_common::Result<Outcome>,
@@ -5877,6 +5967,39 @@ impl Engine {
         policy: irlume_common::config::FaceSensorPolicy,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
+        self.authenticate_for_in_window_with_policy_delivering(
+            user,
+            service,
+            purpose,
+            window,
+            policy,
+            diagnostics,
+            &mut |_, _| {},
+        )
+    }
+
+    /// [`Self::authenticate_for_in_window_with_policy`] with the ADR-0027
+    /// decision hook: `deliver` runs once with the final outcome, after the
+    /// engine's admission checks and before a held concurrent pair is torn
+    /// down. It is not run for outcomes that never reached a decision (setup
+    /// refusals surface as the returned error as before), and the returned
+    /// value is still the outcome the hook saw.
+    ///
+    /// # Errors
+    /// The errors of [`Self::authenticate_for_in_window_with_policy`]. An
+    /// error after the hook ran (a cancellation or expiry noticed by the
+    /// final completion check) does not retract what the hook delivered.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authenticate_for_in_window_with_policy_delivering(
+        &mut self,
+        user: &str,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        window: AuthenticationWindow,
+        policy: irlume_common::config::FaceSensorPolicy,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        deliver: DecisionDelivery<'_>,
+    ) -> irlume_common::Result<Outcome> {
         let previous =
             std::mem::replace(&mut self.authentication_deadline, window.capture_deadline());
         let scope = authentication_window::Scope {
@@ -5894,12 +6017,14 @@ impl Engine {
             window,
             policy,
             diagnostics,
+            deliver,
         );
         // Covers setup and cleanup paths that return before the retry loop.
         scope.engine.check_completed_attempt(&result)?;
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn authenticate_in_window_inner(
         &mut self,
         user: &str,
@@ -5908,10 +6033,12 @@ impl Engine {
         window: AuthenticationWindow,
         policy: irlume_common::config::FaceSensorPolicy,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        deliver: DecisionDelivery<'_>,
     ) -> irlume_common::Result<Outcome> {
         // The daemon reuses this engine across requests. Setup refusals and
         // errors can return before the attempt loop publishes a new situation.
         self.last_attempt_situation = None;
+        self.last_release_cost = None;
         // Outlives the camera handles and lease declared below, so their
         // release is part of the reported finalization interval.
         let _finalization = self.finalization_timer(diagnostics);
@@ -6200,6 +6327,7 @@ impl Engine {
                                 )
                             }),
                             false,
+                            None::<()>,
                         )
                     },
                     std::time::Instant::now,
@@ -6244,6 +6372,7 @@ impl Engine {
                                     )
                                 }),
                                 false,
+                                None::<()>,
                             )
                         },
                         std::time::Instant::now,
@@ -6267,7 +6396,7 @@ impl Engine {
                 .0;
         }
         let mut costliest_attempt = std::time::Duration::ZERO;
-        let (first_result, held_pair_failed) = self.authentication_attempt_loop(
+        let (first_result, held_pair_failed, deferred_release) = self.authentication_attempt_loop(
             &enr,
             purpose,
             service,
@@ -6280,8 +6409,9 @@ impl Engine {
             &mut costliest_attempt,
         );
         if !held_pair_failed {
-            return first_result;
+            return self.deliver_then_release(first_result, deferred_release, deliver);
         }
+        drop(deferred_release);
         let error = first_result.expect_err("held-pair failure must return an error");
         // The sequential fallback re-opens both cameras. Retain its existing
         // conservative setup-cost floor when deciding whether it fits.
@@ -6333,25 +6463,30 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn authentication_attempt_loop(
+    fn authentication_attempt_loop<'c, 'd>(
         &mut self,
         enr: &irlume_core::storage::Enrollment,
         purpose: AuthenticationPurpose,
         service: Option<&str>,
         deadline: std::time::Instant,
         window: u64,
-        cameras: Option<&(irlume_camera::RgbCamera, irlume_camera::IrCamera)>,
+        cameras: Option<&'c (irlume_camera::RgbCamera, irlume_camera::IrCamera)>,
         capture_mode: &CaptureModeSelection,
         camera_operation: &irlume_camera::lease::CameraOperationSession,
-        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        diagnostics: &'d dyn irlume_common::diagnostics::DiagnosticSink,
         costliest_attempt: &mut std::time::Duration,
-    ) -> (irlume_common::Result<Outcome>, bool) {
+    ) -> (
+        irlume_common::Result<Outcome>,
+        bool,
+        Option<DeferredSessionRelease<'c, 'd>>,
+    ) {
         self.authentication_attempt_loop_with(
             deadline,
             window,
             costliest_attempt,
             |engine| {
                 let mut held_pair_failed = false;
+                let mut deferred = None;
                 let result = Self::run_camera_operation(camera_operation, || {
                     if let Some(cameras) = cameras.filter(|_| {
                         managed_pad::eligible(
@@ -6364,7 +6499,7 @@ impl Engine {
                             service,
                         )
                     }) {
-                        return engine.authenticate_managed_concurrent_once(
+                        let (result, release) = engine.authenticate_managed_concurrent_once(
                             enr,
                             purpose,
                             service,
@@ -6374,6 +6509,8 @@ impl Engine {
                             &mut held_pair_failed,
                             diagnostics,
                         );
+                        deferred = release;
+                        return result;
                     }
                     engine.authenticate_once(
                         enr,
@@ -6388,7 +6525,7 @@ impl Engine {
                         },
                     )
                 });
-                (result, held_pair_failed)
+                (result, held_pair_failed, deferred)
             },
             std::time::Instant::now,
         )
@@ -6397,15 +6534,28 @@ impl Engine {
     /// The production retry loop, with capture and monotonic time supplied at
     /// the boundary. Tests replace only those two dependencies, so PAD admission,
     /// retry classification, cost estimation and deadline settlement stay real.
-    fn authentication_attempt_loop_with(
+    ///
+    /// `D` is a held resource the attempt may hand back instead of releasing
+    /// (ADR-0027: the concurrent pair). A retried round releases it here,
+    /// inside the round's measured cost, so the estimator keeps counting the
+    /// teardown exactly as before; a final round returns it to the caller.
+    fn authentication_attempt_loop_with<D>(
         &mut self,
         deadline: std::time::Instant,
         window: u64,
         costliest_attempt: &mut std::time::Duration,
-        mut capture_attempt: impl FnMut(&mut Self) -> (irlume_common::Result<Outcome>, bool),
+        mut capture_attempt: impl FnMut(&mut Self) -> (irlume_common::Result<Outcome>, bool, Option<D>),
         now: impl Fn() -> std::time::Instant,
-    ) -> (irlume_common::Result<Outcome>, bool) {
+    ) -> (irlume_common::Result<Outcome>, bool, Option<D>) {
         let mut attempt = 0_u32;
+        // The costliest CAPTURE this loop has seen, before any release: the
+        // next attempt's estimate. It starts from the caller's seed (a whole
+        // round of an earlier loop, conservative by construction) and grows
+        // only with captures measured here. `costliest_attempt` keeps its
+        // whole-round meaning (release included) for the caller; it must not
+        // feed the retry estimate, where the pending release is added
+        // explicitly, or a round's release would be counted twice.
+        let mut costliest_capture = *costliest_attempt;
         // The costliest attempt so far (caller-seeded: the sequential fallback
         // starts with the concurrent loop's observed worst). A retry that
         // cannot FINISH before the deadline would overrun mid-capture —
@@ -6415,24 +6565,31 @@ impl Engine {
         // attempt now includes fresh stream arming and rate establishment.
         loop {
             if let Err(error) = self.check_request_active() {
-                return (Err(error), false);
+                return (Err(error), false, None);
             }
             if window != 0 && now() >= deadline {
                 self.vit_scores.clear();
                 self.last_attempt_situation = Some(AttemptSituation::TimedOut);
-                return (Err(irlume_common::Error::DeadlineExpired), false);
+                return (Err(irlume_common::Error::DeadlineExpired), false, None);
             }
             attempt += 1;
             let attempt_started = now();
-            let (attempt_result, held_pair_failed) = capture_attempt(self);
+            let (attempt_result, held_pair_failed, deferred) = capture_attempt(self);
             if let Err(error) = self.check_completed_attempt(&attempt_result) {
-                return (Err(error), false);
+                self.release_deferred(deferred, &now);
+                return (Err(error), false, None);
             }
-            *costliest_attempt = (*costliest_attempt).max(now().duration_since(attempt_started));
+            // Measured before any deferred release: a final round hands its
+            // teardown to the caller, a retried round pays it just below and
+            // re-measures the whole round then.
+            let capture_cost = now().duration_since(attempt_started);
+            costliest_capture = costliest_capture.max(capture_cost);
+            *costliest_attempt = (*costliest_attempt).max(capture_cost);
             let out = match attempt_result {
                 Ok(out) => out,
                 Err(error) => {
-                    return (Err(error), held_pair_failed);
+                    self.release_deferred(deferred, &now);
+                    return (Err(error), held_pair_failed, None);
                 }
             };
             // One situation line per FAILED attempt (#616 step 2), including
@@ -6456,29 +6613,54 @@ impl Engine {
             }
             let expired = now() >= deadline;
             if window != 0 && expired && out.granted {
+                self.release_deferred(deferred, &now);
                 self.vit_scores.clear();
                 self.last_attempt_situation = Some(AttemptSituation::TimedOut);
-                return (Err(irlume_common::Error::DeadlineExpired), false);
+                return (Err(irlume_common::Error::DeadlineExpired), false, None);
             }
-            let retry_wont_fit = !expired
-                && presence_retryable(&out)
-                && deadline.saturating_duration_since(now()) < *costliest_attempt;
-            if retry_wont_fit {
-                irlume_common::dlog!(
-                    "grace: retry skipped ({}ms left, costliest attempt {}ms); settling",
-                    deadline.saturating_duration_since(now()).as_millis(),
-                    costliest_attempt.as_millis()
-                );
-            }
-            if !presence_retryable(&out) || expired || retry_wont_fit {
+            if !presence_retryable(&out) || expired {
+                // Final: the caller delivers and then releases what was deferred.
                 if attempt > 1 {
                     irlume_common::dlog!(
                         "grace: settled after {attempt} attempts ({}ms window)",
                         window
                     );
                 }
-                return (Ok(out), false);
+                return (Ok(out), false, deferred);
             }
+            // A retry candidate. Its teardown has not run yet (it is deferred)
+            // and must complete before the next capture can start, so the two
+            // costs ADD: the pending release, at the costliest release this
+            // request has measured (or the floor before one has been), plus
+            // the costliest capture, the next attempt's estimate. Capture and
+            // release are kept apart so neither is counted twice across
+            // rounds. A round that settles here keeps its deferral, so the
+            // final refusal is still delivered before the teardown; a round
+            // that retries pays the teardown now, inside its own measured
+            // whole-round cost, as before.
+            let pending_release = if deferred.is_some() {
+                self.last_release_cost.unwrap_or(RELEASE_ALLOWANCE_FLOOR)
+            } else {
+                std::time::Duration::ZERO
+            };
+            let estimate = pending_release + costliest_capture;
+            let retry_wont_fit = deadline.saturating_duration_since(now()) < estimate;
+            if retry_wont_fit {
+                irlume_common::dlog!(
+                    "grace: retry skipped ({}ms left, costliest attempt {}ms); settling",
+                    deadline.saturating_duration_since(now()).as_millis(),
+                    estimate.as_millis()
+                );
+                if attempt > 1 {
+                    irlume_common::dlog!(
+                        "grace: settled after {attempt} attempts ({}ms window)",
+                        window
+                    );
+                }
+                return (Ok(out), false, deferred);
+            }
+            self.release_deferred(deferred, &now);
+            *costliest_attempt = (*costliest_attempt).max(now().duration_since(attempt_started));
             irlume_common::dlog!(
                 "grace: attempt {attempt} has incomplete face evidence ({}); retrying within window",
                 out.reason
@@ -12539,7 +12721,7 @@ mod engine_tests {
         let calls = Cell::new(0);
         let mut costliest = Duration::from_millis(seed_cost_ms);
         e.vit_scores.clear();
-        let (result, fallback) = e.authentication_attempt_loop_with(
+        let (result, fallback, _deferred) = e.authentication_attempt_loop_with(
             start + Duration::from_millis(window_ms),
             window_ms,
             &mut costliest,
@@ -12559,6 +12741,7 @@ mod engine_tests {
                         &(),
                     ),
                     false,
+                    None::<()>,
                 )
             },
             || clock.get(),
@@ -12695,14 +12878,18 @@ mod engine_tests {
             let clock = std::cell::Cell::new(if already_expired { deadline } else { start });
             let mut calls = 0;
             let mut cost = std::time::Duration::ZERO;
-            let (result, fallback) = state.engine.authentication_attempt_loop_with(
+            let (result, fallback, _deferred) = state.engine.authentication_attempt_loop_with(
                 deadline,
                 15_000,
                 &mut cost,
                 |_| {
                     calls += 1;
                     clock.set(deadline);
-                    (Ok(Outcome::grant(1.0, "synthetic late match")), false)
+                    (
+                        Ok(Outcome::grant(1.0, "synthetic late match")),
+                        false,
+                        None::<()>,
+                    )
                 },
                 || clock.get(),
             );
@@ -12885,7 +13072,7 @@ mod engine_tests {
             let deadline = start + std::time::Duration::from_secs(15);
             let clock = std::cell::Cell::new(start);
             let mut cost = std::time::Duration::ZERO;
-            let (result, fallback) = state.engine.authentication_attempt_loop_with(
+            let (result, fallback, _deferred) = state.engine.authentication_attempt_loop_with(
                 deadline,
                 15_000,
                 &mut cost,
@@ -12894,7 +13081,11 @@ mod engine_tests {
                     // just as the real engine's scoped deadline elapsed.
                     engine.authentication_deadline = Some(std::time::Instant::now());
                     clock.set(deadline);
-                    (Ok(Outcome::deny(kind, "completed synthetic denial")), false)
+                    (
+                        Ok(Outcome::deny(kind, "completed synthetic denial")),
+                        false,
+                        None::<()>,
+                    )
                 },
                 || clock.get(),
             );
@@ -12915,14 +13106,18 @@ mod engine_tests {
         let clock = std::cell::Cell::new(start);
         let mut calls = 0;
         let mut cost = std::time::Duration::ZERO;
-        let (result, fallback) = state.engine.authentication_attempt_loop_with(
+        let (result, fallback, _deferred) = state.engine.authentication_attempt_loop_with(
             start,
             0,
             &mut cost,
             |_| {
                 calls += 1;
                 clock.set(start + std::time::Duration::from_secs(20));
-                (Ok(Outcome::grant(1.0, "synthetic one-shot match")), false)
+                (
+                    Ok(Outcome::grant(1.0, "synthetic one-shot match")),
+                    false,
+                    None::<()>,
+                )
             },
             || clock.get(),
         );
@@ -13026,7 +13221,7 @@ mod engine_tests {
             let now = std::time::Instant::now();
             let mut calls = 0;
             let mut costliest = std::time::Duration::ZERO;
-            let (result, fallback) = s.engine.authentication_attempt_loop_with(
+            let (result, fallback, _deferred) = s.engine.authentication_attempt_loop_with(
                 now + std::time::Duration::from_secs(15),
                 15_000,
                 &mut costliest,
@@ -13036,6 +13231,7 @@ mod engine_tests {
                     (
                         Ok(Outcome::grant(1.0, "synthetic match after disconnect")),
                         false,
+                        None::<()>,
                     )
                 },
                 || now,
@@ -13145,7 +13341,7 @@ mod engine_tests {
         ] {
             let mut calls = 0;
             let mut costliest = std::time::Duration::ZERO;
-            let (out, fallback) = e.authentication_attempt_loop_with(
+            let (out, fallback, _deferred) = e.authentication_attempt_loop_with(
                 deadline,
                 15_000,
                 &mut costliest,
@@ -13158,9 +13354,14 @@ mod engine_tests {
                                 "scripted capture error".into(),
                             )),
                             true,
+                            None::<()>,
                         )
                     } else {
-                        (Ok(Outcome::deny(kind, "scripted terminal denial")), false)
+                        (
+                            Ok(Outcome::deny(kind, "scripted terminal denial")),
+                            false,
+                            None::<()>,
+                        )
                     }
                 },
                 || now,
