@@ -176,6 +176,135 @@ pub(crate) fn ensure_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     Ok(persisted)
 }
 
+/// The unsealed template key as the TPM seam returns it: zeroized on drop.
+pub type UnsealedKey = Zeroizing<Vec<u8>>;
+
+/// Lends the account template key to the readers of one authentication
+/// request (ADR-0025). Implementations unseal at most once per request and
+/// lend a borrow, never a copy.
+pub trait TemplateKeySource {
+    /// The key for `user`'s encrypted stores: `None` on a host without a
+    /// TPM (encrypted stores then fail closed in the readers).
+    ///
+    /// # Errors
+    /// Returns the unseal error when the key cannot be obtained.
+    fn template_key(&mut self, user: &str) -> Result<Option<&[u8]>>;
+}
+
+/// One request's template key: adopted from the enrollment load when that
+/// load unsealed, or unsealed lazily on the request's first encrypted read
+/// (a legacy plaintext primary beside an encrypted secondary). Holds the one
+/// memlocked `Zeroizing` allocation the unseal produced and drops it, and
+/// so zeroizes it, with the request.
+pub struct RequestTemplateKey {
+    /// `Some` once the request resolved its key, even to "none available",
+    /// bound to the account it was resolved for.
+    resolved: Option<(String, Option<UnsealedKey>)>,
+    unseals: usize,
+    unseal: Box<Unsealer>,
+}
+
+/// Resolves the key for a user when the request first needs it.
+type Unsealer = dyn FnMut(&str) -> Result<Option<UnsealedKey>> + Send;
+
+impl Default for RequestTemplateKey {
+    fn default() -> Self {
+        Self::production()
+    }
+}
+
+impl std::fmt::Debug for RequestTemplateKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestTemplateKey")
+            .field(
+                "held",
+                &self.resolved.as_ref().is_some_and(|(_, key)| key.is_some()),
+            )
+            .field("unseals", &self.unseals)
+            .finish()
+    }
+}
+
+impl RequestTemplateKey {
+    /// A source that unseals read-only through the TPM when a key is first
+    /// needed, and lends nothing on a host without a TPM.
+    #[must_use]
+    pub fn production() -> Self {
+        Self::with_unsealer(|user| {
+            if !tpm_available() {
+                return Ok(None);
+            }
+            load_key_read_only_unlocked(user).map(Some)
+        })
+    }
+
+    /// A source with an injected unsealer (tests count and script it).
+    pub fn with_unsealer(
+        unseal: impl FnMut(&str) -> Result<Option<UnsealedKey>> + Send + 'static,
+    ) -> Self {
+        Self {
+            resolved: None,
+            unseals: 0,
+            unseal: Box::new(unseal),
+        }
+    }
+
+    /// Adopt the key another loader in this request already unsealed for
+    /// `user`, so no later reader unseals again. `None` leaves the lazy
+    /// path in place.
+    pub fn adopt(&mut self, user: &str, key: Option<UnsealedKey>) {
+        if key.is_some() {
+            self.resolved = Some((user.to_owned(), key));
+        }
+    }
+
+    /// Forget the key (zeroized on drop). Called when the request ends.
+    pub fn clear(&mut self) {
+        self.resolved = None;
+        self.unseals = 0;
+    }
+
+    /// How many times this source unsealed through its unsealer.
+    #[must_use]
+    pub fn unseals(&self) -> usize {
+        self.unseals
+    }
+
+    /// Whether a key is currently held.
+    #[must_use]
+    pub fn holds_key(&self) -> bool {
+        self.resolved.as_ref().is_some_and(|(_, key)| key.is_some())
+    }
+}
+
+impl TemplateKeySource for RequestTemplateKey {
+    fn template_key(&mut self, user: &str) -> Result<Option<&[u8]>> {
+        match &self.resolved {
+            // One resolution per request, whatever it found: a host without
+            // a TPM is not asked again either.
+            Some((owner, _)) if owner == user => {}
+            // A request serves one account. A store that names another
+            // owner does not borrow this account's key; it fails closed as
+            // the per-read resolution did.
+            Some((owner, _)) => {
+                return Err(Error::Policy(format!(
+                    "the request holds '{owner}'s template key; '{user}'s store cannot borrow it"
+                )));
+            }
+            None => {
+                self.unseals += 1;
+                let key = (self.unseal)(user)?;
+                self.resolved = Some((user.to_owned(), key));
+            }
+        }
+        Ok(self
+            .resolved
+            .as_ref()
+            .and_then(|(_, key)| key.as_deref().map(Vec::as_slice)))
+    }
+}
+
 /// Unseal the existing template key for `user`. Errors if none is sealed (the
 /// caller must NOT generate one here; that would orphan already-encrypted data).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
@@ -377,6 +506,47 @@ fn set_0600(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A resolution that found no key is remembered: a host without a TPM
+    /// is asked once per request, not once per encrypted read.
+    #[test]
+    fn a_request_asks_its_unsealer_at_most_once_even_when_no_key_exists() {
+        let mut none = RequestTemplateKey::with_unsealer(|_| Ok(None));
+        assert!(none.template_key("alice").unwrap().is_none());
+        assert!(none.template_key("alice").unwrap().is_none());
+        assert_eq!(none.unseals(), 1);
+        assert!(!none.holds_key());
+
+        let mut some = RequestTemplateKey::with_unsealer(|_| Ok(Some(Zeroizing::new(vec![9; 32]))));
+        assert_eq!(some.template_key("alice").unwrap(), Some(&[9u8; 32][..]));
+        assert_eq!(some.template_key("alice").unwrap(), Some(&[9u8; 32][..]));
+        assert_eq!(some.unseals(), 1);
+        some.clear();
+        assert!(!some.holds_key());
+        assert_eq!(some.unseals(), 0);
+    }
+
+    /// The held key belongs to one account: a store naming another owner
+    /// cannot borrow it and fails closed, as per-read resolution did.
+    #[test]
+    fn a_held_key_is_never_lent_to_another_account() {
+        let mut keys = RequestTemplateKey::with_unsealer(|_| Ok(Some(Zeroizing::new(vec![1; 32]))));
+        keys.adopt("alice", Some(Zeroizing::new(vec![2; 32])));
+        assert_eq!(keys.template_key("alice").unwrap(), Some(&[2u8; 32][..]));
+        let error = keys.template_key("mallory").unwrap_err().to_string();
+        assert!(
+            error.contains("mallory") && error.contains("alice"),
+            "{error}"
+        );
+        assert_eq!(
+            keys.unseals(),
+            0,
+            "no unseal is attempted for the other account"
+        );
+        // The bound key stays available to its own account afterwards.
+        assert_eq!(keys.template_key("alice").unwrap(), Some(&[2u8; 32][..]));
+    }
 
     /// A sandboxed run must not reach live cryptographic state. `IRLUME_STATE_DIR`
     /// moved the profile store but not these two directories, so a sandboxed ROOT
@@ -411,8 +581,6 @@ mod tests {
         assert!(!key.starts_with(irlume_common::STATE_DIR));
         assert!(!rec.starts_with(irlume_common::STATE_DIR));
     }
-
-    use super::*;
 
     #[test]
     fn read_only_key_load_preserves_envelope_while_normal_load_upgrades() {
