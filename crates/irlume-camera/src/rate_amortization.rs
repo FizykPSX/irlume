@@ -30,8 +30,14 @@ pub(crate) const CONTINUITY_PROBE_DELTAS: usize = 5;
 /// scratch - the probe never passes anything the full fill would not.
 pub(crate) const CONTINUITY_PROBE_ESCALATED_DELTAS: usize = 15;
 
-/// How long a completed full window stays reusable. ADR-0021's bound.
-pub(crate) const MAX_STALENESS: Duration = Duration::from_secs(300);
+/// How long a completed full window stays reusable. ADR-0021's bound,
+/// raised from 5 minutes to 24 hours by its 2026-09-22 amendment: the
+/// evidence that admits a session is the probe on THIS session (5 deltas,
+/// escalating to 15) plus the per-frame judgment, so the bound only says
+/// how long ago the stream's full shape was last seen. Five minutes made
+/// almost every real unlock (after more than five minutes away) re-pay the
+/// full 30-delta fill, measured at +1.5 s on a NexiGo N930W pair.
+pub(crate) const MAX_STALENESS: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Rollback valve, house style: `IRLUME_RATE_AMORTIZATION=0` disables reuse.
 fn enabled() -> bool {
@@ -116,11 +122,11 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::force_completion;
     use super::*;
-
-    // The kill switch reads the process environment, so env-sensitive tests
-    // serialize on this lock (kept local; the crate-wide lock lives in
-    // `crate::testenv`, this module predates it).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // The kill switch reads the process environment, so every test that
+    // touches `IRLUME_RATE_AMORTIZATION` (here and the stream-level tests in
+    // `lib.rs`) serializes on the ONE crate-wide lock; a module-local mutex
+    // would leave them racing each other across modules.
+    use crate::testenv::{env_lock, EnvGuard};
 
     fn key() -> Key {
         Key::new("/dev/video-probe", StreamRole::Rgb)
@@ -128,8 +134,8 @@ mod tests {
 
     #[test]
     fn a_recent_completion_is_amortizable_and_invalidation_removes_it() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("IRLUME_RATE_AMORTIZATION");
+        let _g = env_lock();
+        let _env = EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
         force_completion(key(), Some(Instant::now()));
         assert!(amortizable(&key()));
         invalidate(&key());
@@ -138,8 +144,8 @@ mod tests {
 
     #[test]
     fn a_stale_completion_is_not_amortizable() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("IRLUME_RATE_AMORTIZATION");
+        let _g = env_lock();
+        let _env = EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
         force_completion(
             key(),
             Some(Instant::now() - MAX_STALENESS - Duration::from_secs(1)),
@@ -148,13 +154,30 @@ mod tests {
         force_completion(key(), None);
     }
 
+    /// The bound covers a working day of unlocks: a window completed hours
+    /// ago still admits the probe, which is the evidence that matters
+    /// (ADR-0021 amendment of 2026-09-22).
+    #[test]
+    fn a_completion_from_earlier_the_same_day_is_still_amortizable() {
+        let _g = env_lock();
+        let _env = EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
+        force_completion(
+            key(),
+            Some(Instant::now() - Duration::from_secs(8 * 60 * 60)),
+        );
+        assert!(amortizable(&key()));
+        force_completion(key(), None);
+    }
+
     #[test]
     fn the_kill_switch_disables_reuse_even_with_a_fresh_completion() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("IRLUME_RATE_AMORTIZATION", "0");
+        let _g = env_lock();
         force_completion(key(), Some(Instant::now()));
-        assert!(!amortizable(&key()));
-        std::env::remove_var("IRLUME_RATE_AMORTIZATION");
+        {
+            let _off = EnvGuard::set("IRLUME_RATE_AMORTIZATION", "0");
+            assert!(!amortizable(&key()));
+        }
+        let _on = EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
         assert!(amortizable(&key()));
         force_completion(key(), None);
     }
