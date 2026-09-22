@@ -28,6 +28,8 @@ enum Operation {
     Wait,
     Dequeue,
     Retired,
+    /// An ERROR-marked start-up buffer was parked; the next dequeue proceeds.
+    Parked,
 }
 
 /// Preserve which operation failed across the io::Error-based policy layers.
@@ -46,6 +48,7 @@ impl std::fmt::Display for CaptureIoError {
             Operation::Wait => "capture poll",
             Operation::Dequeue => "VIDIOC_DQBUF",
             Operation::Retired => "retired capture queue",
+            Operation::Parked => "parked start-up buffer",
         };
         write!(formatter, "{operation}: {}", self.source)
     }
@@ -76,6 +79,7 @@ pub(super) fn warmup_retry(error: &io::Error) -> Option<bool> {
     let error = capture_error(error)?;
     Some(match error.operation {
         Operation::Queue | Operation::Start | Operation::Retired => false,
+        Operation::Parked => true,
         Operation::Wait | Operation::Dequeue => {
             matches!(error.source.raw_os_error(), Some(libc::EIO | libc::ENODEV))
                 || matches!(
@@ -87,6 +91,32 @@ pub(super) fn warmup_retry(error: &io::Error) -> Option<bool> {
                 )
         }
     })
+}
+
+/// ERROR-marked buffers that may be parked before a stream delivers its first
+/// frame. A Logitech BRIO marks exactly one: the first IR buffer after its RGB
+/// sensor path was used. Two leaves margin without hiding a failing stream.
+const MAX_PARKED_STARTUP_ERRORS: u32 = 2;
+
+/// A parked start-up buffer: the driver returned at once and more frames are
+/// already waiting, so the caller may dequeue again without a gap.
+pub(super) fn parked(error: &io::Error) -> bool {
+    capture_error(error).is_some_and(|error| matches!(error.operation, Operation::Parked))
+}
+
+fn parked_error() -> io::Error {
+    operation_error(
+        Operation::Parked,
+        io::Error::new(
+            io::ErrorKind::Interrupted,
+            "parked an error-marked start-up capture buffer; dequeue again",
+        ),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn parked_error_for_test() -> io::Error {
+    parked_error()
 }
 
 struct Mapping {
@@ -126,6 +156,10 @@ pub(super) struct MmapCapture {
     failed: bool,
     producer: crate::capture_shutdown::Producer,
     stop_attempted: bool,
+    /// ERROR-marked start-up buffers left dequeued: never viewed or requeued.
+    parked: u32,
+    /// Parking ends with the first delivered frame; later ERROR retires the ring.
+    delivered: bool,
     #[cfg(test)]
     fake: Option<Arc<std::sync::Mutex<tests::FakeIo>>>,
 }
@@ -155,6 +189,8 @@ impl MmapCapture {
             failed: false,
             producer: crate::capture_shutdown::Producer::new(),
             stop_attempted: false,
+            parked: 0,
+            delivered: false,
             #[cfg(test)]
             fake: None,
         }
@@ -328,11 +364,28 @@ impl CaptureDequeue for MmapCapture {
         if buf.flags & v4l::buffer::Flags::ERROR.bits() != 0 {
             // Affected UVC cancel paths can publish ERROR before async copies
             // finish. No mapped reference or requeue is permissible here.
-            self.failed = true;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "driver returned an error-marked capture buffer; ring retired",
-            ));
+            //
+            // Some cameras mark a start-up frame as ERROR while the stream
+            // itself is sound. Parking keeps both rules: the buffer stays
+            // dequeued and unviewed until teardown, as in a retired ring, and
+            // the kernel keeps at least one other buffer to fill. The caller
+            // sees a retryable return rather than a loop here, so its
+            // cancellation, lease and watchdog checks run between driver
+            // returns.
+            let remaining = self.buffers.len().saturating_sub(self.parked as usize + 1);
+            if self.delivered || self.parked >= MAX_PARKED_STARTUP_ERRORS || remaining == 0 {
+                self.failed = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "driver returned an error-marked capture buffer; ring retired",
+                ));
+            }
+            self.parked += 1;
+            irlume_common::dlog!(
+                "parked error-marked start-up capture buffer {}",
+                self.parked
+            );
+            return Err(parked_error());
         }
         let Some(mapping) = self.buffers.get(buf.index as usize) else {
             self.failed = true;
@@ -342,6 +395,7 @@ impl CaptureDequeue for MmapCapture {
             ));
         };
         self.held = Some(buf.index);
+        self.delivered = true;
         let metadata = Metadata {
             bytesused: buf.bytesused,
             flags: buf.flags.into(),
