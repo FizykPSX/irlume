@@ -4222,6 +4222,71 @@ pub struct CameraPair {
     /// The descriptor carries a serial (ADR-0024 §6: without one, same-model
     /// units are indistinguishable).
     pub serial_present: bool,
+    /// The USB location (`<bus>-<port>[.<port>…]`, the device directory's
+    /// sysfs name), share-safe (ADR-0030 §5); `None` off USB.
+    pub port_chain: Option<String>,
+    /// First 16 hex of the descriptor fingerprint (ADR-0030 §5).
+    pub descriptor_token: Option<String>,
+}
+
+/// The share-safe location of the camera behind a node (ADR-0030 §5),
+/// read from sysfs without opening the device: the model, the USB port
+/// chain, the descriptor token the diagnostics carry, and whether a
+/// serial exists (the serial itself stays with the caller that needs it
+/// for a keyed discriminator). `None` when the node is not a UVC device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraLocation {
+    pub model: String,
+    pub port_chain: Option<String>,
+    pub descriptor_token: String,
+    pub serial: Option<String>,
+}
+
+/// See [`CameraLocation`]. Sysfs only, and only the USB identity — link
+/// diagnostics that may be absent on a usable camera are not required.
+/// Never authorizes capture.
+#[must_use]
+pub fn camera_location(node: &str) -> Option<CameraLocation> {
+    let identity = uvc_descriptor::identity_for_location(node).ok()?;
+    let fingerprint = identity.descriptor_fingerprint();
+    Some(CameraLocation {
+        model: format!("{:04x}:{:04x}", identity.vid, identity.pid),
+        port_chain: usb_port_chain(&identity.usb_devpath),
+        descriptor_token: fingerprint.get(..16)?.to_owned(),
+        serial: identity.serial,
+    })
+}
+
+/// The locations of every video node sysfs lists (sysfs only, no opens),
+/// so a record's camera can be matched against what is attached now.
+#[must_use]
+pub fn connected_camera_locations() -> Vec<CameraLocation> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/video4linux") else {
+        return Vec::new();
+    };
+    let mut locations: Vec<CameraLocation> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            camera_location(&format!("/dev/{}", entry.file_name().to_string_lossy()))
+        })
+        .collect();
+    locations.sort_by(|a, b| (&a.port_chain, &a.model).cmp(&(&b.port_chain, &b.model)));
+    locations.dedup();
+    locations
+}
+
+/// `<bus>-<port>[.<port>…]` from a sysfs USB device path, or `None` when
+/// the last component does not have that shape.
+fn usb_port_chain(usb_devpath: &str) -> Option<String> {
+    let name = std::path::Path::new(usb_devpath).file_name()?.to_str()?;
+    let (bus, ports) = name.split_once('-')?;
+    let well_formed = bus.bytes().all(|b| b.is_ascii_digit())
+        && !bus.is_empty()
+        && !ports.is_empty()
+        && ports
+            .split('.')
+            .all(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+    well_formed.then(|| name.to_owned())
 }
 
 /// A camera's name for people, read from sysfs without opening a device:
@@ -4435,6 +4500,8 @@ fn pairs_from(nodes: &[(String, Role)]) -> Vec<CameraPair> {
             name: camera_display_name(id, &rgbs[0]),
             identity: device_identity(&rgbs[0]),
             serial_present,
+            port_chain: id.to_str().and_then(usb_port_chain),
+            descriptor_token: camera_location(&rgbs[0]).map(|l| l.descriptor_token),
             rgb: rgbs[0].clone(),
             ir: irs[0].clone(),
             id: read_vidpid(id),
@@ -16658,6 +16725,25 @@ mod tests {
     /// the USB `product` string, then nothing; it is trimmed and bounded
     /// and never feeds identification. The fixture has no sysfs node, so
     /// the product fallback is what these cases exercise.
+    #[test]
+    fn usb_port_chains_come_from_the_device_directory_name() {
+        assert_eq!(
+            usb_port_chain("/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2.3"),
+            Some("1-2.3".into())
+        );
+        assert_eq!(
+            usb_port_chain("/devices/platform/usb3/3-1"),
+            Some("3-1".into())
+        );
+        assert_eq!(
+            usb_port_chain("/sys/devices/pci0000:00/0000:00:14.0/usb1"),
+            None
+        );
+        assert_eq!(usb_port_chain("/sys/devices/x/1-"), None);
+        assert_eq!(usb_port_chain("/sys/devices/x/1-2..3"), None);
+        assert_eq!(camera_location("/dev/irlume-no-such-node"), None);
+    }
+
     #[test]
     fn repeated_node_names_collapse_to_one_copy() {
         assert_eq!(

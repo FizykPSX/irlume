@@ -146,6 +146,7 @@ impl DiagnosticState {
             operation_id: self.next_operation_id(),
             operation,
             finished: Arc::new(AtomicBool::new(false)),
+            capture: Arc::new(Mutex::new(CaptureSpan::default())),
         }
     }
 
@@ -551,11 +552,76 @@ pub(crate) struct OperationScope {
     operation_id: OperationId,
     operation: OperationClass,
     finished: Arc<AtomicBool>,
+    /// The capture time for the attempt record's `capture_ms` (ADR-0030
+    /// §5), accumulated per capture round from the stage timings this
+    /// scope relays; see [`CaptureSpan`].
+    capture: Arc<Mutex<CaptureSpan>>,
+}
+
+/// Capture time per round: a round runs from the start of its first
+/// capture stage (its event's arrival minus its own duration) to the
+/// arrival of its last, and closes when any other stage reports — so the
+/// detection, liveness and matching between retry rounds are not counted.
+/// Concurrent roles overlap within a round; sequential roles add up.
+#[derive(Default)]
+struct CaptureSpan {
+    /// A capture route started (setup, stream arming or a capture stage
+    /// reported), whether or not a capture stage finished.
+    reached: bool,
+    round_start: Option<std::time::Instant>,
+    round_end: Option<std::time::Instant>,
+    closed_ms: u64,
+    longest_stage_us: u64,
+}
+
+/// What the operation's capture stages tell the attempt record (ADR-0030
+/// §5): whether a camera was reached, and the capture time once a capture
+/// stage reported.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CaptureEvidence {
+    /// A capture route started: the camera was reached even when the
+    /// attempt was cancelled or timed out before a capture stage reported.
+    pub(crate) reached: bool,
+    /// The closed rounds' wall time summed, at least the longest single
+    /// stage; `None` when no capture stage reported.
+    pub(crate) capture_ms: Option<u64>,
+}
+
+impl CaptureEvidence {
+    /// A path that never reached a capture route.
+    pub(crate) const NONE: Self = Self {
+        reached: false,
+        capture_ms: None,
+    };
+}
+
+impl CaptureSpan {
+    fn close_round(&mut self) {
+        if let (Some(start), Some(end)) = (self.round_start.take(), self.round_end.take()) {
+            self.closed_ms = self.closed_ms.saturating_add(
+                u64::try_from(end.saturating_duration_since(start).as_millis()).unwrap_or(u64::MAX),
+            );
+        }
+    }
 }
 
 impl OperationScope {
     pub(crate) const fn operation_id(&self) -> OperationId {
         self.operation_id
+    }
+
+    /// The capture evidence so far (ADR-0030 §5); a still-open capture
+    /// round closes here.
+    pub(crate) fn capture_evidence(&self) -> CaptureEvidence {
+        let mut span = self.capture.lock().unwrap_or_else(|e| e.into_inner());
+        let capture_ms = (span.longest_stage_us > 0).then(|| {
+            span.close_round();
+            span.closed_ms.max(span.longest_stage_us.div_ceil(1000))
+        });
+        CaptureEvidence {
+            reached: span.reached,
+            capture_ms,
+        }
     }
 
     #[cfg(test)]
@@ -603,6 +669,33 @@ impl DiagnosticSink for OperationScope {
     }
 
     fn emit_trace(&self, kind: TraceEventKind) {
+        if let TraceEventKind::StageTiming { stage, elapsed_us } = &kind {
+            use irlume_common::diagnostics::TraceStage;
+            let mut span = self.capture.lock().unwrap_or_else(|e| e.into_inner());
+            match stage {
+                // A capture route started; the camera is reached before any
+                // capture stage can report.
+                TraceStage::CaptureSetup
+                | TraceStage::StreamArm
+                | TraceStage::RateEstablishment => {
+                    span.reached = true;
+                    span.close_round();
+                }
+                TraceStage::RgbCapture | TraceStage::IrCapture => {
+                    span.reached = true;
+                    let now = std::time::Instant::now();
+                    let started = now
+                        .checked_sub(std::time::Duration::from_micros(*elapsed_us))
+                        .unwrap_or(now);
+                    let start = span.round_start.map_or(started, |s| s.min(started));
+                    span.round_start = Some(start);
+                    span.round_end = Some(now);
+                    span.longest_stage_us = span.longest_stage_us.max(*elapsed_us);
+                }
+                // Any other stage reporting means the round's capture is over.
+                _ => span.close_round(),
+            }
+        }
         if !self.finished.load(Ordering::Acquire) {
             self.state
                 .emit_trace(self.operation_id, self.operation, kind);
@@ -1037,5 +1130,43 @@ mod tests {
             }
         ));
         assert_eq!(records[2].operation_id, operation.operation_id);
+    }
+
+    #[test]
+    fn capture_evidence_marks_the_camera_reached_and_counts_only_capture_rounds() {
+        use irlume_common::diagnostics::TraceStage;
+        let state = DiagnosticState::default();
+        let scope = state.begin(OperationClass::Authentication);
+        let stage = |stage: TraceStage, elapsed_us: u64| {
+            scope.emit_trace(TraceEventKind::StageTiming { stage, elapsed_us })
+        };
+        assert_eq!(scope.capture_evidence(), CaptureEvidence::NONE);
+
+        // Setup started a capture route: reached, but nothing captured yet
+        // (a cancellation here keeps its camera without a capture time).
+        stage(TraceStage::CaptureSetup, 5_000);
+        assert_eq!(
+            scope.capture_evidence(),
+            CaptureEvidence {
+                reached: true,
+                capture_ms: None,
+            }
+        );
+
+        // Two concurrent roles overlap within a round; the inference between
+        // rounds is not capture time; a second round adds its own span.
+        stage(TraceStage::RgbCapture, 40_000);
+        stage(TraceStage::IrCapture, 30_000);
+        stage(TraceStage::Detection, 400_000);
+        stage(TraceStage::Liveness, 400_000);
+        stage(TraceStage::RgbCapture, 20_000);
+        stage(TraceStage::IrCapture, 20_000);
+        let evidence = scope.capture_evidence();
+        assert!(evidence.reached);
+        let capture_ms = evidence.capture_ms.expect("capture stages reported");
+        // At least the longest single stage, never the two inference stages.
+        assert!((40..400).contains(&capture_ms), "capture_ms = {capture_ms}");
+        // Reading the evidence again neither loses nor double-counts a round.
+        assert_eq!(scope.capture_evidence().capture_ms, Some(capture_ms));
     }
 }

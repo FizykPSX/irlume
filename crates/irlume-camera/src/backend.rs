@@ -514,6 +514,8 @@ pub(crate) mod tests {
                 name: Some("Spy Camera".into()),
                 identity: Some("1234:5678".into()),
                 serial_present: false,
+                port_chain: None,
+                descriptor_token: None,
             }]
         }
 
@@ -570,6 +572,8 @@ pub(crate) mod tests {
                 name: Some("Fixture Built-in".into()),
                 identity: Some("1111:2222:fx1".into()),
                 serial_present: true,
+                port_chain: None,
+                descriptor_token: None,
             },
             CameraPair {
                 rgb: "/dev/usb-rgb".into(),
@@ -579,6 +583,8 @@ pub(crate) mod tests {
                 name: None,
                 identity: None,
                 serial_present: false,
+                port_chain: None,
+                descriptor_token: None,
             },
         ]
     }

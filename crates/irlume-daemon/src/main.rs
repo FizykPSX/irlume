@@ -59,6 +59,7 @@ pub(crate) mod test_support {
 }
 
 mod arbiter;
+mod attempt_record;
 mod diagnostics;
 mod enrollment_session;
 mod live;
@@ -1003,6 +1004,7 @@ fn main() {
                                 link,
                                 scope,
                                 enqueued_at,
+                                mut attempt,
                             } = job.payload;
                             // Queue-wait boundary: submission to this take.
                             note_queue_wait(&scope, enqueued_at);
@@ -1011,6 +1013,17 @@ fn main() {
                             // the slot first, exactly as the normal path does, so the
                             // uid is not locked out of the camera.
                             if !link.claim() {
+                                // A face request whose client left while it
+                                // queued is a cancelled attempt that reached no
+                                // camera (ADR-0030 §5); its surface was taken
+                                // at submission, while the client still existed.
+                                if let Some(attempt) = attempt {
+                                    note_pre_camera_failure(irlume_common::OutcomeCause::Cancelled);
+                                    attempt.file(
+                                        &Response::Error("client left".into()),
+                                        diagnostics::CaptureEvidence::NONE,
+                                    );
+                                }
                                 link.finish_activity();
                                 scope.finish(
                                     irlume_common::diagnostics::CategoricalOutcome::Cancelled,
@@ -1029,6 +1042,13 @@ fn main() {
                             // unwind out of the worker and take down all face auth for
                             // every user.
                             let mut delivery = Delivery::attached(&reply);
+                            // The camera as sysfs describes it now, before the
+                            // engine runs; the attempt is armed on the delivery
+                            // outside the unwind boundary (ADR-0030 §5).
+                            if let Some(attempt) = attempt.as_mut() {
+                                attempt.camera = irlume_auth::camera_location(engine.rgb_device());
+                            }
+                            delivery.attempt = attempt.map(|attempt| (attempt, scope.clone()));
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 dispatch_scoped_session_delivering(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref(), &mut delivery)
                             }));
@@ -1039,6 +1059,7 @@ fn main() {
                             // late disconnect on it must not cancel the next job.
                             link.released();
                             arbiter.finish(job.class, job.uid);
+                            let panicked = outcome.is_err();
                             let resp = match outcome {
                                 Ok(resp) => resp,
                                 Err(_) => {
@@ -1094,6 +1115,18 @@ fn main() {
                                     Response::Error("request failed".into()).into()
                                 }
                             };
+                            // A panicking request is still an attempt (ADR-0030 §5):
+                            // the delivery slot survives the unwind, so an attempt
+                            // no reply took yet is filed as the synthetic failure.
+                            // A decision delivered early carries its own filing.
+                            if panicked {
+                                if let Some((attempt, scope)) = delivery.attempt.take() {
+                                    note_engine_error(&irlume_common::Error::Protocol(
+                                        "request handler panicked".into(),
+                                    ));
+                                    attempt.file(&resp.response, scope.capture_evidence());
+                                }
+                            }
                             link.finish_activity();
                             scope.finish(categorical_outcome(&resp.response));
                             // The client may already be gone; its thread owns that.
@@ -1101,7 +1134,15 @@ fn main() {
                             // call is not sent again; the returned value only
                             // classified the operation above.
                             if !delivery.delivered {
-                                let _ = reply.send(resp);
+                                if let Err(std::sync::mpsc::SendError(resp)) = reply.send(resp) {
+                                    // The connection thread is gone: no reply
+                                    // reaches the client, so a grant is not one.
+                                    if let Some(filing) = resp.filing {
+                                        filing
+                                            .undelivered(irlume_common::OutcomeCause::Cancelled)
+                                            .commit();
+                                    }
+                                }
                             }
                             // Back to waiting for work: idle is healthy, and leaving the
                             // last job's timestamp behind would read as a wedge (#141).
@@ -1271,7 +1312,17 @@ fn recorded_face_response(
 ) -> Response {
     match record() {
         Ok(()) => complete(),
-        Err(reason) => refuse(reason),
+        Err(reason) => {
+            // The face was decided and the camera used; only the retry
+            // accounting failed. The refusal reply must not read as a
+            // pre-camera policy refusal in the record (ADR-0030 §5).
+            let refused = refuse(reason);
+            note_decided(match &refused {
+                Response::AuthResult { cause, .. } => *cause,
+                _ => Some(irlume_common::OutcomeCause::RetryThrottled),
+            });
+            refused
+        }
     }
 }
 
@@ -1349,6 +1400,7 @@ impl EarlyRefusal {
 /// The wire shape of a pre-engine refusal: policy-refused, no situation
 /// (no camera ran), and the refusal's own cause.
 fn early_refusal(refusal: EarlyRefusal, reason: impl Into<String>) -> Response {
+    note_pre_camera(refusal.cause());
     Response::AuthResult {
         granted: false,
         score: 0.0,
@@ -1366,6 +1418,7 @@ fn retry_verify_refusal(reason: &str) -> Response {
 }
 
 fn retry_unseal_refusal(reason: &str) -> Response {
+    note_pre_camera(irlume_common::OutcomeCause::RetryThrottled);
     Response::Error(reason.into())
 }
 
@@ -1505,6 +1558,19 @@ fn authorized_for(peer: &Peer, target_user: &str) -> bool {
     peer.uid == 0 || uid_of(target_user).is_some_and(|u| u == peer.uid)
 }
 
+/// Whether a refusal at the door belongs in the named account's history
+/// (ADR-0030 §5): only a peer that may act for that account leaves a
+/// trace there — root, or the account itself for a verification; the
+/// credential release is root's alone. Otherwise any local user could
+/// write attempts into another account's record.
+fn peer_may_file_for(req: &Request, peer: &Peer) -> bool {
+    match (req, posture(req).user) {
+        (Request::UnsealPassword { .. }, _) => peer.uid == 0,
+        (_, Some(user)) => authorized_for(peer, user),
+        (_, None) => false,
+    }
+}
+
 /// The daemon's OWN AppArmor confinement label (e.g. "irlumed (enforce)",
 /// "irlumed (complain)", "unconfined") from /proc/self/attr, or None when
 /// AppArmor is not enabled on this boot. Reported in Health so the TUI shows the
@@ -1615,6 +1681,10 @@ struct FaceCompletion {
 struct WorkerReply {
     response: Response,
     completion: Option<FaceCompletion>,
+    /// The attempt record entry prepared for this reply (ADR-0030 §5),
+    /// committed once the reply is admitted and written: a grant that
+    /// never reaches the client is filed as a failure instead.
+    filing: Option<attempt_record::Pending>,
 }
 
 /// The worker's reply channel, lent to the Authenticate arm so the decision
@@ -1625,6 +1695,11 @@ struct WorkerReply {
 struct Delivery<'a> {
     sender: Option<&'a std::sync::mpsc::Sender<WorkerReply>>,
     delivered: bool,
+    /// The attempt to file with the reply (ADR-0030 §5), with the scope
+    /// whose capture evidence it needs. Whichever sends the reply takes
+    /// it — the early hook or the ordinary return path — and a panic finds
+    /// it still here when no reply went out.
+    attempt: Option<(AttemptContext, diagnostics::OperationScope)>,
 }
 
 impl<'a> Delivery<'a> {
@@ -1635,6 +1710,7 @@ impl<'a> Delivery<'a> {
         Self {
             sender: None,
             delivered: false,
+            attempt: None,
         }
     }
 
@@ -1642,28 +1718,39 @@ impl<'a> Delivery<'a> {
         Self {
             sender: Some(sender),
             delivered: false,
+            attempt: None,
         }
     }
 
     /// Send the reply now. Returns false when there is no channel or the
     /// connection thread is gone; the caller then returns the reply as
     /// before and nothing is lost. Never sends twice.
-    fn send(&mut self, reply: WorkerReply) -> bool {
+    fn send(&mut self, mut reply: WorkerReply) -> bool {
         if self.delivered {
             return true;
         }
         let Some(sender) = self.sender else {
             return false;
         };
+        // The reply takes the attempt with it: filed by the connection
+        // thread once the reply is admitted (ADR-0030 §5).
+        if let Some((attempt, scope)) = self.attempt.take() {
+            reply.filing = Some(attempt.prepare(&reply.response, scope.capture_evidence()));
+        }
         match sender.send(reply) {
             Ok(()) => {
                 self.delivered = true;
                 true
             }
-            Err(_) => {
+            Err(std::sync::mpsc::SendError(reply)) => {
                 jout_warn!(
                     "irlumed: decision ready before camera release, but the connection thread is gone"
                 );
+                if let Some(filing) = reply.filing {
+                    filing
+                        .undelivered(irlume_common::OutcomeCause::Cancelled)
+                        .commit();
+                }
                 false
             }
         }
@@ -1730,6 +1817,7 @@ impl From<Response> for WorkerReply {
         Self {
             response,
             completion: None,
+            filing: None,
         }
     }
 }
@@ -1743,10 +1831,19 @@ fn is_face_grant(response: &Response) -> bool {
 
 impl WorkerReply {
     fn respond(self, stream: UnixStream) -> std::io::Result<()> {
-        let Some(completion) = self.completion.filter(|_| is_face_grant(&self.response)) else {
-            return respond(stream, &self.response);
+        let WorkerReply {
+            response,
+            completion,
+            filing,
+        } = self;
+        let Some(completion) = completion.filter(|_| is_face_grant(&response)) else {
+            let result = respond(stream, &response);
+            if let Some(filing) = filing {
+                filing.commit();
+            }
+            return result;
         };
-        let result = respond_admitted(stream, &self.response, |stream| {
+        let result = respond_admitted(stream, &response, |stream| {
             let timeout = completion
                 .window
                 .remaining()
@@ -1767,18 +1864,41 @@ impl WorkerReply {
             }
             // Last admission check, after serialization and before the first
             // byte. A partial write cannot be retracted if expiry arrives later.
-            completion.window.check().map_err(std::io::Error::other)?;
+            let expired = |e| std::io::Error::new(std::io::ErrorKind::TimedOut, e);
+            completion.window.check().map_err(expired)?;
             if let Some(binding) = &completion.shared_unlock {
                 binding.validate().map_err(std::io::Error::other)?;
             }
-            completion.window.check().map_err(std::io::Error::other)
+            completion.window.check().map_err(expired)
         });
         if result.is_ok() && completion.attempt.delivered().is_err() {
             // The admitted response cannot be retracted. Disk stays authoritative;
             // retain conservative accounting and never send a second response.
             jout_warn!("irlumed: delivered face response; retry reset was not confirmed");
         }
+        // The record says what the client got (ADR-0030 §5): a grant that
+        // was not admitted or not written is a failure, not a grant.
+        if let Some(filing) = filing {
+            match &result {
+                Ok(()) => filing.commit(),
+                Err(e) => filing.undelivered(undelivered_cause(e)).commit(),
+            }
+        }
         result
+    }
+}
+
+/// Why an admitted grant never reached the client, for its record.
+fn undelivered_cause(error: &std::io::Error) -> irlume_common::OutcomeCause {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::TimedOut => irlume_common::OutcomeCause::TimedOut,
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::BrokenPipe
+        | ErrorKind::NotConnected
+        | ErrorKind::WriteZero => irlume_common::OutcomeCause::Cancelled,
+        _ => irlume_common::OutcomeCause::Other,
     }
 }
 
@@ -1795,6 +1915,10 @@ struct Queued {
     /// Submission instant, from which the worker measures the queue-wait
     /// boundary. Set immediately before `arbiter.submit`.
     enqueued_at: std::time::Instant,
+    /// The attempt this face request is (ADR-0030 §5), snapshotted at
+    /// submission while the peer's login session is still resolvable; the
+    /// worker adds the camera and files it with the reply.
+    attempt: Option<AttemptContext>,
 }
 
 /// The handshake between one connection thread and the camera worker, so work a
@@ -3032,22 +3156,81 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             ir_scope_index: None,
         },
         // A face attempt refused because the engine is still loading is a
-        // pre-camera refusal with its own cause (ADR-0030 §5). A client
-        // that asked for typed errors gets a retryable operational failure
-        // (the daemon is unavailable, no face was tested); a legacy client
-        // gets the refusal in the shape it decodes.
+        // pre-camera refusal with its own cause (ADR-0030 §5); the record
+        // files it too, with its surface. A client that asked for typed
+        // errors gets a retryable operational failure (the daemon is
+        // unavailable, no face was tested); a legacy client gets the
+        // refusal in the shape it decodes.
         Request::Authenticate {
-            structured_errors: true,
+            user,
+            service,
+            structured_errors,
             ..
-        } => Response::OperationError {
-            code: irlume_common::OperationErrorCode::OperationFailed,
-            retryable: true,
-            cause: Some(EarlyRefusal::DaemonStarting.cause()),
-        },
-        Request::Authenticate { .. } => early_refusal(
-            EarlyRefusal::DaemonStarting,
-            "irlumed is still starting (loading models); retry, or use your password",
-        ),
+        } => {
+            attempt_record::record_in_background(
+                user.clone(),
+                attempt_record::Filed {
+                    at: attempt_record::unix_now(),
+                    kind: irlume_common::AttemptKind::Authenticate,
+                    surface: attempt_surface(&user, service.as_deref(), peer),
+                    result: irlume_common::AttemptResult::Failed,
+                    cause: Some(EarlyRefusal::DaemonStarting.cause()),
+                    elapsed_ms: 0,
+                    capture_ms: None,
+                    camera: None,
+                },
+            );
+            if structured_errors {
+                Response::OperationError {
+                    code: irlume_common::OperationErrorCode::OperationFailed,
+                    retryable: true,
+                    cause: Some(EarlyRefusal::DaemonStarting.cause()),
+                }
+            } else {
+                early_refusal(
+                    EarlyRefusal::DaemonStarting,
+                    "irlumed is still starting (loading models); retry, or use your password",
+                )
+            }
+        }
+        Request::UnsealPassword { user, service } => {
+            attempt_record::record_in_background(
+                user.clone(),
+                attempt_record::Filed {
+                    at: attempt_record::unix_now(),
+                    kind: irlume_common::AttemptKind::Authenticate,
+                    surface: attempt_surface(&user, service.as_deref(), peer),
+                    result: irlume_common::AttemptResult::Failed,
+                    cause: Some(EarlyRefusal::DaemonStarting.cause()),
+                    elapsed_ms: 0,
+                    capture_ms: None,
+                    camera: None,
+                },
+            );
+            Response::Error(
+                "irlumed is still starting (loading models); retry, or use your password".into(),
+            )
+        }
+        Request::Identify => {
+            if let IdentifyScope::SelfOnly(name) = identify_scope(peer) {
+                attempt_record::record_in_background(
+                    name.clone(),
+                    attempt_record::Filed {
+                        at: attempt_record::unix_now(),
+                        kind: irlume_common::AttemptKind::Identify,
+                        surface: irlume_common::AttemptSurface::Other,
+                        result: irlume_common::AttemptResult::Failed,
+                        cause: Some(EarlyRefusal::DaemonStarting.cause()),
+                        elapsed_ms: 0,
+                        capture_ms: None,
+                        camera: None,
+                    },
+                );
+            }
+            Response::Error(
+                "irlumed is still starting (loading models); retry, or use your password".into(),
+            )
+        }
         _ => Response::Error(
             "irlumed is still starting (loading models); retry, or use your password".into(),
         ),
@@ -3116,6 +3299,7 @@ fn serve_peer(
                     | Request::SupportSnapshot { .. }
                     | Request::FaceSensorStatus { .. }
                     | Request::PreferencesStatus
+                    | Request::LastAttempts { .. }
             ) {
                 if let Some(resp) = pregate(&req, &peer) {
                     return respond(stream, &resp);
@@ -3142,9 +3326,20 @@ fn serve_peer(
             }
             if let Some(resp) = pregate(&req, &peer) {
                 // This is a completed production request even though it never
-                // queues: retain its failed Status diagnostic before replying.
+                // queues: retain its failed Status diagnostic before replying,
+                // and file a refused face attempt (ADR-0030 §5) — it named
+                // no camera.
                 let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
                 scope.finish(categorical_outcome(&resp));
+                if peer_may_file_for(&req, &peer) {
+                    if let Some(attempt) = AttemptContext::for_request(&req, &peer, || None) {
+                        // Whatever the reply shape, an authority or
+                        // confirmation refusal is a policy decision before
+                        // any camera.
+                        note_pre_camera(irlume_common::OutcomeCause::Policy);
+                        attempt.file(&resp, diagnostics::CaptureEvidence::NONE);
+                    }
+                }
                 return respond(stream, &resp);
             }
             let authorization = match operation_authorization::authorize(&req, &peer, &stream) {
@@ -3204,7 +3399,12 @@ fn serve_peer(
                 activity: activity.clone(),
                 ..ClientLink::default()
             });
+            // Built before the request moves into the job: a refusal at the
+            // door is a completed attempt that reached no camera (ADR-0030
+            // §5), and only the refusal branch uses it.
+            let refused_attempt = AttemptContext::for_request(&req, &peer, || None);
             let queued = Queued {
+                attempt: AttemptContext::for_request(&req, &peer, || None),
                 authorization,
                 session,
                 position,
@@ -3222,6 +3422,14 @@ fn serve_peer(
                 // time rather than costing a thread per attempt (#142).
                 record_refusal(peer.uid);
                 scope.finish(irlume_common::diagnostics::CategoricalOutcome::Unavailable);
+                if let Some(attempt) = refused_attempt {
+                    // Contention is a failure to run, not a refusal of a face.
+                    note_pre_camera_failure(irlume_common::OutcomeCause::CameraUnavailable);
+                    attempt.file(
+                        &Response::Error(refusal.message().into()),
+                        diagnostics::CaptureEvidence::NONE,
+                    );
+                }
                 return respond(stream, &Response::Error(refusal.message().into()));
             }
             if let Some(activity) = &activity {
@@ -3679,6 +3887,13 @@ fn posture(req: &Request) -> RequestPosture<'_> {
                 AnyPeer
             },
             user: user.as_deref(),
+            enrollment: Reads,
+        },
+        // The attempt record is the account's own non-biometric history
+        // (ADR-0030 §5): the account and root, like FaceSensorStatus.
+        LastAttempts { user } => RequestPosture {
+            privilege: RootOrTarget { verb: "query" },
+            user: Some(user.as_str()),
             enrollment: Reads,
         },
         Ping
@@ -4218,6 +4433,7 @@ fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
 
 /// Preserve legacy replies unless the caller can understand typed errors.
 fn authentication_error(error: irlume_common::Error, structured: bool) -> Response {
+    note_engine_error(&error);
     if structured {
         // ADR-0030 §5: the cause comes from the typed variant, never the
         // text; it rides beside the code the client already branches on.
@@ -4455,6 +4671,10 @@ fn dispatch_status_with_diagnostics(
             Response::PreferencesStatus(irlume_common::PreferencesState::observe())
         }
         Request::FaceSensorStatus { user: Some(_) } => return None,
+        // Root-only file under the state directory; no engine, no camera.
+        Request::LastAttempts { user } => {
+            Response::LastAttempts(attempt_record::load(user).unwrap_or_default())
+        }
         Request::FaceSensorStatus { user: None } => Response::FaceSensorStatus {
             policy: irlume_common::config::observe_face_sensor_policy(),
             ir_readiness: None,
@@ -5208,6 +5428,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | SetCamerasIfCurrent { .. }
         | FaceSensorStatus { .. }
         | PreferencesStatus
+        | LastAttempts { .. }
         | ListProfiles { .. }
         | DeleteProfile { .. }
         | DeleteScan { .. }
@@ -5323,6 +5544,281 @@ fn set_cameras_if_current(
     set_camera_devices(rgb, ir, engine)
 }
 
+/// What the attempt record needs from a request before it is served
+/// (ADR-0030 §5); filed from the reply that was actually sent.
+struct AttemptContext {
+    user: String,
+    kind: irlume_common::AttemptKind,
+    surface: irlume_common::AttemptSurface,
+    started: std::time::Instant,
+    /// The configured camera as sysfs described it when the request
+    /// arrived — resolved before the engine runs, so an attempt that ends
+    /// because the camera went away is still filed under that camera.
+    camera: Option<irlume_auth::CameraLocation>,
+}
+
+/// What a prose reply on this thread cannot say for itself: the cause the
+/// site decided, whether it was a decision against a face rather than a
+/// failure before one, and whether it was decided before any camera.
+#[derive(Clone, Copy, Debug)]
+struct ReplyFacts {
+    cause: Option<irlume_common::OutcomeCause>,
+    decided: bool,
+    pre_camera: bool,
+}
+
+thread_local! {
+    /// Facts about the reply being built on this thread, for the attempt
+    /// record (ADR-0030 §5); cleared when a face request begins.
+    static REPLY_FACTS: std::cell::Cell<Option<ReplyFacts>> = const { std::cell::Cell::new(None) };
+}
+
+/// An engine error became the reply: its typed cause, a failure, camera
+/// reachability left to the evidence.
+fn note_engine_error(error: &irlume_common::Error) {
+    REPLY_FACTS.with(|cell| {
+        cell.set(Some(ReplyFacts {
+            cause: Some(error.cause()),
+            decided: false,
+            pre_camera: false,
+        }))
+    });
+}
+
+/// A refusal decided before any camera was selected became the reply.
+fn note_pre_camera(cause: irlume_common::OutcomeCause) {
+    REPLY_FACTS.with(|cell| {
+        cell.set(Some(ReplyFacts {
+            cause: Some(cause),
+            decided: true,
+            pre_camera: true,
+        }))
+    });
+}
+
+/// A failure before any camera (the daemon or the camera arbitration
+/// refused to run the attempt): not a decision about a face.
+fn note_pre_camera_failure(cause: irlume_common::OutcomeCause) {
+    REPLY_FACTS.with(|cell| {
+        cell.set(Some(ReplyFacts {
+            cause: Some(cause),
+            decided: false,
+            pre_camera: true,
+        }))
+    });
+}
+
+/// An engine outcome became a prose reply: a decision against a face,
+/// unless its cause says the engine could not decide (timed out, no
+/// comparable enrollment, an unmeasurable exposure).
+fn note_outcome(cause: Option<irlume_common::OutcomeCause>) {
+    REPLY_FACTS.with(|cell| {
+        cell.set(Some(ReplyFacts {
+            cause,
+            decided: !cause.is_some_and(irlume_common::OutcomeCause::is_operational),
+            pre_camera: false,
+        }))
+    });
+}
+
+/// A new request on this thread: no site has said anything yet.
+fn reset_reply_facts() {
+    REPLY_FACTS.with(|cell| cell.set(None));
+}
+
+/// A decision against a face became a prose reply.
+fn note_decided(cause: Option<irlume_common::OutcomeCause>) {
+    REPLY_FACTS.with(|cell| {
+        cell.set(Some(ReplyFacts {
+            cause,
+            decided: true,
+            pre_camera: false,
+        }))
+    });
+}
+
+/// The surface an authentication serves (ADR-0030 §5): the operation
+/// class with the session state bound to this login; `Other` only when
+/// the account cannot be resolved. The gate keeps its own classification.
+fn attempt_surface(
+    user: &str,
+    service: Option<&str>,
+    peer: &Peer,
+) -> irlume_common::AttemptSurface {
+    // Unresolvable session state is `Other` in the record (the contract),
+    // even though policy would treat it as cold: a dual-purpose greeter
+    // must not be filed as a login on a guess.
+    crate::users::uid_for_name(user)
+        .and_then(|uid| attempt_record::session_state_for(peer.pid, uid))
+        .map(|state| irlume_core::biopolicy::classify(service.unwrap_or(""), state))
+        .map(attempt_record::surface_for)
+        .unwrap_or(irlume_common::AttemptSurface::Other)
+}
+
+impl AttemptContext {
+    /// `camera` resolves the configured camera's location now (sysfs, no
+    /// opens); a path that never reaches a camera passes `|| None`.
+    fn for_request(
+        req: &Request,
+        peer: &Peer,
+        camera: impl FnOnce() -> Option<irlume_auth::CameraLocation>,
+    ) -> Option<Self> {
+        reset_reply_facts();
+        let (user, kind, surface) = match req {
+            // The verify path and the cold-login credential-release path
+            // are both face authentications.
+            Request::Authenticate { user, service, .. }
+            | Request::UnsealPassword { user, service } => (
+                user.clone(),
+                irlume_common::AttemptKind::Authenticate,
+                attempt_surface(user, service.as_deref(), peer),
+            ),
+            Request::Identify => {
+                // Root's account-less identify has no account to file under.
+                let IdentifyScope::SelfOnly(name) = identify_scope(peer) else {
+                    return None;
+                };
+                (
+                    name,
+                    irlume_common::AttemptKind::Identify,
+                    irlume_common::AttemptSurface::Other,
+                )
+            }
+            _ => return None,
+        };
+        Some(Self {
+            user,
+            kind,
+            surface,
+            started: std::time::Instant::now(),
+            camera: camera(),
+        })
+    }
+
+    /// File the attempt from the reply now: the camera snapshot is attached
+    /// only when the attempt reached a camera; `capture` is what the
+    /// operation's capture stages reported. The durable write (a lock and
+    /// two syncs) runs on its own thread: the record is history and never
+    /// delays the reply or the camera worker.
+    fn file(self, response: &Response, capture: diagnostics::CaptureEvidence) {
+        self.prepare(response, capture).commit();
+    }
+
+    /// Prepare the entry from the reply, on the thread that built it (the
+    /// reply facts are thread-local); the caller commits it once the reply
+    /// is delivered.
+    fn prepare(
+        self,
+        response: &Response,
+        capture: diagnostics::CaptureEvidence,
+    ) -> attempt_record::Pending {
+        use irlume_common::{AttemptResult, OutcomeCause};
+        let facts = REPLY_FACTS.with(|cell| cell.get());
+        // The site that built the reply says whether it was a decision and
+        // whether it came before any camera; the reply's shape is only the
+        // fallback when no site said (an engine verdict).
+        // A site that noted its facts is believed (a throttle or a disabled
+        // method is a pre-camera refusal); otherwise an operational cause on
+        // an engine verdict (timed out, no comparable enrollment, an
+        // unmeasurable exposure) is the engine failing to decide, not a
+        // decision about the face.
+        let decided_for = |cause: &Option<OutcomeCause>| {
+            facts.map_or(!cause.is_some_and(OutcomeCause::is_operational), |f| {
+                f.decided
+            })
+        };
+        let pre_camera = facts.is_some_and(|f| f.pre_camera);
+        let (result, cause, pre_camera) = match response {
+            Response::AuthResult {
+                granted,
+                refused_by_policy,
+                cause,
+                ..
+            } => (
+                attempt_record::result_of(*granted, decided_for(cause)),
+                *cause,
+                pre_camera || (*refused_by_policy && facts.is_none()),
+            ),
+            Response::Identified { cause, .. } => (
+                attempt_record::result_of(false, decided_for(cause)),
+                *cause,
+                pre_camera,
+            ),
+            // The credential-release grant.
+            Response::PasswordUnsealed { .. } => (AttemptResult::Granted, None, false),
+            // A credential-release refusal before any capture.
+            Response::UnsealUnavailable { .. } => (
+                AttemptResult::Refused,
+                facts.and_then(|f| f.cause).or(Some(OutcomeCause::Policy)),
+                true,
+            ),
+            Response::OperationError { cause, .. } => (
+                attempt_record::result_of(false, facts.is_some_and(|f| f.decided)),
+                *cause,
+                pre_camera,
+            ),
+            Response::Error(_) => match facts {
+                Some(f) => (
+                    attempt_record::result_of(false, f.decided),
+                    f.cause,
+                    f.pre_camera,
+                ),
+                None => (AttemptResult::Failed, None, false),
+            },
+            _ => return attempt_record::Pending::nothing(),
+        };
+        // The camera is named on evidence, not on the cause alone: a grant,
+        // a capture route that started (even one cancelled or timed out
+        // before a capture stage reported), or a failure of the camera
+        // itself. A setup refusal or a budget expiry with no capture
+        // evidence names none — the engine refuses those before any lease.
+        // Identification runs through the engine's plain assessment, which
+        // reports no capture stages: a verdict about a face — a match, or a
+        // refusal of one — is itself the evidence that a camera captured one.
+        let face_verdict = match response {
+            Response::Identified { user, cause, .. } => {
+                user.is_some() || cause.is_some_and(OutcomeCause::is_face_verdict)
+            }
+            _ => false,
+        };
+        let reached_camera = !pre_camera
+            && (matches!(result, AttemptResult::Granted)
+                || capture.reached
+                || capture.capture_ms.is_some()
+                || face_verdict
+                || matches!(
+                    cause,
+                    Some(OutcomeCause::CameraUnavailable | OutcomeCause::PrivacyShutter)
+                ));
+        // A match on identify is not a grant of anything, but the record
+        // shows a recognised face as the engine reported it.
+        let result = match (self.kind, response) {
+            (irlume_common::AttemptKind::Identify, Response::Identified { user, .. })
+                if user.is_some() =>
+            {
+                AttemptResult::Granted
+            }
+            _ => result,
+        };
+        let camera = if reached_camera { self.camera } else { None };
+        let filed = attempt_record::Filed {
+            at: attempt_record::unix_now(),
+            kind: self.kind,
+            surface: self.surface,
+            result,
+            cause,
+            elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            capture_ms: if reached_camera {
+                capture.capture_ms
+            } else {
+                None
+            },
+            camera,
+        };
+        attempt_record::Pending::new(self.user, filed)
+    }
+}
+
 #[cfg(test)]
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
     let state = diagnostics::DiagnosticState::default();
@@ -5342,7 +5838,12 @@ fn dispatch_scoped(
 ) -> Response {
     // Returning a value is not delivery. An unacknowledged token is dropped
     // conservatively; reset tests exercise the production socket responder.
-    dispatch_scoped_session(req, peer, engine, scope, authorization, None, None).response
+    let reply = dispatch_scoped_session(req, peer, engine, scope, authorization, None, None);
+    // Tests deliver nothing: the returned reply is what the client got.
+    if let Some(filing) = reply.filing {
+        filing.commit();
+    }
+    reply.response
 }
 
 #[cfg(test)]
@@ -5383,6 +5884,16 @@ fn dispatch_scoped_session_delivering(
     delivery: &mut Delivery<'_>,
 ) -> WorkerReply {
     let mut completion = None;
+    // Armed on the delivery, outside the arms: whichever path sends the
+    // reply files the attempt with it (ADR-0030 §5). The worker arms it
+    // from the submission snapshot; a test dispatch arms it here.
+    reset_reply_facts();
+    if delivery.attempt.is_none() {
+        delivery.attempt = AttemptContext::for_request(&req, peer, || {
+            irlume_auth::camera_location(engine.rgb_device())
+        })
+        .map(|attempt| (attempt, scope.clone()));
+    }
     let response = dispatch_scoped_session_inner(
         req,
         peer,
@@ -5397,9 +5908,17 @@ fn dispatch_scoped_session_delivering(
     if !is_face_grant(&response) {
         completion = None;
     }
+    // Prepared after the reply is built and committed once it is delivered
+    // (an early delivery took it already): the record is history and never
+    // delays a decision.
+    let filing = delivery
+        .attempt
+        .take()
+        .map(|(attempt, _)| attempt.prepare(&response, scope.capture_evidence()));
     WorkerReply {
         response,
         completion,
+        filing,
     }
 }
 
@@ -5642,6 +6161,7 @@ fn dispatch_scoped_session_inner(
         | Request::Health
         | Request::FaceSensorStatus { user: None }
         | Request::PreferencesStatus
+        | Request::LastAttempts { .. }
         | Request::HasSealedPassword { .. }
         | Request::KeyringMetadata { .. }
         | Request::RecoveryStatus { .. }
@@ -5869,6 +6389,7 @@ fn dispatch_scoped_session_inner(
                     let sent = delivery.send(WorkerReply {
                         response: response.clone(),
                         completion: completed.take().filter(|_| is_face_grant(&response)),
+                        filing: None,
                     });
                     if !sent {
                         // No channel (or the connection thread is gone): the
@@ -5921,6 +6442,7 @@ fn dispatch_scoped_session_inner(
             if camera_probe_rate_limited(peer.uid) {
                 // A pre-camera refusal with its own cause (ADR-0030 §5), in
                 // the reply shape every identify client already decodes.
+                note_pre_camera(irlume_common::OutcomeCause::RetryThrottled);
                 return Response::Identified {
                     user: None,
                     profile: None,
@@ -5935,9 +6457,13 @@ fn dispatch_scoped_session_inner(
             // is enrolled. Root keeps the full cross-user search (admin/test);
             // a non-root peer is scoped to its OWN account; the score then only
             // concerns a face the caller already controls, not other users'.
+            // The scope sees the capture stages, so the attempt record can
+            // name the camera a decided or failed identification reached.
             let scoped = match identify_scope(peer) {
-                IdentifyScope::Full => engine.identify(),
-                IdentifyScope::SelfOnly(name) => engine.identify_within(&name),
+                IdentifyScope::Full => engine.identify_with_diagnostics(scope),
+                IdentifyScope::SelfOnly(name) => {
+                    engine.identify_within_with_diagnostics(&name, scope)
+                }
                 IdentifyScope::NoAccount => Ok(irlume_auth::IdentifyOutcome {
                     user: None,
                     profile: None,
@@ -5948,25 +6474,38 @@ fn dispatch_scoped_session_inner(
                 }),
             };
             match scoped {
-                Ok(o) => Response::Identified {
-                    cause: o.cause,
-                    user: o.user,
-                    profile: o.profile,
-                    score: o.score,
-                    live: o.live,
-                    reason: o.reason,
-                },
+                Ok(o) => {
+                    // Face disabled by the method policy is decided before
+                    // any camera: the same pre-camera refusal the
+                    // Authenticate path files (ADR-0030 §5).
+                    if o.cause == Some(irlume_common::OutcomeCause::MethodNotAvailable) {
+                        note_pre_camera(irlume_common::OutcomeCause::MethodNotAvailable);
+                    }
+                    Response::Identified {
+                        cause: o.cause,
+                        user: o.user,
+                        profile: o.profile,
+                        score: o.score,
+                        live: o.live,
+                        reason: o.reason,
+                    }
+                }
                 // An engine failure is a typed refusal in the reply shape
                 // every identify client decodes (ADR-0030 §5); the prose
-                // stays in `reason`.
-                Err(e) => Response::Identified {
-                    cause: Some(e.cause()),
-                    user: None,
-                    profile: None,
-                    score: 0.0,
-                    live: false,
-                    reason: e.to_string(),
-                },
+                // stays in `reason` and the record reads the cause from it.
+                Err(e) => {
+                    // A failure, not a decision about a face: the record
+                    // files it as such (ADR-0030 §5).
+                    note_engine_error(&e);
+                    Response::Identified {
+                        cause: Some(e.cause()),
+                        user: None,
+                        profile: None,
+                        score: 0.0,
+                        live: false,
+                        reason: e.to_string(),
+                    }
+                }
             }
         }
         Request::SetCamerasIfCurrent { rgb, ir, expected } => set_cameras_if_current(
@@ -6330,6 +6869,7 @@ fn dispatch_scoped_session_inner(
             // Same method gate as Authenticate: fingerprint-configured means no
             // face-driven credential release either.
             if irlume_core::policy::method().face_disabled() {
+                note_pre_camera(irlume_common::OutcomeCause::MethodNotAvailable);
                 return Response::Error(
                     "face auth disabled: the configured method is fingerprint".into(),
                 );
@@ -6337,7 +6877,10 @@ fn dispatch_scoped_session_inner(
             let sensor_policy = match irlume_common::config::observe_face_sensor_policy().resolve()
             {
                 Ok(policy) => policy,
-                Err(error) => return Response::Error(error.to_string()),
+                Err(error) => {
+                    note_pre_camera(irlume_common::OutcomeCause::Configuration);
+                    return Response::Error(error.to_string());
+                }
             };
             let tier = face_tier(sensor_policy, engine.tier());
             // ALWAYS-ON: a polkit prompt never releases the sealed credential,
@@ -6354,6 +6897,7 @@ fn dispatch_scoped_session_inner(
                     "irlumed: UnsealPassword refused for polkit service '{}' (verify-only class)",
                     journal_safe(svc)
                 );
+                    note_pre_camera(irlume_common::OutcomeCause::Policy);
                     return Response::Error(format!(
                         "'{svc}' is verify-only: a polkit prompt never releases the credential"
                     ));
@@ -6363,6 +6907,7 @@ fn dispatch_scoped_session_inner(
             // sealed credential: no cold-login / keyring unlock by RGB-only face.
             if tier == irlume_core::biopolicy::Tier::Convenience {
                 jout_notice!("irlumed: convenience(RGB-only) refuses credential release for '{user}' -> password");
+                note_pre_camera(irlume_common::OutcomeCause::Policy);
                 return Response::UnsealUnavailable {
                     reason: "RGB-only convenience: face cannot release the login credential".into(),
                 };
@@ -6389,6 +6934,7 @@ fn dispatch_scoped_session_inner(
                     "irlumed: biopolicy denies unseal for service '{}' ({action:?}) -> password",
                     journal_safe(svc)
                 );
+                    note_pre_camera(irlume_common::OutcomeCause::Policy);
                     return Response::Error(format!(
                         "biopolicy: '{svc}' may not release the credential"
                     ));
@@ -6611,6 +7157,8 @@ fn dispatch_scoped_session_inner(
                     // other peers get vid:pid and serial_present.
                     identity: if peer.uid == 0 { p.identity } else { None },
                     serial_present: p.serial_present,
+                    port_chain: p.port_chain,
+                    descriptor_token: p.descriptor_token,
                 })
                 .collect(),
         ),
@@ -7160,6 +7708,7 @@ fn do_unseal_password_scoped(
     jout_info!("irlumed: UnsealPassword: attempt for '{user}'");
     let t = std::time::Instant::now();
     if !irlume_core::keyring::has_sealed_password(user) {
+        note_pre_camera(irlume_common::OutcomeCause::Configuration);
         return Response::UnsealUnavailable {
             reason: format!("no sealed password for '{user}': run `irlume keyring arm`"),
         };
@@ -7186,6 +7735,7 @@ fn do_unseal_password_scoped(
             let sent = delivery.send(WorkerReply {
                 response: response.clone(),
                 completion: completed.take().filter(|_| is_face_grant(&response)),
+                filing: None,
             });
             if !sent {
                 *completion = completed;
@@ -7232,6 +7782,7 @@ fn do_unseal_password_scoped(
                 ""
             };
             jout_warn!("irlumed: UnsealPassword: capture/auth failed for '{user}': {e}{hint}");
+            note_engine_error(&e);
             return Response::Error(e.to_string());
         }
     };
@@ -7270,8 +7821,12 @@ fn unseal_reply(
             }
         },
         retry_unseal_refusal,
-        // Credential release has no typed-error opt-in: prose, as before.
-        |error| Response::Error(error.to_string()),
+        // Credential release has no typed-error opt-in: prose, as before;
+        // the record still gets the typed cause (ADR-0030 §5).
+        |error| {
+            note_engine_error(&error);
+            Response::Error(error.to_string())
+        },
     )
 }
 
@@ -7291,6 +7846,9 @@ fn finish_unseal_password(
             deny_score(outcome.score),
             deny_reason(&outcome.reason)
         );
+        // The prose reply is the only shape an older PAM decodes; the
+        // record still gets the engine's cause (ADR-0030 §5).
+        note_outcome(outcome.cause);
         return Response::Error(format!("face not granted: {}", outcome.reason));
     }
     // See the UnsealKeyring path: one load, so the bytes and their kind always
@@ -7327,6 +7885,9 @@ fn finish_unseal_password(
                 "irlumed: UnsealPassword: face matched for '{user}' (score {:.4}) but TPM unseal FAILED: {e}{hint}",
                 outcome.score
             );
+            // The face was granted; the release failed after it. The
+            // record files the typed cause of that failure (ADR-0030 §5).
+            note_engine_error(&e);
             Response::Error(e.to_string())
         }
     }
@@ -7409,6 +7970,7 @@ mod tests {
                 cause: None,
             },
             completion: None,
+            filing: None,
         }
     }
 
@@ -8705,7 +9267,7 @@ mod tests {
     }
 
     /// Exclusive. For a test that MUTATES the environment.
-    fn env_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
+    pub(crate) fn env_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
         crate::test_support::env_write()
     }
 
@@ -8761,8 +9323,9 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 13] = [
+        let sources: [(&str, &str); 14] = [
             ("main.rs", include_str!("main.rs")),
+            ("attempt_record.rs", include_str!("attempt_record.rs")),
             ("shared_unlock.rs", include_str!("shared_unlock.rs")),
             (
                 "shared_greeter_tests.rs",
@@ -9275,6 +9838,7 @@ mod tests {
             },
         CaptureModeStatus => Request::CaptureModeStatus,
         FaceSensorStatus => Request::FaceSensorStatus { user: Some(u()) },
+        LastAttempts => Request::LastAttempts { user: u() },
         PreferencesStatus => Request::PreferencesStatus,
         SelfTest => Request::SelfTest {
             kind: irlume_common::SelfTestKind::Liveness,
@@ -10099,6 +10663,7 @@ mod tests {
                 arbiter::Class::Auth,
                 0,
                 Queued {
+                    attempt: None,
                     authorization: None,
                     session: None,
                     position: None,
@@ -10534,6 +11099,7 @@ mod tests {
                         link,
                         scope,
                         enqueued_at: _,
+                        attempt: _,
                     } = job.payload;
                     assert!(link.claim());
                     let response = dispatch_scoped(req, &peer, &mut engine, &scope, authorization);
@@ -11767,6 +12333,7 @@ mod tests {
                 arbiter::Class::Auth,
                 0,
                 Queued {
+                    attempt: None,
                     authorization: None,
                     session: None,
                     position: None,
@@ -13019,6 +13586,7 @@ mod tests {
                         let resp = WorkerReply {
                             response: Response::Error("stand-in worker".into()),
                             completion: None,
+                            filing: None,
                         };
                         job_scope.finish(irlume_common::diagnostics::CategoricalOutcome::Failed);
                         arb.finish(job_class, job_uid);
@@ -13129,6 +13697,134 @@ mod tests {
             }
             other => panic!("fingerprint mode must deny via AuthResult, got {other:?}"),
         }
+    }
+
+    /// ADR-0030 §5: a refused authentication is filed in the account's
+    /// attempt record from the reply that was sent — a pre-camera refusal
+    /// with its cause and no camera — and LastAttempts serves it to the
+    /// account and root, and refuses a stranger.
+    #[test]
+    fn a_refusal_at_the_door_is_filed_only_by_a_peer_who_may_act_for_the_account() {
+        let _g = env_lock();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let me = crate::users::name_for_uid(uid).expect("own account");
+        let verify = Request::Authenticate {
+            structured_errors: false,
+            user: me.clone(),
+            service: None,
+            intent_confirmation: None,
+        };
+        assert!(peer_may_file_for(&verify, &peer(0)));
+        assert!(peer_may_file_for(&verify, &peer(uid)));
+        assert!(
+            !peer_may_file_for(&verify, &peer(NOBODY)),
+            "another local user must not write into this account's record"
+        );
+        let release = Request::UnsealPassword {
+            user: me,
+            service: None,
+        };
+        assert!(peer_may_file_for(&release, &peer(0)));
+        assert!(!peer_may_file_for(&release, &peer(uid)));
+        assert!(!peer_may_file_for(&Request::Ping, &peer(0)));
+    }
+
+    #[test]
+    fn refused_authentication_is_filed_and_served_by_last_attempts() {
+        use irlume_common::{AttemptKind, AttemptResult, OutcomeCause};
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("auth-record");
+        std::fs::write(sb.dir.join("method"), "fingerprint").unwrap();
+        std::env::set_var("IRLUME_METHOD_CONF", sb.dir.join("method"));
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let me = crate::users::name_for_uid(uid).expect("own account");
+        let response = dispatch(
+            Request::Authenticate {
+                structured_errors: false,
+                user: me.clone(),
+                service: Some("kde".into()),
+                intent_confirmation: None,
+            },
+            &peer(0),
+            &mut e,
+        );
+        assert!(matches!(
+            response,
+            Response::AuthResult { granted: false, .. }
+        ));
+        // The write is off the reply path: wait for it to land.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let record = loop {
+            let served = dispatch(
+                Request::LastAttempts { user: me.clone() },
+                &peer(uid),
+                &mut e,
+            );
+            let Response::LastAttempts(record) = served else {
+                panic!("expected LastAttempts, got {served:?}");
+            };
+            if record.latest_authenticate.is_some() || std::time::Instant::now() > deadline {
+                break record;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let latest = record.latest_authenticate.expect("the refusal was filed");
+        assert_eq!(latest.kind, AttemptKind::Authenticate);
+        assert_eq!(latest.result, AttemptResult::Refused);
+        assert_eq!(latest.cause, Some(OutcomeCause::MethodNotAvailable));
+        assert_eq!(latest.camera, None, "refused before a camera was chosen");
+        assert!(record.latest_identify.is_none());
+        assert!(record.cameras.is_empty());
+        // Root may read it too; another account may not.
+        assert!(matches!(
+            dispatch(Request::LastAttempts { user: me.clone() }, &peer(0), &mut e),
+            Response::LastAttempts(_)
+        ));
+        assert!(matches!(
+            dispatch(
+                Request::LastAttempts { user: me.clone() },
+                &peer(NOBODY),
+                &mut e
+            ),
+            Response::Error(_)
+        ));
+        // An account-scoped identify refused before any camera — by the
+        // disabled method, or by the probe throttle if an earlier test
+        // spent this uid's interval — is filed as decided, not failed: the
+        // site's facts win over the operational-cause fallback.
+        let identified = dispatch(Request::Identify, &peer(uid), &mut e);
+        let Response::Identified { cause, .. } = identified else {
+            panic!("expected Identified, got {identified:?}");
+        };
+        assert!(matches!(
+            cause,
+            Some(OutcomeCause::MethodNotAvailable | OutcomeCause::RetryThrottled)
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let record = loop {
+            let served = dispatch(
+                Request::LastAttempts { user: me.clone() },
+                &peer(uid),
+                &mut e,
+            );
+            let Response::LastAttempts(record) = served else {
+                panic!("expected LastAttempts, got {served:?}");
+            };
+            if record.latest_identify.is_some() || std::time::Instant::now() > deadline {
+                break record;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let latest = record
+            .latest_identify
+            .expect("the identify refusal was filed");
+        assert_eq!(latest.kind, AttemptKind::Identify);
+        assert_eq!(latest.result, AttemptResult::Refused);
+        assert_eq!(latest.cause, cause);
+        assert_eq!(latest.camera, None);
     }
 
     #[test]

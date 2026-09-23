@@ -37,7 +37,8 @@ pub use irlume_camera::{camera_inventory_snapshot, initialize_camera_monitor};
 /// camera-class `ListCameras` arm: clients must not enumerate for themselves
 /// (#187), so this is the only path to a listing.
 pub use irlume_camera::{
-    camera_rate_diagnostics, list_pairs, privacy_engaged, set_forbid_external_cameras, CameraPair,
+    camera_location, camera_rate_diagnostics, connected_camera_locations, list_pairs,
+    privacy_engaged, set_forbid_external_cameras, CameraLocation, CameraPair,
 };
 /// Auto-select the RGB+IR camera pair (built-in or external Hello webcam), plus
 /// the stable per-device identity the daemon records alongside a persisted pair
@@ -4297,10 +4298,24 @@ impl Engine {
     /// (RGB+IR) when an IR camera is present, else RGB-only (convenience).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn assess(&mut self) -> irlume_common::Result<Assessment> {
+        self.assess_with_diagnostics(&())
+    }
+
+    /// [`Self::assess`] reporting its capture stages to `diagnostics`, so
+    /// the caller's operation scope sees the camera the capture reached.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn assess_with_diagnostics(
+        &mut self,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Assessment> {
         // One-shot entry: no authenticate_for/capture_scans ran to clear the
         // ViT vote ring, so repeated assess() calls must not accumulate a
         // cross-presentation vote (GLM review finding 2).
         self.vit_scores.clear();
+        // The setup interval runs from here to the start of the capture
+        // route; a caller's scope learns the camera was reached from that
+        // mark even when the capture is cancelled before a stage reports.
+        self.begin_capture_setup();
         // Resolve the capture-mode selection through the qualification store
         // BEFORE acquiring the streaming operation, exactly as
         // authenticate_for does at its own entry: without this the one-shot
@@ -4324,12 +4339,13 @@ impl Engine {
             std::time::Duration::from_secs(2),
         )
         .map_err(lease_unavailable)?;
+        self.emit_capture_setup(diagnostics);
         operation
             .run(|| {
                 if self.ir_available {
-                    self.assess_full(&selection, &operation)
+                    self.assess_full(&selection, &operation, diagnostics)
                 } else {
-                    self.assess_rgb_only()
+                    self.assess_rgb_only_with_diagnostics(diagnostics)
                 }
             })
             .map_err(lease_unavailable)?
@@ -4528,10 +4544,6 @@ impl Engine {
     /// path for devices without an IR camera. Anti-spoof here is DETERRENT-grade
     /// (well-lit + frontal + screen/glare heuristic), which is why this tier is
     /// limited to lock-screen unlock and never releases credentials.
-    fn assess_rgb_only(&mut self) -> irlume_common::Result<Assessment> {
-        self.assess_rgb_only_with_diagnostics(&())
-    }
-
     fn assess_rgb_only_with_diagnostics(
         &mut self,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
@@ -4730,8 +4742,9 @@ impl Engine {
         &mut self,
         selection: &CaptureModeSelection,
         operation: &irlume_camera::lease::CameraOperationSession,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Assessment> {
-        self.assess_full_with(None, Some(selection), operation, &())
+        self.assess_full_with(None, Some(selection), operation, diagnostics)
             .map_err(CapturePathError::into_inner)
     }
 
@@ -4952,12 +4965,24 @@ impl Engine {
         // Every one-shot capture below carries the per-window heartbeat
         // (#336); held sessions already carry theirs from `capture_scans`.
         let control = self.capture_control();
+        // Sequential roles report their timing as each finishes, so a trace
+        // consumer reconstructing the capture span adds them instead of
+        // overlapping two stages that were emitted together at the end.
+        let mut rgb_timing_emitted = false;
         let (mut rgb_res, mut rgb_ms, mut ir_res, mut ir_ms, recovered_side) =
             if let Some((rgb_s, ir_s)) = held {
                 if sequential {
                     let t = std::time::Instant::now();
                     let (rgb, rgb_recovered) = held_rgb_capture(rgb_s);
                     let rgb_ms = t.elapsed().as_millis();
+                    if rgb.is_ok() {
+                        emit_trace_stage_ms(
+                            diagnostics,
+                            irlume_common::diagnostics::TraceStage::RgbCapture,
+                            rgb_ms,
+                        );
+                        rgb_timing_emitted = true;
+                    }
                     if rgb.is_err() {
                         (rgb, rgb_ms, Ok(None), 0, rgb_recovered)
                     } else {
@@ -5015,6 +5040,14 @@ impl Engine {
                 let t = std::time::Instant::now();
                 let rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control);
                 let rgb_ms = t.elapsed().as_millis();
+                if rgb.is_ok() {
+                    emit_trace_stage_ms(
+                        diagnostics,
+                        irlume_common::diagnostics::TraceStage::RgbCapture,
+                        rgb_ms,
+                    );
+                    rgb_timing_emitted = true;
+                }
                 // Match the old short-circuit: don't fire the IR emitter after an
                 // RGB fault (privacy switch, missing node); the shared retry below
                 // surfaces the RGB error.
@@ -5073,11 +5106,13 @@ impl Engine {
                 .into());
             }
         }
-        emit_trace_stage_ms(
-            diagnostics,
-            irlume_common::diagnostics::TraceStage::RgbCapture,
-            rgb_ms,
-        );
+        if !rgb_timing_emitted {
+            emit_trace_stage_ms(
+                diagnostics,
+                irlume_common::diagnostics::TraceStage::RgbCapture,
+                rgb_ms,
+            );
+        }
         emit_trace_stage_ms(
             diagnostics,
             irlume_common::diagnostics::TraceStage::IrCapture,
@@ -5285,7 +5320,19 @@ impl Engine {
                     }
                 );
                 rgb_hard_retried = true;
-                irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?
+                // The retry is the capture that produced the assessed frame:
+                // it reports its own timing, and the detection line below
+                // carries it.
+                let t = std::time::Instant::now();
+                let frame =
+                    irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?;
+                rgb_ms = t.elapsed().as_millis();
+                emit_trace_stage_ms(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::RgbCapture,
+                    rgb_ms,
+                );
+                frame
             }
             Err(e) => return Err(e.into()),
         };
@@ -5294,12 +5341,24 @@ impl Engine {
         // `None` = sequential mode skipped IR after an RGB fault; the RGB `?`
         // above already returned, so reaching here with `None` is unreachable,
         // but capture alone rather than unwrap to stay panic-free.
+        let timed_ir_capture = |diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink| {
+            let t = std::time::Instant::now();
+            let captured = irlume_camera::capture_ir_with_stats_and_control(&self.ir_dev, &control);
+            if captured.is_ok() {
+                emit_trace_stage_ms(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::IrCapture,
+                    t.elapsed().as_millis(),
+                );
+            }
+            captured
+        };
         let (ir, ir_stats) = match ir_res {
             Ok(Some(f)) => f,
-            Ok(None) => irlume_camera::capture_ir_with_stats_and_control(&self.ir_dev, &control)?,
+            Ok(None) => timed_ir_capture(diagnostics)?,
             Err(e) if !held_sessions && !pair_sequential_retried => {
                 irlume_common::dlog!("assess: ir capture retry (concurrent failed: {e})");
-                irlume_camera::capture_ir_with_stats_and_control(&self.ir_dev, &control)?
+                timed_ir_capture(diagnostics)?
             }
             Err(e) => return Err(e.into()),
         };
@@ -7393,7 +7452,16 @@ impl Engine {
     /// users' templates.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn identify(&mut self) -> irlume_common::Result<IdentifyOutcome> {
-        self.identify_impl(None)
+        self.identify_impl(None, &())
+    }
+
+    /// [`Self::identify`] reporting its capture stages to `diagnostics`.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn identify_with_diagnostics(
+        &mut self,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<IdentifyOutcome> {
+        self.identify_impl(None, diagnostics)
     }
 
     /// Identify scoped to a single enrolled user ("is this `user`?"). Same
@@ -7401,10 +7469,25 @@ impl Engine {
     /// just this one account: what a non-root peer is allowed to ask about itself.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn identify_within(&mut self, user: &str) -> irlume_common::Result<IdentifyOutcome> {
-        self.identify_impl(Some(user))
+        self.identify_impl(Some(user), &())
     }
 
-    fn identify_impl(&mut self, restrict: Option<&str>) -> irlume_common::Result<IdentifyOutcome> {
+    /// [`Self::identify_within`] reporting its capture stages to
+    /// `diagnostics`.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn identify_within_with_diagnostics(
+        &mut self,
+        user: &str,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<IdentifyOutcome> {
+        self.identify_impl(Some(user), diagnostics)
+    }
+
+    fn identify_impl(
+        &mut self,
+        restrict: Option<&str>,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<IdentifyOutcome> {
         if irlume_core::policy::method().face_disabled() {
             return Ok(IdentifyOutcome {
                 user: None,
@@ -7415,7 +7498,7 @@ impl Engine {
                 cause: Some(OutcomeCause::MethodNotAvailable),
             });
         }
-        let a = self.assess()?;
+        let a = self.assess_with_diagnostics(diagnostics)?;
         let Some(probe) = a.embedding else {
             return Ok(IdentifyOutcome {
                 user: None,
