@@ -175,6 +175,9 @@ impl From<IrFailure> for Category {
             IrFailure::CameraLeaseRefused => Self::CameraLeaseRefused,
             IrFailure::CameraIoFailed => Self::CameraIoFailed,
             IrFailure::CameraHardwareFailed => Self::CameraHardwareFailed,
+            // Schema 4 has no privacy category; the shutter refusal keeps
+            // the hardware class it always had in evaluation records.
+            IrFailure::PrivacyShutter => Self::CameraHardwareFailed,
             IrFailure::CameraAuthorizationRefused => Self::CameraAuthorizationRefused,
             IrFailure::CameraPolicyRefused => Self::CameraPolicyRefused,
             IrFailure::CameraCaptureFailed => Self::CameraCaptureFailed,

@@ -268,6 +268,8 @@ struct PairAssessmentContext<'a> {
 
 /// The authentication decision for a user.
 // Debug is diagnostic-only (tests, dlog); derives add no behavior.
+pub use irlume_common::OutcomeCause;
+
 #[derive(Debug)]
 pub struct Outcome {
     pub granted: bool,
@@ -279,6 +281,31 @@ pub struct Outcome {
     /// `reason` prose. Engine-internal: the daemon maps `Outcome` to the wire
     /// `Response` field by field, and `kind` never crosses the socket.
     pub kind: OutcomeKind,
+    /// Why the attempt did not grant, in the wire vocabulary (ADR-0030
+    /// §5): decided where the outcome is built, defaulting to the class
+    /// `kind` implies and overridden where `kind` is coarser than the
+    /// cause (a binding mismatch is `OtherDeny` but "not enrolled on this
+    /// camera"). `None` on a grant. This one does cross the socket.
+    pub cause: Option<OutcomeCause>,
+}
+
+impl OutcomeKind {
+    /// The cause an outcome of this kind carries unless the site that
+    /// built it knows better.
+    fn default_cause(self) -> Option<OutcomeCause> {
+        Some(match self {
+            OutcomeKind::Granted => return None,
+            OutcomeKind::NoFace => OutcomeCause::NoFace,
+            OutcomeKind::Uncertain
+            | OutcomeKind::RgbPadPending
+            | OutcomeKind::SpoofNoIrFace
+            | OutcomeKind::Spoof => OutcomeCause::LivenessRefused,
+            OutcomeKind::BelowThreshold => OutcomeCause::BelowThreshold,
+            OutcomeKind::SetupUnavailable => OutcomeCause::SetupUnavailable,
+            OutcomeKind::DeadlineExpired => OutcomeCause::TimedOut,
+            OutcomeKind::RuntimeUnavailable | OutcomeKind::OtherDeny => OutcomeCause::Other,
+        })
+    }
 }
 
 /// Grant/failure class of an [`Outcome`]. The
@@ -326,6 +353,15 @@ impl Outcome {
             score: 0.0,
             reason: reason.into(),
             kind,
+            cause: kind.default_cause(),
+        }
+    }
+
+    /// Refusal whose cause is finer than its kind (ADR-0030 §5).
+    fn deny_because(kind: OutcomeKind, cause: OutcomeCause, reason: impl Into<String>) -> Self {
+        Self {
+            cause: Some(cause),
+            ..Self::deny(kind, reason)
         }
     }
 
@@ -337,6 +373,7 @@ impl Outcome {
             score,
             reason: reason.into(),
             kind,
+            cause: kind.default_cause(),
         }
     }
 
@@ -348,6 +385,7 @@ impl Outcome {
             score,
             reason: reason.into(),
             kind: OutcomeKind::Granted,
+            cause: None,
         }
     }
 }
@@ -362,6 +400,8 @@ pub struct IdentifyOutcome {
     pub score: f32,
     pub live: bool,
     pub reason: String,
+    /// Why no match was found (ADR-0030 §5); `None` on a match.
+    pub cause: Option<OutcomeCause>,
 }
 
 /// One live enrollment scan, as captured by [`Engine::capture_scans`].
@@ -1269,6 +1309,30 @@ fn finish_loader<T>(loader: &mut Option<std::sync::mpsc::Receiver<EnrollmentLoad
 
 /// How a deferred enrollment load ended when it did not produce an
 /// enrollment the request can use.
+/// A camera lease that could not be taken or kept is the camera being
+/// unavailable to this attempt (ADR-0030 §5): held by another operation,
+/// an endpoint that is not usable, or a stale lifecycle reference. Same
+/// prose as before, the camera's own class.
+fn lease_unavailable(error: irlume_camera::lease::CameraLeaseError) -> irlume_common::Error {
+    irlume_common::Error::CameraUnavailable(error.to_string())
+}
+
+/// An enrollment that exists but cannot be read or decoded is a setup
+/// failure (ADR-0030 §5): no biometric comparison happened. The storage
+/// error's own text is kept, so the prose reply is unchanged; the typed
+/// budget, pre-emption and camera errors pass through untouched.
+fn enrollment_unreadable(error: irlume_common::Error) -> irlume_common::Error {
+    match error {
+        irlume_common::Error::DeadlineExpired
+        | irlume_common::Error::Preempted(_)
+        | irlume_common::Error::CameraBusy(_)
+        | irlume_common::Error::CameraUnavailable(_)
+        | irlume_common::Error::PrivacyShutter(_)
+        | irlume_common::Error::Enrollment(_) => error,
+        other => irlume_common::Error::Enrollment(other.to_string()),
+    }
+}
+
 #[derive(Debug)]
 enum LoaderExit {
     /// The store vanished between the pre-check and the read: the same
@@ -1289,13 +1353,11 @@ fn resolve_loader<T>(
     match recv {
         Ok(Ok(Some(loaded))) => Ok(loaded),
         Ok(Ok(None)) => Err(LoaderExit::NotEnrolled),
-        Ok(Err(e)) => Err(LoaderExit::Fallback(e)),
+        Ok(Err(e)) => Err(LoaderExit::Fallback(enrollment_unreadable(e))),
+        // The load outlived the authentication window: the budget ended,
+        // which is the typed deadline every other expiry path reports.
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err(LoaderExit::Fallback(irlume_common::Error::Protocol(
-                "enrollment load exceeded the authentication deadline; \
-                 falling back to password"
-                    .into(),
-            )))
+            Err(LoaderExit::Fallback(irlume_common::Error::DeadlineExpired))
         }
         // The sender is gone without a result: the loader panicked.
         // Contained by the thread boundary; the request fails closed rather
@@ -4227,9 +4289,7 @@ impl Engine {
         operation: &irlume_camera::lease::CameraOperationSession,
         task: impl FnOnce() -> irlume_common::Result<T>,
     ) -> irlume_common::Result<T> {
-        operation
-            .run(task)
-            .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
+        operation.run(task).map_err(lease_unavailable)?
     }
 
     /// One capture: RGB+IR → liveness verdict + (if a face) its embedding.
@@ -4263,7 +4323,7 @@ impl Engine {
             irlume_camera::lease::CameraOperationKind::Authentication,
             std::time::Duration::from_secs(2),
         )
-        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+        .map_err(lease_unavailable)?;
         operation
             .run(|| {
                 if self.ir_available {
@@ -4272,7 +4332,7 @@ impl Engine {
                     self.assess_rgb_only()
                 }
             })
-            .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
+            .map_err(lease_unavailable)?
     }
 
     /// Perform one bounded, production-shaped camera capture for a support
@@ -4748,9 +4808,7 @@ impl Engine {
     ) -> Result<Assessment, CapturePathError> {
         operation
             .run(|| self.assess_full_with(held, capture_mode, operation, diagnostics))
-            .map_err(|error| {
-                CapturePathError::Other(irlume_common::Error::Hardware(error.to_string()))
-            })?
+            .map_err(|error| CapturePathError::Other(lease_unavailable(error)))?
     }
 
     /// [`Self::assess_full`], optionally reusing already-streaming cameras.
@@ -5067,23 +5125,47 @@ impl Engine {
             if let Some(context_key) = capture_mode.runtime_key.as_deref() {
                 trip_runtime_capture_health(context_key, degradation);
             }
-            return Err(CapturePathError::ConcurrentPair(
-                irlume_common::Error::Hardware(format!(
-                    "held concurrent pair became unusable (rgb: {}; ir: {}; recovered-side: {recovered_side}; runtime: {}); both results must be discarded",
-                    rgb_res
-                        .as_ref()
-                        .err()
-                        .map_or("ok".to_owned(), ToString::to_string),
-                    ir_res
-                        .as_ref()
-                        .err()
-                        .map_or("ok".to_owned(), ToString::to_string),
-                    runtime_violation.map_or_else(
-                        || if missing_runtime_contract { "missing contract".to_owned() } else { "ok".to_owned() },
-                        |error| error.to_string(),
-                    ),
-                )),
-            ));
+            let message = format!(
+                "held concurrent pair became unusable (rgb: {}; ir: {}; recovered-side: {recovered_side}; runtime: {}); both results must be discarded",
+                rgb_res
+                    .as_ref()
+                    .err()
+                    .map_or("ok".to_owned(), ToString::to_string),
+                ir_res
+                    .as_ref()
+                    .err()
+                    .map_or("ok".to_owned(), ToString::to_string),
+                runtime_violation.map_or_else(
+                    || if missing_runtime_contract { "missing contract".to_owned() } else { "ok".to_owned() },
+                    |error| error.to_string(),
+                ),
+            );
+            // The pair-failure context wraps the message; the cause is the
+            // underlying refusal's (ADR-0030 §5): a shutter engaged on
+            // either side stays a privacy shutter.
+            // The pair-failure context wraps the message; the class is the
+            // underlying refusal's (ADR-0030 §5), the most specific of the
+            // two sides winning: shutter, then busy, then the budget or a
+            // pre-emption, then the camera itself.
+            let sides = [rgb_res.as_ref().err(), ir_res.as_ref().err()];
+            let pick = |matches: fn(&irlume_common::Error) -> bool| {
+                sides.into_iter().flatten().any(matches)
+            };
+            use irlume_common::Error as E;
+            let classified = if pick(|e| matches!(e, E::PrivacyShutter(_))) {
+                E::PrivacyShutter(message)
+            } else if pick(|e| matches!(e, E::CameraBusy(_))) {
+                E::CameraBusy(message)
+            } else if pick(|e| matches!(e, E::DeadlineExpired)) {
+                E::DeadlineExpired
+            } else if pick(|e| matches!(e, E::Preempted(_))) {
+                E::Preempted(message)
+            } else if pick(|e| matches!(e, E::CameraUnavailable(_))) {
+                E::CameraUnavailable(message)
+            } else {
+                E::Hardware(message)
+            };
+            return Err(CapturePathError::ConcurrentPair(classified));
         }
         let mut pair_sequential_retried = false;
         if pair_requires_fallback {
@@ -6080,8 +6162,9 @@ impl Engine {
         // Fingerprint mode: face is disabled so pam_fprintd drives; never engage
         // the camera, decline so the PAM stack cascades to fingerprint/password.
         if irlume_core::policy::method().face_disabled() {
-            return Ok(Outcome::deny(
+            return Ok(Outcome::deny_because(
                 OutcomeKind::OtherDeny,
+                OutcomeCause::MethodNotAvailable,
                 "face disabled (fingerprint mode)",
             ));
         }
@@ -6099,7 +6182,9 @@ impl Engine {
         // paths retain password fallback; a loader panic maps to an error.
         let load_started = std::time::Instant::now();
         let mut loader = PendingEnrollmentLoad {
-            receiver: match irlume_core::storage::store_is_encrypted(user)? {
+            receiver: match irlume_core::storage::store_is_encrypted(user)
+                .map_err(enrollment_unreadable)?
+            {
                 // No file at all: the instant deny, before anything else wakes.
                 None => {
                     return Ok(Outcome::deny(
@@ -6138,7 +6223,7 @@ impl Engine {
             irlume_camera::device_identity(&self.ir_dev),
         );
         let sync_enr = if loader.receiver.is_none() {
-            let loaded = irlume_core::storage::load_with_key(user);
+            let loaded = irlume_core::storage::load_with_key(user).map_err(enrollment_unreadable);
             // Completed work boundary: the plaintext store load itself,
             // before any policy decision on its content. Attempt preparation
             // starts here on this path (the deferred path starts it at its
@@ -6191,7 +6276,7 @@ impl Engine {
             Ok(op) => op,
             Err(error) => {
                 finish_loader(&mut loader.receiver);
-                return Err(irlume_common::Error::Hardware(error.to_string()));
+                return Err(lease_unavailable(error));
             }
         };
 
@@ -6882,8 +6967,11 @@ impl Engine {
             match decision {
                 Ok(irlume_core::multi_camera::commit::GrantDecision::Grant) => {}
                 Ok(irlume_core::multi_camera::commit::GrantDecision::Refuse(clause)) => {
-                    return Ok(Outcome::deny(
+                    // The pinned enrollment drifted under the attempt: the
+                    // kind stays OtherDeny, the cause is setup.
+                    return Ok(Outcome::deny_because(
                         OutcomeKind::OtherDeny,
+                        OutcomeCause::SetupUnavailable,
                         format!("secondary grant refused at the boundary: {clause}"),
                     ));
                 }
@@ -7147,7 +7235,14 @@ impl Engine {
                      pipeline (unknown or changed IR space, recognizer or dimension); \
                      add fresh scans to your profile to restore dark unlock"
                 };
-                return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
+                // No identity was compared: the enrollment cannot serve a
+                // dark attempt. The kind stays OtherDeny for the retry
+                // accounting; the cause says setup (ADR-0030 §5).
+                return Ok(Outcome::deny_because(
+                    OutcomeKind::OtherDeny,
+                    OutcomeCause::SetupUnavailable,
+                    reason,
+                ));
             }
             let (verdict, cues, reason) = self.gate.evaluate_ir_only(&a.signals);
             diagnostics.emit_trace(irlume_liveness::diagnostic_trace_decision(
@@ -7317,6 +7412,7 @@ impl Engine {
                 score: 0.0,
                 live: false,
                 reason: "face disabled (fingerprint mode)".into(),
+                cause: Some(OutcomeCause::MethodNotAvailable),
             });
         }
         let a = self.assess()?;
@@ -7327,30 +7423,46 @@ impl Engine {
                 score: 0.0,
                 live: false,
                 reason: format!("no RGB face: {}", a.reason),
+                cause: Some(OutcomeCause::NoFace),
             });
         };
         if a.verdict != Verdict::Live {
+            // The authentication classifier's distinction: an exposure the
+            // format cannot measure is a runtime limitation, not the
+            // subject failing liveness.
+            let cause = match liveness_deny_kind(a.verdict, a.deny_cause) {
+                OutcomeKind::RuntimeUnavailable => OutcomeCause::Other,
+                _ => OutcomeCause::LivenessRefused,
+            };
             return Ok(IdentifyOutcome {
                 user: None,
                 profile: None,
                 score: 0.0,
                 live: false,
                 reason: format!("liveness {:?}: {}", a.verdict, a.reason),
+                cause: Some(cause),
             });
         }
         let mut best: Option<(f32, String, String)> = None; // (score, user, profile)
+                                                            // Whether any template was compared at all: a refusal with none is
+                                                            // a setup failure, not a recognition one (ADR-0030 §5).
+        let mut compared = false;
         let candidates: Vec<String> = match restrict {
             Some(u) => vec![u.to_string()],
             None => irlume_core::storage::list_users(),
         };
         for user in candidates {
-            let Some(enr) = irlume_core::storage::load(&user)? else {
+            // An unreadable enrollment is a setup failure here as on the
+            // authentication path.
+            let Some(enr) = irlume_core::storage::load(&user).map_err(enrollment_unreadable)?
+            else {
                 continue;
             };
             let scans = enr.rgb_scans_in(&self.embed_space);
             if scans.is_empty() {
                 continue;
             }
+            compared = true;
             let thr = self.rgb_grant_threshold(scans.len());
             let (score, who) = scans
                 .iter()
@@ -7370,13 +7482,23 @@ impl Engine {
                 score,
                 live: true,
                 reason: "match".into(),
+                cause: None,
+            }),
+            None if compared => Ok(IdentifyOutcome {
+                user: None,
+                profile: None,
+                score: 0.0,
+                live: true,
+                reason: "live face, but no enrolled match".into(),
+                cause: Some(OutcomeCause::BelowThreshold),
             }),
             None => Ok(IdentifyOutcome {
                 user: None,
                 profile: None,
                 score: 0.0,
                 live: true,
-                reason: "live face, but no enrolled match".into(),
+                reason: "live face, but no enrollment this recognizer can compare".into(),
+                cause: Some(OutcomeCause::SetupUnavailable),
             }),
         }
     }
@@ -7479,7 +7601,7 @@ impl Engine {
             irlume_camera::lease::CameraOperationKind::Enrollment,
             std::time::Duration::from_secs(2),
         )
-        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+        .map_err(lease_unavailable)?;
         let cams = if use_ir {
             match (operation.open_rgb(&rgb_dev), operation.open_ir(&ir_dev)) {
                 (Ok(r), Ok(i)) => Some((r, i)),
@@ -7838,13 +7960,13 @@ impl Engine {
             |session| {
                 operation
                     .run(|| session.denoised())
-                    .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
+                    .map_err(lease_unavailable)?
             },
             |session| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     operation
                         .run(|| session.capture_with_stats())
-                        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
+                        .map_err(lease_unavailable)?
                 }))
                 .unwrap_or_else(|_| {
                     Err(irlume_common::Error::Hardware(
@@ -8370,7 +8492,11 @@ impl Engine {
         }
         if let Some(bind) = &enr.camera_binding {
             if let Some(reason) = binding_mismatch_for(bind, live) {
-                return Some(Outcome::deny(OutcomeKind::OtherDeny, reason));
+                return Some(Outcome::deny_because(
+                    OutcomeKind::OtherDeny,
+                    OutcomeCause::NotEnrolledOnThisCamera,
+                    reason,
+                ));
             }
         }
         // RGB and IR matching both exclude other recognizers' embedding spaces.
@@ -8979,7 +9105,7 @@ impl Engine {
             irlume_camera::lease::CameraOperationKind::Enrollment,
             std::time::Duration::from_secs(2),
         )
-        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+        .map_err(lease_unavailable)?;
         if self.should_stop() || std::time::Instant::now() >= deadline {
             return Err(irlume_common::Error::Preempted(
                 "framing cancelled while waiting for camera ownership".into(),
@@ -9973,6 +10099,7 @@ mod tests {
             score: 0.0,
             reason: reason.into(),
             kind,
+            cause: None,
         }
     }
 
@@ -12812,6 +12939,7 @@ mod engine_tests {
                 "dark" => {
                     assert!(!out.granted);
                     assert_eq!(out.kind, OutcomeKind::OtherDeny);
+                    assert_eq!(out.cause, Some(OutcomeCause::SetupUnavailable));
                     assert!(out.reason.contains("no enrolled IR scans are compatible"));
                 }
                 _ => {
@@ -13942,6 +14070,42 @@ mod engine_tests {
         assert!(inactive_store_write_refusal(&store, b"primary v2").is_ok());
     }
 
+    /// ADR-0030 §5: every outcome carries the cause its kind implies
+    /// unless the site knew better; a grant carries none.
+    #[test]
+    fn outcome_causes_follow_the_kind_by_default() {
+        for (kind, cause) in [
+            (OutcomeKind::NoFace, OutcomeCause::NoFace),
+            (OutcomeKind::Uncertain, OutcomeCause::LivenessRefused),
+            (OutcomeKind::RgbPadPending, OutcomeCause::LivenessRefused),
+            (OutcomeKind::SpoofNoIrFace, OutcomeCause::LivenessRefused),
+            (OutcomeKind::Spoof, OutcomeCause::LivenessRefused),
+            (OutcomeKind::BelowThreshold, OutcomeCause::BelowThreshold),
+            (
+                OutcomeKind::SetupUnavailable,
+                OutcomeCause::SetupUnavailable,
+            ),
+            (OutcomeKind::DeadlineExpired, OutcomeCause::TimedOut),
+            (OutcomeKind::RuntimeUnavailable, OutcomeCause::Other),
+            (OutcomeKind::OtherDeny, OutcomeCause::Other),
+        ] {
+            assert_eq!(Outcome::deny(kind, "r").cause, Some(cause), "{kind:?}");
+            assert_eq!(
+                Outcome::deny_live(kind, 0.1, "r").cause,
+                Some(cause),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(Outcome::grant(0.9, "match").cause, None);
+        let finer = Outcome::deny_because(
+            OutcomeKind::OtherDeny,
+            OutcomeCause::MethodNotAvailable,
+            "face disabled",
+        );
+        assert_eq!(finer.kind, OutcomeKind::OtherDeny);
+        assert_eq!(finer.cause, Some(OutcomeCause::MethodNotAvailable));
+    }
+
     #[test]
     fn binding_mismatch_refuses_swapped_or_vanished_cameras() {
         let _g = env_guard();
@@ -14004,13 +14168,15 @@ mod engine_tests {
             rgb: Some("dead:beef".into()),
             ir: None,
         });
-        assert_eq!(
-            s.engine
-                .enrollment_policy_refusal_for("fixture", &enrollment, &(None, None))
-                .unwrap()
-                .kind,
-            OutcomeKind::OtherDeny
-        );
+        let mismatch = s
+            .engine
+            .enrollment_policy_refusal_for("fixture", &enrollment, &(None, None))
+            .unwrap();
+        assert_eq!(mismatch.kind, OutcomeKind::OtherDeny);
+        // ADR-0030 §5: the kind stays coarse for retry accounting; the
+        // cause names the camera.
+        assert_eq!(mismatch.cause, Some(OutcomeCause::NotEnrolledOnThisCamera));
+        assert_eq!(refusal.cause, Some(OutcomeCause::SetupUnavailable));
         enrollment.camera_binding = None;
 
         // Any one of the three profiles can supply the current model's scan.
@@ -15864,18 +16030,20 @@ mod engine_tests {
         tx.send(Err(irlume_common::Error::Io("unreadable".into())))
             .unwrap();
         drop(tx);
-        assert!(matches!(
-            resolve_loader(rx.recv_timeout(std::time::Duration::ZERO)),
-            Err(LoaderExit::Fallback(irlume_common::Error::Io(_)))
-        ));
+        // A load error is an unreadable enrollment (ADR-0030 §5), with
+        // the storage error's own text kept.
+        match resolve_loader(rx.recv_timeout(std::time::Duration::ZERO)) {
+            Err(LoaderExit::Fallback(irlume_common::Error::Enrollment(text))) => {
+                assert!(text.starts_with("io:"), "{text}");
+            }
+            other => panic!("a load error must fail closed as a setup failure: {other:?}"),
+        }
 
         // A load that outlives the authentication deadline fails closed.
         let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();
         let resolved = resolve_loader(rx.recv_timeout(std::time::Duration::from_millis(1)));
         match resolved {
-            Err(LoaderExit::Fallback(irlume_common::Error::Protocol(msg))) => {
-                assert!(msg.contains("deadline"), "{msg}");
-            }
+            Err(LoaderExit::Fallback(irlume_common::Error::DeadlineExpired)) => {}
             other => panic!("deadline expiry must fail closed to the password: {other:?}"),
         }
         drop(tx);

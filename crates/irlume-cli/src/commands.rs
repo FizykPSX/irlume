@@ -991,6 +991,17 @@ pub fn identify(_args: &[String]) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        // A refusal or failure that is not a verdict about a face (throttled,
+        // camera unavailable, shutter, cancelled, setup…) says so.
+        Ok(Response::Identified {
+            user: None,
+            cause: Some(cause),
+            reason,
+            ..
+        }) if cause.is_operational() => {
+            println!("[identify] not run: {reason}");
+            ExitCode::from(1)
+        }
         Ok(Response::Identified {
             user: None,
             live,
