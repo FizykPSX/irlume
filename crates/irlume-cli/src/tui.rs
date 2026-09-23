@@ -546,13 +546,24 @@ impl CameraListing {
     }
 }
 
-fn gather_capture_qualification() -> Option<String> {
+/// A capture-schedule observation, bound to the pair it was measured on
+/// so a later configuration change cannot present it as another pair's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureObservation {
+    rgb: String,
+    ir: String,
+    text: String,
+}
+
+fn gather_capture_qualification() -> Option<CaptureObservation> {
     let Ok(Response::CaptureModeStatus {
         mode,
         source,
         qualification_state,
         qualification_reason,
         runtime_degradation,
+        rgb,
+        ir,
         ..
     }) = crate::daemon_poll(&Request::CaptureModeStatus)
     else {
@@ -565,7 +576,11 @@ fn gather_capture_qualification() -> Option<String> {
     if let Some(reason) = runtime_degradation {
         text.push_str(&format!("; degraded: {reason}"));
     }
-    Some(text)
+    Some(CaptureObservation {
+        rgb,
+        ir: ir.unwrap_or_default(),
+        text,
+    })
 }
 
 fn receive_finished<T>(receiver: &Option<mpsc::Receiver<T>>) -> Option<Result<T, ()>> {
@@ -635,7 +650,7 @@ struct App {
     camera_confirmation: Option<CameraChoice>,
     selected_camera_choice: Option<Option<CameraChoice>>,
     selected_profile_identity: Option<Option<(String, Option<String>)>>,
-    qualification_load: Option<mpsc::Receiver<Option<String>>>,
+    qualification_load: Option<mpsc::Receiver<Option<CaptureObservation>>>,
     identify_checked_at: Option<Instant>,
     screen: usize,
     sel: usize,
@@ -651,6 +666,11 @@ struct App {
     profiles: Vec<ProfileSummary>,
     camera_groups: Vec<irlume_common::CameraGroupSummary>,
     camera_store_error: Option<String>,
+    /// The primary enrollment's camera binding (ADR-0029), for the role
+    /// labels on Cameras; `None` from an older daemon or before binding.
+    primary_camera: Option<irlume_common::PrimaryCameraBinding>,
+    /// The Cameras details panel is open for the selected pair.
+    cam_details: bool,
     keyring_armed: Option<bool>,
     /// Seal-tier label from envelope metadata (e.g. "pcrlock NV 0x… (Tier 2)");
     /// `None` when not armed or the daemon predates the request.
@@ -682,7 +702,7 @@ struct App {
     /// Current capture schedule from the daemon (`CaptureModeStatus`), for
     /// the Cameras info block — e.g. "sequential (source: measured; …)".
     /// `None` = not fetched / daemon refused: drawn as unknown, never blank.
-    capture_mode: Option<String>,
+    capture_mode: Option<CaptureObservation>,
     camera_load: Option<mpsc::Receiver<CameraListing>>,
     activity: activity::Activity,
     input: Option<(String, String, Pending)>,
@@ -817,6 +837,7 @@ enum ProfilesOutcome {
         profiles: Vec<ProfileSummary>,
         camera_groups: Vec<irlume_common::CameraGroupSummary>,
         camera_store_error: Option<String>,
+        primary_camera: Option<irlume_common::PrimaryCameraBinding>,
     },
     /// The daemon answered with an error (corrupt enrollment, missing
     /// template key): real state, shown on Repair like the sync path did.
@@ -1280,6 +1301,12 @@ impl App {
                 }
                 self.profiles.clear();
                 self.profiles_loaded = false;
+                // The role labels on Cameras derive from these: an
+                // enrollment that became unreadable must not keep labelling
+                // pairs from the last good load (ADR-0029).
+                self.primary_camera = None;
+                self.camera_groups.clear();
+                self.camera_store_error = None;
             }
             Source::Cameras => {
                 if (self.pairs_known || !self.pairs.is_empty())
@@ -1393,6 +1420,173 @@ impl App {
         self.qualification_load = Some(rx);
     }
 
+    /// The selected account's role for a listed pair (ADR-0029). The
+    /// enrollment is "known" once a profile listing arrived: before that,
+    /// or from a daemon without the binding field, no role is claimed.
+    fn camera_role(&self, pair: &irlume_common::CameraPairInfo) -> CameraRole {
+        // Known once the daemon described the enrollment: a binding, groups,
+        // or a successfully observed empty enrollment (first-run account).
+        // A loaded enrollment with neither (older daemon, or an unbound
+        // legacy profile) stays unknown rather than claiming "not enrolled".
+        // A binding with neither side set is an unbound legacy primary,
+        // not evidence about any camera; and while the secondary store is
+        // unreadable, a pair that matches nothing may be an enrolled group
+        // the daemon could not summarize. Both keep the verdict unknown.
+        // Groups alone establish nothing about an unmatched pair: with an
+        // unbound (all-None) primary the authentication path accepts any
+        // pair, so only a bound primary or an observed empty enrollment
+        // lets an unmatched pair be called unenrolled. Group matches are
+        // labelled regardless.
+        let bound_primary = self
+            .primary_camera
+            .as_ref()
+            .is_some_and(|binding| binding.rgb.is_some() || binding.ir.is_some());
+        let known = self.camera_store_error.is_none()
+            && (bound_primary || (self.profiles_loaded && self.profiles.is_empty()));
+        camera_role_for(
+            RoleCandidate {
+                identity: pair.identity.as_deref(),
+                id: pair.id.as_deref(),
+                serial_present: pair.serial_present,
+            },
+            self.primary_camera.as_ref(),
+            &self.camera_groups,
+            known,
+        )
+    }
+
+    /// Whether the enrollment matched to `role` holds no template the
+    /// daemon's loaded recognizer can use (#288): the primary's profiles by
+    /// `scans_by_recognizer[live_recognizer]`, a group's by its compatible
+    /// candidate counts. Absent facts (an older daemon) are not zero.
+    fn no_usable_scans_for(&self, role: CameraRole) -> bool {
+        match role {
+            CameraRole::Primary => {
+                !self.profiles.is_empty()
+                    && self.profiles.iter().all(|profile| {
+                        profile.live_recognizer.as_deref().is_some_and(|live| {
+                            profile.scans_by_recognizer.get(live).copied().unwrap_or(0) == 0
+                        })
+                    })
+            }
+            CameraRole::Secondary(index) => {
+                self.camera_groups.get(index - 1).is_some_and(|group| {
+                    !group.profiles.is_empty()
+                        && group.profiles.iter().all(|profile| {
+                            profile.compatible_rgb_candidates == 0
+                                && profile.compatible_ir_pairs == 0
+                        })
+                })
+            }
+            CameraRole::Unenrolled | CameraRole::Unknown => false,
+        }
+    }
+
+    /// The details panel for one listed pair (ADR-0029): identity, nodes,
+    /// connection, enrollment facts and privacy — everything the row used
+    /// to carry, plus what the enrollment knows about this camera.
+    fn camera_details_lines(
+        &self,
+        p: &irlume_common::CameraPairInfo,
+        configured: bool,
+    ) -> Vec<Line<'static>> {
+        let role = self.camera_role(p);
+        let role_text = match role {
+            CameraRole::Secondary(index) => format!("Secondary camera #{index}"),
+            CameraRole::Unknown => "role unknown (older daemon or no USB identity)".into(),
+            other => other.label().to_string(),
+        };
+        let mut lines = vec![section(&format!("{} — {role_text}", camera_row_name(p)))];
+        // The full binding identity when the daemon sends it; the legacy
+        // vid:pid alone from an older daemon, whose serial state is then
+        // unknown rather than "none".
+        let identity = match (
+            p.identity.as_deref().map(printable),
+            p.id.as_deref().map(printable),
+        ) {
+            (Some(identity), _) if p.serial_present => {
+                Span::raw(format!("{identity} · serial present"))
+            }
+            (Some(identity), _) => Span::styled(
+                format!(
+                    "{identity} · no serial: another unit of this model could not be told apart"
+                ),
+                Style::new().fg(th().warn),
+            ),
+            // No identity: the daemon withholds the serial from a non-root
+            // peer (serial_present still tells whether one exists), or it
+            // predates the field.
+            (None, Some(id)) if p.serial_present => Span::styled(
+                format!("{id} · serial present (shown to root only)"),
+                Style::new().dim(),
+            ),
+            (None, Some(id)) => Span::styled(
+                format!("{id} · no serial reported (none, or an older daemon)"),
+                Style::new().dim(),
+            ),
+            (None, None) => {
+                Span::styled("no USB descriptor readable".to_string(), Style::new().dim())
+            }
+        };
+        lines.push(state_row("identity", 12, identity));
+        lines.push(state_row(
+            "nodes",
+            12,
+            Span::raw(format!("{} (RGB) + {} (IR)", p.rgb, p.ir)),
+        ));
+        lines.push(state_row(
+            "connection",
+            12,
+            Span::raw(format!(
+                "{}{}",
+                if p.fixed { "built-in" } else { "external USB" },
+                if configured {
+                    " · the daemon's configured pair"
+                } else {
+                    ""
+                }
+            )),
+        ));
+        let enrolled = match role {
+            CameraRole::Primary => Span::raw(format!(
+                "primary enrollment · {} profile(s)",
+                self.profiles.len()
+            )),
+            CameraRole::Secondary(index) => {
+                let group = &self.camera_groups[index - 1];
+                let scans: usize = group.profiles.iter().map(|profile| profile.scans).sum();
+                Span::raw(format!(
+                    "added camera · {} profile(s), {scans} scan(s) · store generation {}{}",
+                    group.profiles.len(),
+                    group.generation,
+                    if group.stale {
+                        " · inactive: the primary enrollment changed"
+                    } else {
+                        ""
+                    }
+                ))
+            }
+            CameraRole::Unenrolled => Span::styled(
+                "not enrolled for this account · add it from Faces".to_string(),
+                Style::new().dim(),
+            ),
+            CameraRole::Unknown => Span::styled("unknown".to_string(), Style::new().dim()),
+        };
+        lines.push(state_row("enrolled", 12, enrolled));
+        let privacy = if p.privacy && self.source_usable(Source::CameraPrivacy) {
+            Span::styled(
+                "shutter or switch ON".to_string(),
+                Style::new().fg(th().err),
+            )
+        } else if !self.source_usable(Source::CameraPrivacy) {
+            Span::styled("unobserved".to_string(), Style::new().fg(th().warn))
+        } else {
+            Span::styled("open".to_string(), Style::new().fg(th().ok))
+        };
+        lines.push(state_row("privacy", 12, privacy));
+        lines
+    }
+
     fn camera_choice(&self, rgb: &str, ir: &str) -> Option<CameraChoice> {
         let inventory = self.current_inventory()?;
         let candidate = inventory.candidates.iter().find(|candidate| {
@@ -1472,6 +1666,9 @@ impl App {
             self.invalidate_source(Source::Cameras);
             self.invalidate_source(Source::CameraPrivacy);
             self.invalidate_source(Source::Qualification);
+            // Node paths are reused across hotplug, so an observation from
+            // the previous inventory cannot be this hardware's.
+            self.capture_mode = None;
             self.freshness.cycle_mut(Worker::Cameras).invalidate();
             self.freshness.cycle_mut(Worker::Qualification).invalidate();
             self.classified_epoch = None;
@@ -1686,11 +1883,13 @@ impl App {
         self.background_idle()
             && daemon_idle
             && (self.freshness.cycle(Worker::Profiles).pending()
-                || (matches!(self.screen, SC_WELCOME | SC_PROFILES | SC_REPAIR | SC_DONE)
-                    && self
-                        .freshness
-                        .cycle(Worker::Profiles)
-                        .due(now, Duration::from_secs(30))))
+                || (matches!(
+                    self.screen,
+                    SC_WELCOME | SC_PROFILES | SC_REPAIR | SC_DONE | SC_CAMERAS
+                ) && self
+                    .freshness
+                    .cycle(Worker::Profiles)
+                    .due(now, Duration::from_secs(30))))
     }
 
     fn cameras_refresh_due(&self, daemon_idle: bool) -> bool {
@@ -1830,6 +2029,8 @@ impl App {
             profiles: Vec::new(),
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
+            cam_details: false,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -2237,11 +2438,13 @@ impl App {
                     profiles,
                     camera_groups,
                     camera_store_error,
+                    primary_camera,
                     ..
                 }) => ProfilesOutcome::Loaded {
                     profiles,
                     camera_groups,
                     camera_store_error,
+                    primary_camera,
                 },
                 // A corrupt/unreadable enrollment (or a missing template key
                 // for an encrypted file) surfaces as an Error, not empty;
@@ -3600,6 +3803,7 @@ impl App {
                         profiles,
                         camera_groups,
                         camera_store_error,
+                        primary_camera,
                     } => {
                         let selected = self.selected_profile_identity.take().or_else(|| {
                             (self.profiles_loaded || !self.profiles.is_empty())
@@ -3610,6 +3814,7 @@ impl App {
                         self.profiles = profiles;
                         self.camera_groups = camera_groups;
                         self.camera_store_error = camera_store_error;
+                        self.primary_camera = primary_camera;
                         if let Some(selected) = selected {
                             self.sel = self.rows().iter().position(|row| self.profile_row_name(*row) == selected).unwrap_or_else(|| {
                                 self.log('·', "the selected profile or scan was removed or renamed; select a row before acting");
@@ -4639,6 +4844,11 @@ impl App {
             // silently exited the whole TUI (verified on two hosts). Esc with
             // nothing to close lands on Overview instead — a harmless "back".
             KeyCode::Char('q') => self.quit = true,
+            // The Cameras details panel is "something open": Esc closes it
+            // instead of going home (ADR-0029).
+            KeyCode::Esc if self.screen == SC_CAMERAS && self.cam_details => {
+                self.cam_details = false;
+            }
             KeyCode::Esc => self.go_home(),
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::F(2) => self.more_actions = Some((String::new(), 0)),
@@ -4930,7 +5140,20 @@ impl App {
             // an Enter on the row is easy to hit by accident (found during the
             // 0.11.0rc1 walkthrough: a mis-focused Enter ran it blind) and it
             // changes the persisted camera pin.
+            // Cameras: Enter opens the details panel for the selected pair
+            // (ADR-0029); it never changes state, so a stray Enter costs
+            // nothing. Switching is [u], confirmed as before.
             (SC_CAMERAS, KeyCode::Enter) => {
+                if self.pairs.get(self.cam_sel).is_some() {
+                    self.cam_details = !self.cam_details;
+                } else {
+                    self.log(
+                        '·',
+                        "no paired Hello camera to inspect (an RGB-only device has no pair)",
+                    );
+                }
+            }
+            (SC_CAMERAS, KeyCode::Char('u')) => {
                 // Use the cached pairs (clone the selected one so self stays
                 // free for the log/suspend below).
                 match self.pairs.get(self.cam_sel).cloned() {
@@ -4942,10 +5165,12 @@ impl App {
                         self.camera_confirmation = Some(choice.clone());
                         self.confirm = Some((
                             format!(
-                                "Switch the active camera pair to {} + {}? This \
-                                 writes /etc/irlume/cameras.conf and asks for your \
+                                "Always use {} ({} + {})? This writes \
+                                 /etc/irlume/cameras.conf and asks for your \
                                  password.",
-                                p.rgb, p.ir
+                                camera_row_name(&p),
+                                p.rgb,
+                                p.ir
                             ),
                             "Switch",
                             ConfirmAct::Sus(Suspend::SetCameras(p.rgb.clone(), p.ir.clone(),
@@ -5018,6 +5243,8 @@ impl App {
                 self.freshness.cycle_mut(Worker::Cameras).invalidate();
                 self.invalidate_source(Source::Cameras);
                 self.refresh_camera_listing();
+                // The role labels read the enrollment: refresh it too.
+                self.refresh_profiles();
             }
             (SC_CAMERAS, KeyCode::Char('c')) => {
                 self.confirm = Some(("Inspect capture qualification? This opens camera controls when available; it does not capture frames. The result is a dated observation, not a live readiness guarantee.".into(), "Inspect", ConfirmAct::CameraQualification));
@@ -6532,7 +6759,7 @@ impl App {
                     None => "Checking face authentication and system status.",
                 },
                 SC_REPAIR => "System health, clear explanations, and focused repairs.",
-                SC_CAMERAS => "Choose the RGB and infrared camera pair used for recognition.",
+                SC_CAMERAS => "The cameras your face can sign in with; names are for you, the USB identity is what is checked.",
                 SC_PROFILES => "Manage enrolled faces and improve recognition over time.",
                 SC_IDENTIFY => "Test recognition without changing enrollment.",
                 SC_KEYRING => match self.keyring_armed {
@@ -7028,6 +7255,7 @@ impl App {
                 enforce_biopolicy: None,
                 consent_overridden: false,
                 biopolicy_overridden: false,
+                forbid_external_cameras: None,
             })
     }
 
@@ -7247,41 +7475,75 @@ impl App {
             }
             v
         } else {
+            // Name, role, kind, then the one status that matters right now
+            // (ADR-0029). Nodes and USB ids live in the details panel.
+            let external_blocked = self
+                .preferences
+                .filter(|_| self.source_usable(Source::Preferences))
+                .and_then(|state| state.forbid_external_cameras);
             pairs
                 .iter()
                 .map(|p| {
                     let active = p.rgb == argb && p.ir == air;
                     let kind = if p.fixed { "built-in" } else { "external" };
-                    let id = p.id.clone().unwrap_or_else(|| "?".into());
                     let priv_on = p.privacy && self.source_usable(Source::CameraPrivacy);
+                    let role = self.camera_role(p);
+                    let role_text = match role {
+                        CameraRole::Secondary(index) => format!("Secondary camera #{index}"),
+                        other => other.label().to_string(),
+                    };
+                    // A group whose store is stale cannot authenticate until
+                    // it is re-authorized (ADR-0024 §1.1): the row says so
+                    // instead of "ready".
+                    let stale = matches!(role, CameraRole::Secondary(index)
+                        if self.camera_groups.get(index - 1).is_some_and(|group| group.stale));
+                    let no_usable_scans = self.no_usable_scans_for(role);
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             if active { " ● " } else { " ○ " },
                             Style::new().fg(if active { th().ok } else { Color::Reset }),
                         ),
                         Span::styled(
-                            format!(
-                                "{:<16}",
-                                format!(
-                                    "{}+{}",
-                                    p.rgb.trim_start_matches("/dev/"),
-                                    p.ir.trim_start_matches("/dev/")
-                                )
-                            ),
+                            fit_columns(&camera_row_name(p), 26),
                             if active {
                                 Style::new().add_modifier(Modifier::BOLD)
                             } else {
                                 Style::new()
                             },
                         ),
-                        Span::styled(format!("{kind:<10}"), Style::new().fg(th().accent)),
-                        Span::styled(format!("[{id}]"), Style::new().dim()),
+                        Span::styled(
+                            format!("{role_text:<22}"),
+                            match role {
+                                CameraRole::Unenrolled | CameraRole::Unknown => Style::new().dim(),
+                                _ => Style::new().fg(th().accent),
+                            },
+                        ),
+                        Span::styled(format!("{kind:<10}"), Style::new().dim()),
                         if priv_on {
-                            Span::styled("  ⚠ privacy ON", Style::new().fg(th().err))
+                            Span::styled("⚠ privacy ON", Style::new().fg(th().err))
+                        } else if !p.fixed && external_blocked == Some(true) {
+                            // The daemon refuses every non-fixed camera under
+                            // this policy: "ready" would be a false promise.
+                            Span::styled("○ blocked by policy", Style::new().dim())
+                        } else if !p.fixed && external_blocked.is_none() {
+                            Span::styled("◐ policy unobserved", Style::new().fg(th().warn))
+                        } else if matches!(role, CameraRole::Unenrolled) {
+                            // An unenrolled pair cannot sign in: "ready"
+                            // would contradict the refusal it would get.
+                            Span::styled("○ cannot sign in", Style::new().dim())
+                        } else if matches!(role, CameraRole::Unknown) {
+                            Span::styled("◐ role unknown", Style::new().dim())
+                        } else if stale {
+                            Span::styled("⚠ inactive (primary changed)", Style::new().fg(th().warn))
+                        } else if no_usable_scans {
+                            // The enrollment matches this camera but holds no
+                            // template the loaded recognizer can use: the
+                            // daemon refuses before capture, so not "ready".
+                            Span::styled("○ no usable scans", Style::new().dim())
                         } else if !self.source_usable(Source::CameraPrivacy) {
-                            Span::styled("  ◐ privacy unobserved", Style::new().fg(th().warn))
+                            Span::styled("◐ privacy unobserved", Style::new().fg(th().warn))
                         } else {
-                            Span::raw("")
+                            Span::styled("ready", Style::new().fg(th().ok))
                         },
                     ]))
                 })
@@ -7298,7 +7560,7 @@ impl App {
         .areas(list_area);
         f.render_widget(
             Paragraph::new(section(
-                "Cameras  (● = configured · ↑↓ select · Enter uses one)",
+                "Cameras  (● = configured · ↑↓ select · Enter details · u use this camera)",
             )),
             hdr_area,
         );
@@ -7343,6 +7605,89 @@ impl App {
                 ),
             }
         };
+        // Capture schedule in force (the `irlume camera-mode` answer): a
+        // user deciding whether to run [t] tune wants the current verdict
+        // without leaving the screen. Not-fetched draws as not fetched,
+        // never as the default schedule and never as a daemon fault: the
+        // poll simply has not run yet.
+        // A failed latest request is reported before any cached schedule:
+        // an old verdict must not read as the answer to the retry.
+        let qualification_failed = self
+            .freshness
+            .observation(Source::Qualification)
+            .last_request_failed();
+        let capture = match &self.capture_mode {
+            Some(_) if qualification_failed => Span::styled(
+                "last inspection failed; press c to retry".to_string(),
+                Style::new().fg(th().warn),
+            ),
+            // The observation belongs to the pair it was measured on; the
+            // health snapshot names the pair the daemon holds now, so after
+            // a camera switch it is not this pair's until re-inspected.
+            Some(observed)
+                if self.health.is_some() && (observed.rgb != argb || observed.ir != air) =>
+            {
+                Span::styled(
+                    "measured on a previous pair; press c to inspect this one".to_string(),
+                    Style::new().dim(),
+                )
+            }
+            Some(observed) => Span::raw(format!(
+                "last observation ({}): {}",
+                self.source_status(Source::Qualification),
+                observed.text
+            )),
+            // A request that ran and failed is reported as such; only a
+            // request that was never made reads as not fetched.
+            None if self
+                .freshness
+                .observation(Source::Qualification)
+                .last_request_failed() =>
+            {
+                Span::styled(
+                    "last inspection failed; press c to retry".to_string(),
+                    Style::new().fg(th().warn),
+                )
+            }
+            None => Span::styled("not fetched yet".to_string(), Style::new().dim()),
+        };
+        if self.cam_details {
+            if let Some(p) = pairs.get(self.cam_sel) {
+                let configured = argb == p.rgb && air == p.ir;
+                let mut lines = self.camera_details_lines(p, configured);
+                // The schedule observation belongs to the configured pair;
+                // another camera's details do not borrow it.
+                lines.push(Line::from(vec![
+                    Span::styled("  capture schedule  ", Style::new().dim()),
+                    if configured {
+                        capture
+                    } else {
+                        Span::styled(
+                            "measured for the configured pair only; use this camera (u) to qualify it"
+                                .to_string(),
+                            Style::new().dim(),
+                        )
+                    },
+                ]));
+                lines.push(Line::raw(""));
+                push_page_actions(
+                    &mut lines,
+                    &mut page_actions,
+                    &[
+                        (
+                            "u",
+                            "always use this camera (writes /etc/irlume/cameras.conf)",
+                        ),
+                        ("s", "set up IR emitter"),
+                        ("t", "tune capture (holds the camera ~1 min)"),
+                        ("p", "list emitter units (writes nothing)"),
+                        ("esc", "back to the list"),
+                    ],
+                );
+                self.draw_action_paragraph(f, info_area, lines, &page_actions);
+                return;
+            }
+        }
         let mut lines = vec![Line::from(vec![
             Span::styled("  configured ", Style::new().dim()),
             Span::styled(active, active_style),
@@ -7351,25 +7696,11 @@ impl App {
             if p.rgb != argb || p.ir != air {
                 lines.push(Line::from(vec![
                     Span::styled("  selected ", Style::new().dim()),
-                    Span::styled(format!("{} + {}", p.rgb, p.ir), Style::new()),
-                    Span::styled("   [enter] to switch", Style::new().fg(th().accent)),
+                    Span::styled(camera_row_name(p), Style::new()),
+                    Span::styled("   [u] to use it", Style::new().fg(th().accent)),
                 ]));
             }
         }
-        // Capture schedule in force (the `irlume camera-mode` answer): a
-        // user deciding whether to run [t] tune wants the current verdict
-        // without leaving the screen. Not-fetched draws as unknown, never
-        // as the default schedule.
-        let capture = match &self.capture_mode {
-            Some(text) => Span::raw(format!(
-                "last observation ({}): {text}",
-                self.source_status(Source::Qualification)
-            )),
-            None => Span::styled(
-                "unknown (daemon not answering)".to_string(),
-                Style::new().dim(),
-            ),
-        };
         lines.push(Line::from(vec![
             Span::styled("  capture history  ", Style::new().dim()),
             capture,
@@ -8868,9 +9199,10 @@ impl App {
                 ("t", "Toggle Debug Logs"),
             ],
             SC_CAMERAS => &[
+                ("enter", "Camera Details"),
+                ("u", "Use This Camera…"),
                 ("r", "Inspect Candidates"),
                 ("c", "Inspect Qualification"),
-                ("enter", "Use Selected Pair…"),
                 ("s", "Set Up Emitter…"),
                 ("p", "List Units"),
                 ("t", "Tune Capture…"),
@@ -9213,6 +9545,186 @@ fn footer_keycode(k: &str) -> Option<KeyCode> {
             }
         }
     }
+}
+
+/// Which enrolled role a listed camera pair holds for the account whose
+/// enrollment the TUI shows (ADR-0029): the primary binding, an added
+/// camera group by its 1-based store position, or none. Labels only —
+/// the daemon decides which store an attempt scores against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CameraRole {
+    Primary,
+    Secondary(usize),
+    Unenrolled,
+    /// The daemon predates the role fields or the pair has no identity.
+    Unknown,
+}
+
+impl CameraRole {
+    fn label(self) -> &'static str {
+        match self {
+            CameraRole::Primary => "Primary camera",
+            CameraRole::Secondary(_) => "Secondary camera",
+            CameraRole::Unenrolled => "not enrolled",
+            CameraRole::Unknown => "",
+        }
+    }
+}
+
+/// A binding (primary or group) names this identity when every bound side
+/// equals it and at least one side is bound. An unbound side is unchecked,
+/// as the dual path's `GroupPair::matches` treats it.
+fn binding_names(rgb: Option<&str>, ir: Option<&str>, identity: &str) -> bool {
+    let sides = [rgb, ir];
+    let bound = sides.iter().flatten().count();
+    bound > 0 && sides.iter().flatten().all(|side| *side == identity)
+}
+
+/// `vid:pid` of a binding identity (`vid:pid[:serial]`), for matching a
+/// listing that withholds the serial.
+fn without_serial(identity: &str) -> &str {
+    match identity.match_indices(':').nth(1) {
+        Some((at, _)) => &identity[..at],
+        None => identity,
+    }
+}
+
+/// What a listed pair tells the client about itself for role matching.
+#[derive(Clone, Copy, Debug)]
+struct RoleCandidate<'a> {
+    /// The full binding identity; a root peer only.
+    identity: Option<&'a str>,
+    /// `vid:pid`, every peer.
+    id: Option<&'a str>,
+    /// Whether the unit reports a serial (withheld from non-root peers).
+    serial_present: bool,
+}
+
+/// Whether a binding names the candidate: `Some(true)` / `Some(false)`
+/// when the client can tell, `None` when it cannot.
+fn binding_names_candidate(
+    rgb: Option<&str>,
+    ir: Option<&str>,
+    candidate: RoleCandidate<'_>,
+) -> Option<bool> {
+    if let Some(identity) = candidate.identity {
+        return Some(binding_names(rgb, ir, identity));
+    }
+    let id = candidate.id?;
+    let bound_with_serial = [rgb, ir]
+        .into_iter()
+        .flatten()
+        .any(|side| without_serial(side) != side);
+    if !binding_names(rgb.map(without_serial), ir.map(without_serial), id) {
+        return Some(false);
+    }
+    if !bound_with_serial {
+        return Some(true);
+    }
+    // The binding carries a serial the daemon withheld. A unit without one
+    // is definitely not it; with one, the client cannot tell this unit
+    // from any other of the model (the enrolled one may be unplugged and a
+    // twin attached alone), so no role is claimed: ADR-0030 moves this
+    // correlation into the daemon.
+    if candidate.serial_present {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+fn camera_role_for(
+    candidate: RoleCandidate<'_>,
+    primary: Option<&irlume_common::PrimaryCameraBinding>,
+    groups: &[irlume_common::CameraGroupSummary],
+    enrollment_known: bool,
+) -> CameraRole {
+    if candidate.identity.is_none() && candidate.id.is_none() {
+        return CameraRole::Unknown;
+    }
+    if let Some(primary) = primary {
+        match binding_names_candidate(primary.rgb.as_deref(), primary.ir.as_deref(), candidate) {
+            Some(true) => return CameraRole::Primary,
+            None => return CameraRole::Unknown,
+            Some(false) => {}
+        }
+    }
+    for (index, group) in groups.iter().enumerate() {
+        match binding_names_candidate(group.rgb.as_deref(), group.ir.as_deref(), candidate) {
+            Some(true) => return CameraRole::Secondary(index + 1),
+            None => return CameraRole::Unknown,
+            Some(false) => {}
+        }
+    }
+    if enrollment_known {
+        CameraRole::Unenrolled
+    } else {
+        CameraRole::Unknown
+    }
+}
+
+/// The name a row leads with: the camera's own name, else its node pair.
+/// Device text is scrubbed of control characters here too, so the TUI
+/// stays safe against a daemon that predates the camera crate's own
+/// scrubbing.
+fn camera_row_name(pair: &irlume_common::CameraPairInfo) -> String {
+    pair.name
+        .as_deref()
+        .map(|name| {
+            name.chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}+{}",
+                pair.rgb.trim_start_matches("/dev/"),
+                pair.ir.trim_start_matches("/dev/")
+            )
+        })
+}
+
+/// A name clipped to a column slot with an ellipsis, so a long USB name
+/// never pushes the role and status columns off the row. Measured in
+/// terminal cells, not characters: a wide (CJK, emoji) name takes two
+/// cells per character and is clipped accordingly.
+fn clip_columns(text: &str, width: usize) -> String {
+    let cells = |s: &str| Span::raw(s.to_owned()).width();
+    if cells(text) <= width {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        let mut candidate = out.clone();
+        candidate.push(ch);
+        if cells(&candidate) > width.saturating_sub(1) {
+            break;
+        }
+        out = candidate;
+    }
+    out.push('…');
+    out
+}
+
+/// `text` clipped to `width` cells and padded with spaces to exactly that
+/// many cells, so the next column starts where it should whatever the
+/// script.
+fn fit_columns(text: &str, width: usize) -> String {
+    let mut out = clip_columns(text, width);
+    let used = Span::raw(out.clone()).width();
+    out.extend(std::iter::repeat_n(' ', width.saturating_sub(used)));
+    out
+}
+
+/// Device-supplied text for a screen: control characters blanked so a
+/// crafted descriptor (name or serial) cannot inject terminal sequences.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 fn section(title: &str) -> Line<'static> {
@@ -10903,6 +11415,7 @@ mod tests {
             profiles: vec![profile("Alice", &["a1", "a2"]), profile("Bob", &["b1"])],
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         })
         .unwrap();
         app.poll();
@@ -10926,6 +11439,7 @@ mod tests {
             profiles: vec![profile("Alice", &["a1"]), profile("Carol", &["c1"])],
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         })
         .unwrap();
         app.poll();
@@ -10937,6 +11451,7 @@ mod tests {
             profiles: vec![profile("Alice", &["a1", "a2"]), profile("Carol", &["c1"])],
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         })
         .unwrap();
         app.poll();
@@ -11151,6 +11666,8 @@ mod tests {
             profiles: Vec::new(),
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
+            cam_details: false,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -12798,6 +13315,9 @@ mod tests {
                 id: None,
                 fixed: true,
                 privacy: false,
+                name: None,
+                identity: None,
+                serial_present: false,
             },
             irlume_common::CameraPairInfo {
                 rgb: "/dev/video4".into(),
@@ -12805,6 +13325,9 @@ mod tests {
                 id: None,
                 fixed: false,
                 privacy: false,
+                name: None,
+                identity: None,
+                serial_present: false,
             },
         ];
         app.on_key(KeyCode::Up);
@@ -13145,7 +13668,7 @@ mod tests {
             vec!["/dev/video0".into(), "/dev/video2".into()];
         app.apply_live_snapshot(snapshot, app.now());
         app.screen = SC_CAMERAS;
-        app.on_key(KeyCode::Enter);
+        app.on_key(KeyCode::Char('u'));
         assert!(app.suspend.is_none());
         assert!(app.confirm.is_none(), "no pair -> no confirm either");
         let (_, msg) = app.activity.last().expect("the no-pair case is explained");
@@ -13156,14 +13679,27 @@ mod tests {
             id: Some("abcd:1234".into()),
             fixed: true,
             privacy: false,
+            name: None,
+            identity: None,
+            serial_present: false,
         }];
         app.cam_sel = 0;
+        // Enter opens the details panel and changes nothing (ADR-0029);
+        // Esc closes it. Switching is [u].
         app.on_key(KeyCode::Enter);
-        // Enter ARMS the confirm dialog (0.11.0rc1 finding: a mis-focused
-        // Enter ran the sudo op blind); only the dialog's y/Esc fires it.
+        assert!(app.cam_details && app.confirm.is_none() && app.suspend.is_none());
+        app.on_key(KeyCode::Esc);
+        assert!(!app.cam_details, "Esc closes the details panel");
+        assert_eq!(
+            app.screen, SC_CAMERAS,
+            "Esc with details open does not go home"
+        );
+        app.on_key(KeyCode::Char('u'));
+        // [u] ARMS the confirm dialog (0.11.0rc1 finding: a mis-focused
+        // key ran the sudo op blind); only the dialog's y/Esc fires it.
         assert!(
             app.suspend.is_none(),
-            "Enter must not suspend straight into sudo set-cameras"
+            "u must not suspend straight into sudo set-cameras"
         );
         let (_, _verb, act) = app.confirm.take().expect("confirm dialog armed");
         match act {
@@ -13172,6 +13708,458 @@ mod tests {
             }
             _ => panic!("confirm action must be SetCameras"),
         }
+    }
+
+    /// ADR-0029: the row labels a pair by the account's enrollment, from
+    /// identities only; an older daemon (no binding field, no groups)
+    /// claims no role, and a name never matters.
+    #[test]
+    fn camera_roles_follow_the_binding_and_the_groups_by_identity() {
+        use irlume_common::{CameraGroupSummary, PrimaryCameraBinding};
+        // A root peer's candidate: the full identity, nothing withheld.
+        let exact = |identity: &'static str| RoleCandidate {
+            identity: Some(identity),
+            id: None,
+            serial_present: identity.matches(':').count() > 1,
+        };
+        // An ordinary account's candidate: vid:pid only.
+        let redacted = |id: &'static str, serial_present: bool| RoleCandidate {
+            identity: None,
+            id: Some(id),
+            serial_present,
+        };
+        let none = RoleCandidate {
+            identity: None,
+            id: None,
+            serial_present: false,
+        };
+        let primary = PrimaryCameraBinding {
+            rgb: Some("046d:085e:e179cb54".into()),
+            ir: Some("046d:085e:e179cb54".into()),
+        };
+        let group = |id: &str, rgb: Option<&str>, ir: Option<&str>| CameraGroupSummary {
+            id: id.into(),
+            rgb: rgb.map(str::to_owned),
+            ir: ir.map(str::to_owned),
+            connected: true,
+            selected: false,
+            stale: false,
+            generation: 1,
+            profiles: Vec::new(),
+        };
+        let groups = vec![
+            group("desk", Some("3443:c803"), Some("3443:c803")),
+            group("one-sided", None, Some("1bcf:28c4")),
+        ];
+        assert_eq!(
+            camera_role_for(exact("046d:085e:e179cb54"), Some(&primary), &groups, true),
+            CameraRole::Primary
+        );
+        assert_eq!(
+            camera_role_for(exact("3443:c803"), Some(&primary), &groups, true),
+            CameraRole::Secondary(1)
+        );
+        // A one-sided group names its bound side only.
+        assert_eq!(
+            camera_role_for(exact("1bcf:28c4"), Some(&primary), &groups, true),
+            CameraRole::Secondary(2)
+        );
+        assert_eq!(
+            camera_role_for(exact("3277:0059"), Some(&primary), &groups, true),
+            CameraRole::Unenrolled
+        );
+        // The primary keeps precedence over a group with the same pair.
+        let dup = vec![group(
+            "dup",
+            Some("046d:085e:e179cb54"),
+            Some("046d:085e:e179cb54"),
+        )];
+        assert_eq!(
+            camera_role_for(exact("046d:085e:e179cb54"), Some(&primary), &dup, true),
+            CameraRole::Primary
+        );
+        // No identity, or an enrollment the daemon did not describe: no claim.
+        assert_eq!(
+            camera_role_for(none, Some(&primary), &groups, true),
+            CameraRole::Unknown
+        );
+        assert_eq!(
+            camera_role_for(exact("3277:0059"), None, &[], false),
+            CameraRole::Unknown
+        );
+        // Without the serial (a non-root peer), a serial-bearing binding is
+        // never claimed for a unit that reports a serial: the client cannot
+        // tell it from a twin (the daemon resolves this, ADR-0030).
+        assert_eq!(
+            camera_role_for(redacted("046d:085e", true), Some(&primary), &groups, true),
+            CameraRole::Unknown
+        );
+        // A unit without a serial cannot be a serial-bearing binding.
+        assert_eq!(
+            camera_role_for(redacted("046d:085e", false), Some(&primary), &groups, true),
+            CameraRole::Unenrolled
+        );
+        // A serial-less binding matches by vid:pid.
+        assert_eq!(
+            camera_role_for(redacted("3443:c803", false), Some(&primary), &groups, true),
+            CameraRole::Secondary(1)
+        );
+    }
+
+    /// ADR-0029: the row leads with the camera's name and its role; the
+    /// node pair is the fallback when the daemon sends no name.
+    #[test]
+    fn cameras_rows_show_names_and_roles_and_details_show_the_identity() {
+        let mut app = live_test_app();
+        let mut snapshot = live_test_snapshot();
+        snapshot.cameras.candidates[0].endpoint_paths =
+            vec!["/dev/video0".into(), "/dev/video2".into()];
+        app.apply_live_snapshot(snapshot, app.now());
+        app.screen = SC_CAMERAS;
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Cameras)
+            .record(true, now);
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: Some("3277:0059".into()),
+            ir: Some("3277:0059".into()),
+        });
+        app.pairs = vec![
+            irlume_common::CameraPairInfo {
+                rgb: "/dev/video0".into(),
+                ir: "/dev/video2".into(),
+                id: Some("3277:0059".into()),
+                fixed: true,
+                privacy: false,
+                name: Some("ASUS Integrated Camera".into()),
+                identity: Some("3277:0059".into()),
+                serial_present: false,
+            },
+            irlume_common::CameraPairInfo {
+                rgb: "/dev/video4".into(),
+                ir: "/dev/video6".into(),
+                id: Some("3443:c803".into()),
+                fixed: false,
+                privacy: false,
+                name: None,
+                identity: Some("3443:c803".into()),
+                serial_present: false,
+            },
+        ];
+        // The external-camera policy is observed and off, so the external
+        // pair's status reflects its role rather than the policy (the
+        // policy cases are asserted further down).
+        app.preferences = Some(irlume_common::PreferencesState {
+            face_sensor_policy: irlume_common::config::FaceSensorPolicyObservation::DefaultDual,
+            privileged_face_consent: None,
+            enforce_biopolicy: None,
+            consent_overridden: false,
+            biopolicy_overridden: false,
+            forbid_external_cameras: Some(false),
+        });
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Preferences)
+            .record(true, now);
+        let render = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            rendered(&term)
+        };
+        let text = render(&mut app);
+        assert!(text.contains("ASUS Integrated Camera"), "{text}");
+        assert!(text.contains("Primary camera"), "{text}");
+        assert!(
+            text.contains("video4+video6"),
+            "unnamed pair falls back to nodes: {text}"
+        );
+        assert!(text.contains("not enrolled"), "{text}");
+        let unenrolled = text.lines().find(|l| l.contains("not enrolled")).unwrap();
+        assert!(
+            unenrolled.contains("cannot sign in") && !unenrolled.contains("ready"),
+            "{unenrolled}"
+        );
+        assert!(
+            !text.contains("[3277:0059]"),
+            "the USB id leaves the row for the details panel: {text}"
+        );
+        let primary_row = |text: &str| {
+            text.lines()
+                .find(|l| l.contains("Primary camera"))
+                .unwrap()
+                .to_string()
+        };
+        app.freshness
+            .observation_mut(Source::CameraPrivacy)
+            .record(true, now);
+        let text = render(&mut app);
+        assert!(primary_row(&text).contains("ready"), "{text}");
+        // An enrollment with no template for the loaded recognizer is
+        // refused before capture: the row must not say "ready".
+        let mut incompatible = profile("BEN", &["a"]);
+        incompatible.live_recognizer = Some("arcface-v2".into());
+        incompatible.scans_by_recognizer.insert("legacy".into(), 1);
+        app.profiles = vec![incompatible];
+        let text = render(&mut app);
+        let row = primary_row(&text);
+        assert!(
+            row.contains("no usable scans") && !row.contains("ready"),
+            "{row}"
+        );
+        // A daemon that does not report the live recognizer establishes
+        // nothing about usability.
+        app.profiles = vec![profile("BEN", &["a"])];
+        assert!(primary_row(&render(&mut app)).contains("ready"));
+        app.profiles.clear();
+
+        assert!(text.contains("not fetched yet"), "{text}");
+        // A qualification inspection that ran and failed is reported, not
+        // left looking like a fetch that never happened.
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Qualification)
+            .record(false, now);
+        let text = render(&mut app);
+        assert!(text.contains("last inspection failed"), "{text}");
+        assert!(!text.contains("not fetched yet"), "{text}");
+        app.freshness
+            .observation_mut(Source::Qualification)
+            .invalidate();
+        app.cam_sel = 0;
+        app.on_key(KeyCode::Enter);
+        let text = render(&mut app);
+        assert!(
+            text.contains("3277:0059"),
+            "details carry the identity: {text}"
+        );
+        assert!(text.contains("no serial"), "{text}");
+        assert!(
+            text.contains("/dev/video0 (RGB) + /dev/video2 (IR)"),
+            "{text}"
+        );
+        assert!(text.contains("primary enrollment"), "{text}");
+        // A serial-bearing camera shows its full identity; an older daemon's
+        // row (no identity field) never claims "no serial".
+        app.on_key(KeyCode::Esc);
+        app.pairs[1].identity = Some("3443:c803:sn0042".into());
+        app.pairs[1].serial_present = true;
+        app.pairs[0].identity = None;
+        app.pairs[0].serial_present = false;
+        app.cam_sel = 1;
+        app.on_key(KeyCode::Enter);
+        let text = render(&mut app);
+        assert!(text.contains("3443:c803:sn0042 · serial present"), "{text}");
+        app.on_key(KeyCode::Esc);
+        app.cam_sel = 0;
+        app.on_key(KeyCode::Enter);
+        let text = render(&mut app);
+        assert!(
+            text.contains("no serial reported (none, or an older daemon)"),
+            "{text}"
+        );
+        assert!(!text.contains("no serial:"), "{text}");
+        app.on_key(KeyCode::Esc);
+        // Identity withheld from an ordinary account, serial known to exist.
+        app.pairs[0].serial_present = true;
+        app.on_key(KeyCode::Enter);
+        let text = render(&mut app);
+        assert!(
+            text.contains("serial present (shown to root only)"),
+            "{text}"
+        );
+        app.pairs[0].serial_present = false;
+        app.on_key(KeyCode::Esc);
+        // A stale group keeps its role but the row says it is inactive.
+        app.camera_groups = vec![irlume_common::CameraGroupSummary {
+            id: "desk".into(),
+            rgb: Some("3443:c803".into()),
+            ir: Some("3443:c803".into()),
+            connected: true,
+            selected: false,
+            stale: true,
+            generation: 4,
+            profiles: Vec::new(),
+        }];
+        app.pairs[1].identity = Some("3443:c803".into());
+        let text = render(&mut app);
+        assert!(text.contains("Secondary camera #1"), "{text}");
+        assert!(text.contains("inactive (primary changed)"), "{text}");
+        // The schedule observation is shown only on the configured pair.
+        app.cam_sel = 1;
+        app.on_key(KeyCode::Enter);
+        let text = render(&mut app);
+        assert!(
+            text.contains("measured for the configured pair only"),
+            "{text}"
+        );
+        app.on_key(KeyCode::Esc);
+        app.cam_sel = 0;
+        // An unreadable enrollment stops labelling: clearing the profile
+        // source clears the roles with it.
+        app.clear_source(Source::Profiles);
+        let text = render(&mut app);
+        assert!(!text.contains("Primary camera"), "{text}");
+        assert!(!text.contains("Secondary camera"), "{text}");
+        // A long or hostile name never pushes the role column off the row,
+        // and control characters never reach the terminal.
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: Some("3277:0059".into()),
+            ir: Some("3277:0059".into()),
+        });
+        app.pairs[0].identity = Some("3277:0059".into());
+        app.pairs[0].name =
+            Some("\x1b[31mA very long camera product string that keeps going".into());
+        let text = render(&mut app);
+        assert!(text.contains("[31mA very long camera pr…"), "{text}");
+        assert!(text.contains("Primary camera"), "{text}");
+        assert!(!text.contains('\x1b'), "{text}");
+        // A wide-character name is clipped by terminal cells, so the role
+        // column still lands in place.
+        app.pairs[0].name = Some("摄像头摄像头摄像头摄像头摄像头摄像头摄像头摄像头".into());
+        let text = render(&mut app);
+        // 12 wide glyphs (24 cells) + the ellipsis fit the 26-cell slot; the
+        // test backend pads each wide glyph with a spacer cell.
+        let row = text.lines().find(|l| l.contains("Primary camera")).unwrap();
+        assert!(row.contains('…'), "{row}");
+        assert_eq!(row.matches('摄').count(), 4, "{row}");
+        assert!(row.contains("Primary camera        built-in"), "{row}");
+        // A serial with control characters never reaches the terminal.
+        app.pairs[0].identity = Some("3277:0059:\x1b[2Jsn".into());
+        app.pairs[0].serial_present = true;
+        app.cam_sel = 0;
+        app.on_key(KeyCode::Enter);
+        let text = render(&mut app);
+        assert!(text.contains("3277:0059: [2Jsn"), "{text}");
+        assert!(!text.contains('\x1b'), "{text}");
+        app.on_key(KeyCode::Esc);
+        // A cached schedule never outranks a failed retry.
+        app.capture_mode = Some(CaptureObservation {
+            rgb: "/dev/video40".into(),
+            ir: "/dev/video42".into(),
+            text: "sequential (source: test)".into(),
+        });
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Qualification)
+            .record(false, now);
+        let text = render(&mut app);
+        assert!(text.contains("last inspection failed"), "{text}");
+        // A successful observation is shown only for the pair it measured;
+        // after a camera switch it is not presented as this pair's.
+        app.freshness
+            .observation_mut(Source::Qualification)
+            .record(true, now);
+        let text = render(&mut app);
+        assert!(text.contains("sequential (source: test)"), "{text}");
+        if let Some(h) = app.health.as_mut() {
+            h.ir_dev = Some("/dev/video4".into());
+        }
+        let text = render(&mut app);
+        assert!(text.contains("measured on a previous pair"), "{text}");
+        assert!(!text.contains("sequential (source: test)"), "{text}");
+        if let Some(h) = app.health.as_mut() {
+            h.ir_dev = Some("/dev/video42".into());
+        }
+        app.capture_mode = None;
+        app.freshness
+            .observation_mut(Source::Qualification)
+            .invalidate();
+        // An all-None binding is an unbound primary: no camera is labelled.
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: None,
+            ir: None,
+        });
+        app.camera_groups.clear();
+        let text = render(&mut app);
+        assert!(!text.contains("not enrolled"), "{text}");
+        assert!(!text.contains("Primary camera"), "{text}");
+        // An unbound primary beside a group: the group is labelled, the
+        // unmatched pair stays unknown.
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: None,
+            ir: None,
+        });
+        app.camera_groups = vec![irlume_common::CameraGroupSummary {
+            id: "desk".into(),
+            rgb: Some("3443:c803".into()),
+            ir: Some("3443:c803".into()),
+            connected: true,
+            selected: false,
+            stale: false,
+            generation: 1,
+            profiles: Vec::new(),
+        }];
+        app.pairs[1].identity = Some("3443:c803".into());
+        let text = render(&mut app);
+        assert!(text.contains("Secondary camera #1"), "{text}");
+        assert!(!text.contains("not enrolled"), "{text}");
+        app.camera_groups.clear();
+        // An unreadable secondary store keeps unmatched pairs unknown.
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: Some("3277:0059".into()),
+            ir: Some("3277:0059".into()),
+        });
+        app.camera_store_error = Some("store unreadable".into());
+        let text = render(&mut app);
+        assert!(!text.contains("not enrolled"), "{text}");
+        app.camera_store_error = None;
+        // An external camera under the external-camera prohibition is
+        // never "ready"; with the policy unobserved it says so.
+        let base = app.preferences.unwrap_or(irlume_common::PreferencesState {
+            face_sensor_policy: irlume_common::config::FaceSensorPolicyObservation::DefaultDual,
+            privileged_face_consent: None,
+            enforce_biopolicy: None,
+            consent_overridden: false,
+            biopolicy_overridden: false,
+            forbid_external_cameras: None,
+        });
+        app.preferences = Some(irlume_common::PreferencesState {
+            forbid_external_cameras: Some(true),
+            ..base
+        });
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Preferences)
+            .record(true, now);
+        app.freshness
+            .observation_mut(Source::CameraPrivacy)
+            .record(true, now);
+        let text = render(&mut app);
+        let external = text.lines().find(|l| l.contains("video4+video6")).unwrap();
+        assert!(external.contains("blocked by policy"), "{external}");
+        app.preferences = Some(irlume_common::PreferencesState {
+            forbid_external_cameras: None,
+            ..base
+        });
+        let text = render(&mut app);
+        let external = text.lines().find(|l| l.contains("video4+video6")).unwrap();
+        assert!(external.contains("policy unobserved"), "{external}");
+        app.preferences = Some(irlume_common::PreferencesState {
+            forbid_external_cameras: Some(false),
+            ..base
+        });
+        // A successfully observed empty enrollment labels every camera as
+        // not enrolled instead of claiming nothing.
+        app.primary_camera = None;
+        app.camera_groups.clear();
+        app.profiles.clear();
+        app.profiles_loaded = true;
+        app.pairs[0].identity = Some("3277:0059".into());
+        app.pairs[0].name = Some("ASUS Integrated Camera".into());
+        let text = render(&mut app);
+        assert!(text.contains("not enrolled"), "{text}");
+        // A hotplug (new inventory revision) drops the capture observation:
+        // node paths are reused, so it cannot be this hardware's.
+        app.capture_mode = Some(CaptureObservation {
+            rgb: "/dev/video40".into(),
+            ir: "/dev/video42".into(),
+            text: "sequential (source: test)".into(),
+        });
+        let mut changed = live_test_snapshot();
+        changed.cameras.revision = changed.cameras.revision.wrapping_add(1);
+        let now = app.now();
+        app.apply_live_snapshot(changed, now);
+        assert!(app.capture_mode.is_none(), "hotplug keeps no observation");
     }
 
     #[test]
@@ -14201,6 +15189,7 @@ mod tests {
             profiles: vec![profile("Alice", &["s1"])],
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         })
         .unwrap();
         app.poll();
@@ -14259,6 +15248,7 @@ mod tests {
             profiles: Vec::new(),
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         })
         .unwrap();
         app.poll();
@@ -14802,13 +15792,25 @@ mod tests {
             id: Some("abcd:1234".into()),
             fixed: true,
             privacy: false,
+            name: None,
+            identity: None,
+            serial_present: false,
         }];
         let text = draw_text(&app);
+        // No name from the daemon: the node pair is the row's name; the USB
+        // id belongs to the details panel (ADR-0029).
         assert!(text.contains("video0+video2"));
         assert!(text.contains("built-in"));
-        assert!(text.contains("[abcd:1234]"));
+        assert!(!text.contains("[abcd:1234]"), "{text}");
         assert!(text.contains("IR emitter (850nm)"));
         assert!(text.contains("[s]"), "the emitter setup key is advertised");
+        app.on_key(KeyCode::Enter);
+        let text = draw_text(&app);
+        assert!(text.contains("abcd:1234"), "details carry the id: {text}");
+        assert!(
+            text.contains("role unknown"),
+            "no enrollment described: {text}"
+        );
     }
 
     #[test]
@@ -15053,7 +16055,7 @@ mod tests {
         let cases: [(usize, &str, &str); 11] = [
             (SC_WELCOME, "Enroll Face", "Uninstall"),
             (SC_REPAIR, "Fix Selected Issue", "Toggle Debug Logs"),
-            (SC_CAMERAS, "Inspect Candidates", "Use Selected Pair"),
+            (SC_CAMERAS, "Camera Details", "Use This Camera"),
             (SC_PROFILES, "Enroll Face", "Delete"),
             (SC_IDENTIFY, "Test Recognition", "Test Recognition"),
             (SC_KEYRING, "Connect Wallet", "Forget"),
@@ -16711,6 +17713,9 @@ mod tests {
             id: Some("example".into()),
             fixed: true,
             privacy: false,
+            name: None,
+            identity: None,
+            serial_present: false,
         }];
         app.on_key(KeyCode::F(6));
         app.on_key(KeyCode::Down); // keyboard focus is on another control, not the selected camera row
@@ -16724,13 +17729,19 @@ mod tests {
             .find_map(|(rect, click)| matches!(click, Click::Select(0)).then_some(*rect))
             .unwrap();
         app.on_click(row.x, row.y, area);
+        // A second click on the selected row is Enter: the details panel
+        // opens (ADR-0029); the focused, unrelated control never fires and
+        // nothing is confirmed or suspended.
+        assert!(app.cam_details, "click on the selected row opens details");
+        assert!(app.confirm.is_none() && app.suspend.is_none());
+        app.on_key(KeyCode::Char('u'));
         assert!(
             matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::SetCameras(rgb, ir, _))))
             if rgb == "/dev/example-rgb" && ir == "/dev/example-ir")
         );
         assert!(
             app.suspend.is_none(),
-            "click retains the camera-switch confirmation"
+            "u retains the camera-switch confirmation"
         );
     }
 
@@ -16797,6 +17808,7 @@ mod tests {
             enforce_biopolicy: Some(true),
             consent_overridden: false,
             biopolicy_overridden: false,
+            forbid_external_cameras: None,
         }
     }
 

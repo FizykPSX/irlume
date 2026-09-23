@@ -3707,6 +3707,63 @@ struct EnrollmentSummary {
     ir_ratio_calibrated: bool,
     camera_groups: Vec<irlume_common::CameraGroupSummary>,
     camera_store_error: Option<String>,
+    /// The primary enrollment's camera binding (ADR-0029), for the
+    /// client's role labels; identities only.
+    primary_camera: Option<irlume_common::PrimaryCameraBinding>,
+    /// The primary file's state when this summary was built, so a cache
+    /// hit can tell a legacy rewrite of the primary (which sends no
+    /// request) from an unchanged file.
+    primary_digest: PrimaryDigest,
+}
+
+/// The primary enrollment file as one cheap read sees it: absent, present
+/// with the SHA-256 of its bytes, or unreadable. Absent and unreadable are
+/// distinct so a file that appears in an unreadable form (a directory, a
+/// permission or I/O failure) is never mistaken for "still absent" and
+/// the failure reaches the worker, which reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PrimaryDigest {
+    Absent,
+    Present(String),
+    Unreadable,
+    /// The file changed while the summary was being built, so the digest
+    /// cannot be tied to the bytes the summary describes.
+    Unsettled,
+}
+
+impl PrimaryDigest {
+    /// Whether a summary built at `self` still describes a file now at
+    /// `now`: only two absences or two equal digests. A read failure or an
+    /// unsettled build on either side is never "unchanged".
+    fn unchanged(&self, now: &PrimaryDigest) -> bool {
+        match (self, now) {
+            (PrimaryDigest::Absent, PrimaryDigest::Absent) => true,
+            (PrimaryDigest::Present(then), PrimaryDigest::Present(now)) => then == now,
+            _ => false,
+        }
+    }
+
+    /// The digest to publish for a summary built from a load that began at
+    /// `before` and ended at `after`: the file's digest only if it did not
+    /// change in between, so a legacy writer racing the load cannot leave
+    /// a summary of the old bytes filed under the new file's digest.
+    fn settled(before: PrimaryDigest, after: PrimaryDigest) -> PrimaryDigest {
+        if before.unchanged(&after) {
+            after
+        } else {
+            PrimaryDigest::Unsettled
+        }
+    }
+}
+
+/// The current primary file's state: one file read, no TPM, safe on a
+/// connection thread.
+fn primary_digest_now(user: &str) -> PrimaryDigest {
+    match std::fs::read(irlume_core::multi_camera::primary_enrollment_path(user)) {
+        Ok(bytes) => PrimaryDigest::Present(irlume_common::sha256_hex(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PrimaryDigest::Absent,
+        Err(_) => PrimaryDigest::Unreadable,
+    }
 }
 
 impl EnrollmentSummary {
@@ -3719,6 +3776,7 @@ impl EnrollmentSummary {
             ir_ratio_calibrated: self.ir_ratio_calibrated,
             camera_groups: self.camera_groups,
             camera_store_error: self.camera_store_error,
+            primary_camera: self.primary_camera,
         }
     }
 }
@@ -3806,6 +3864,13 @@ fn summarize_enrollment(
         Some(enr) => EnrollmentSummary {
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: enr.camera_binding.as_ref().map(|binding| {
+                irlume_common::PrimaryCameraBinding {
+                    rgb: binding.rgb.clone(),
+                    ir: binding.ir.clone(),
+                }
+            }),
+            primary_digest: PrimaryDigest::Absent,
             profiles: enr
                 .profiles
                 .iter()
@@ -3841,6 +3906,8 @@ fn summarize_enrollment(
         None => EnrollmentSummary {
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
+            primary_digest: PrimaryDigest::Absent,
             profiles: Vec::new(),
             ir_ratio_calibrated: false,
         },
@@ -4213,6 +4280,14 @@ fn dispatch_status_with_diagnostics(
             // publishes. Serving the real load here would put a TPM command
             // and a potential template-key WRITE on a connection thread.
             match cached_enrollment_summary(user) {
+                // A primary rewritten by a legacy writer since publication
+                // sends no request: its binding may have changed, so the
+                // cached summary is a miss and the worker reloads (ADR-0029).
+                // Compared even when the file was absent at publication, so
+                // an enrollment created since is seen.
+                Some(sum) if !sum.primary_digest.unchanged(&primary_digest_now(user)) => {
+                    return None
+                }
                 Some(mut sum) => {
                     // Hotplug and legacy rewrites since publication must
                     // not be hidden by the cache: refresh the volatile
@@ -5371,6 +5446,7 @@ fn dispatch_scoped_session_inner(
                     Response::Error(prose)
                 }
             };
+            let digest_before = primary_digest_now(&user);
             match irlume_core::storage::load(&user) {
                 Ok(enr) => {
                     // The status path serves this snapshot from now on; the
@@ -5387,6 +5463,10 @@ fn dispatch_scoped_session_inner(
                     let (camera_groups, camera_store_error) = camera_group_rows(&user, engine);
                     sum.camera_groups = camera_groups;
                     sum.camera_store_error = camera_store_error;
+                    // Tied to the bytes the load read: a file that changed
+                    // under the load is not filed under its new digest.
+                    sum.primary_digest =
+                        PrimaryDigest::settled(digest_before, primary_digest_now(&user));
                     publish_enrollment_summary(&user, sum.clone());
                     sum.into_response()
                 }
@@ -6262,6 +6342,12 @@ fn dispatch_scoped_session_inner(
                     ir: p.ir,
                     id: p.id,
                     fixed: p.fixed,
+                    name: p.name,
+                    // The serial-bearing identity is root-only on this
+                    // any-peer request (ADR-0030 §4 amending ADR-0029 A);
+                    // other peers get vid:pid and serial_present.
+                    identity: if peer.uid == 0 { p.identity } else { None },
+                    serial_present: p.serial_present,
                 })
                 .collect(),
         ),
@@ -6675,6 +6761,7 @@ fn set_require_eyes_open_off(user: &str, engine: &irlume_auth::Engine) -> Respon
                 engine.ir_dim(),
             );
             let (camera_groups, camera_store_error) = camera_group_rows(user, engine);
+            summary.primary_digest = primary_digest_now(user);
             summary.camera_groups = camera_groups;
             summary.camera_store_error = camera_store_error;
             publish_enrollment_summary(user, summary);
@@ -9371,6 +9458,7 @@ mod tests {
                             ir_ratio_calibrated: false,
                             camera_groups: Vec::new(),
                             camera_store_error: None,
+                            primary_camera: None,
                         },
                         _ => Response::Pong,
                     };
@@ -10348,6 +10436,8 @@ mod tests {
                 ir_ratio_calibrated: true,
                 camera_groups: Vec::new(),
                 camera_store_error: None,
+                primary_camera: None,
+                primary_digest: PrimaryDigest::Absent,
             },
         );
         match dispatch_status(&req, &peer) {
@@ -10478,6 +10568,8 @@ mod tests {
                     ir_ratio_calibrated: false,
                     camera_groups: Vec::new(),
                     camera_store_error: None,
+                    primary_camera: None,
+                    primary_digest: PrimaryDigest::Absent,
                 },
             );
             let response = dispatch(request, &owner, &mut engine);
@@ -10486,6 +10578,140 @@ mod tests {
             );
             assert!(cached_enrollment_summary(user).is_some());
         }
+        invalidate_enrollment_summary(user);
+    }
+
+    /// ADR-0029: a legacy rewrite of the primary sends no request, so a
+    /// cached summary published against the old bytes is a miss once the
+    /// file changes (the worker reloads); an unchanged file still hits.
+    #[test]
+    fn cached_summary_misses_when_the_primary_file_changed() {
+        let _guard = env_lock();
+        let sb = sandbox("primary-digest");
+        let _ = sb;
+        let user = "irlume-digest-user";
+        let path = irlume_core::multi_camera::primary_enrollment_path(user);
+        std::fs::write(&path, b"{\"user\":\"irlume-digest-user\",\"profiles\":[]}").unwrap();
+        publish_enrollment_summary(
+            user,
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: Some(irlume_common::PrimaryCameraBinding {
+                    rgb: Some("046d:085e".into()),
+                    ir: Some("046d:085e".into()),
+                }),
+                primary_digest: primary_digest_now(user),
+            },
+        );
+        let request = Request::ListProfiles {
+            user: user.into(),
+            structured_errors: false,
+        };
+        assert!(
+            matches!(
+                dispatch_status(&request, &peer(0)),
+                Some(Response::Enrollment { .. })
+            ),
+            "unchanged primary: cache hit"
+        );
+        std::fs::write(
+            &path,
+            b"{\"user\":\"irlume-digest-user\",\"profiles\":[],\"x\":1}",
+        )
+        .unwrap();
+        assert!(
+            dispatch_status(&request, &peer(0)).is_none(),
+            "rewritten primary: cache miss, the worker reloads"
+        );
+        // An account cached as unenrolled (no file) misses once the file
+        // appears.
+        std::fs::remove_file(&path).unwrap();
+        publish_enrollment_summary(
+            user,
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: None,
+                primary_digest: primary_digest_now(user),
+            },
+        );
+        assert!(matches!(
+            dispatch_status(&request, &peer(0)),
+            Some(Response::Enrollment { .. })
+        ));
+        std::fs::write(&path, b"{\"user\":\"irlume-digest-user\",\"profiles\":[]}").unwrap();
+        assert!(
+            dispatch_status(&request, &peer(0)).is_none(),
+            "a primary created since publication is a cache miss"
+        );
+        // A path that appears in an unreadable form (here a directory) is
+        // not "still absent": the cache misses so the worker reports it.
+        std::fs::remove_file(&path).unwrap();
+        publish_enrollment_summary(
+            user,
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: None,
+                primary_digest: primary_digest_now(user),
+            },
+        );
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(primary_digest_now(user), PrimaryDigest::Unreadable);
+        assert!(
+            dispatch_status(&request, &peer(0)).is_none(),
+            "an unreadable primary is a cache miss"
+        );
+        // And a summary built while it was unreadable never becomes a hit.
+        publish_enrollment_summary(
+            user,
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: None,
+                primary_digest: primary_digest_now(user),
+            },
+        );
+        assert!(dispatch_status(&request, &peer(0)).is_none());
+        std::fs::remove_dir(&path).unwrap();
+        // A file that changed between the start and the end of a load is
+        // filed as unsettled, which never hits, so the worker reloads.
+        let before = primary_digest_now(user);
+        std::fs::write(&path, b"{\"user\":\"irlume-digest-user\",\"profiles\":[]}").unwrap();
+        let after = primary_digest_now(user);
+        assert_eq!(
+            PrimaryDigest::settled(before, after.clone()),
+            PrimaryDigest::Unsettled
+        );
+        assert_eq!(
+            PrimaryDigest::settled(after.clone(), after.clone()),
+            after.clone()
+        );
+        publish_enrollment_summary(
+            user,
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
+                primary_camera: None,
+                primary_digest: PrimaryDigest::Unsettled,
+            },
+        );
+        assert!(
+            dispatch_status(&request, &peer(0)).is_none(),
+            "an unsettled digest is a cache miss even for an unchanged file"
+        );
+        std::fs::remove_file(&path).unwrap();
         invalidate_enrollment_summary(user);
     }
 
@@ -10537,6 +10763,8 @@ mod tests {
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
                 camera_store_error: None,
+                primary_camera: None,
+                primary_digest: PrimaryDigest::Absent,
             },
         );
         match dispatch(delete(), &peer(NOBODY), &mut e) {
@@ -10592,9 +10820,10 @@ mod tests {
         let object = value["PreferencesStatus"].as_object().unwrap();
         assert_eq!(
             object.len(),
-            5,
-            "only policy enums, optional bools and override flags"
+            6,
+            "only policy enums, optional bools and override flags (ADR-0029 A adds the external-camera prohibition as an optional bool)"
         );
+        assert!(object["forbid_external_cameras"].is_boolean());
     }
 
     #[test]
@@ -12788,6 +13017,8 @@ mod tests {
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
                 camera_store_error: None,
+                primary_camera: None,
+                primary_digest: PrimaryDigest::Absent,
             },
         );
         let sb = sandbox("summary-carryover");
@@ -13201,6 +13432,8 @@ mod tests {
                     ir_ratio_calibrated: false,
                     camera_groups: Vec::new(),
                     camera_store_error: None,
+                    primary_camera: None,
+                    primary_digest: PrimaryDigest::Absent,
                 },
             );
             match dispatch(request.clone(), &peer(NOBODY), &mut e) {
@@ -13317,6 +13550,8 @@ mod tests {
                 ir_ratio_calibrated: false,
                 camera_groups: Vec::new(),
                 camera_store_error: None,
+                primary_camera: None,
+                primary_digest: PrimaryDigest::Absent,
             },
         );
         assert!(
@@ -15205,6 +15440,8 @@ mod tests {
                 profiles: Vec::new(),
             }],
             camera_store_error: None,
+            primary_camera: None,
+            primary_digest: PrimaryDigest::Absent,
         };
         // Published while active; a legacy writer then rewrites the primary
         // with NO request in flight: the cached row must flip to stale.
@@ -15245,6 +15482,8 @@ mod tests {
                 profiles: Vec::new(),
             }],
             camera_store_error: None,
+            primary_camera: None,
+            primary_digest: PrimaryDigest::Absent,
         };
         // The worker froze the row while the camera was plugged in AND
         // selected; hotplug since then: the identity is gone and the live

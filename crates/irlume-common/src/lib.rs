@@ -950,6 +950,34 @@ pub struct CameraPairInfo {
     /// opens the device and only the daemon may do that (#187).
     #[serde(default)]
     pub privacy: bool,
+    /// The camera's own name, for people (ADR-0029): the USB `product`
+    /// string, else the RGB node's sysfs name. Display only; nothing
+    /// matches on it (ADR-0007). Absent on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The full binding identity of the pair (`vid:pid[:serial]`), the
+    /// value enrollments and camera groups are bound to. Sent to a root
+    /// peer only (the serial is device-identifying; ADR-0008 keeps the
+    /// ordinary surface at present/absent); absent for other peers, on
+    /// older daemons and for nodes without USB descriptors — a client then
+    /// matches roles on `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// The descriptor carries a serial: without one, two units of the same
+    /// model cannot be told apart (ADR-0024 §6).
+    #[serde(default)]
+    pub serial_present: bool,
+}
+
+/// The primary enrollment's camera binding, by identity (`vid:pid[:serial]`
+/// per side), for the client's role labels (ADR-0029). Same shape as a
+/// camera group's pair; an unbound side is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimaryCameraBinding {
+    #[serde(default)]
+    pub rgb: Option<String>,
+    #[serde(default)]
+    pub ir: Option<String>,
 }
 
 /// A profile and the names of its scans, for `ListProfiles`.
@@ -1187,6 +1215,13 @@ pub struct PreferencesState {
     pub enforce_biopolicy: Option<bool>,
     pub consent_overridden: bool,
     pub biopolicy_overridden: bool,
+    /// The effective external-camera prohibition as the daemon observes
+    /// it (ADR-0029 A): the `forbid_external_cameras` setting or the
+    /// legacy `IRLUME_CAMERA_REQUIRE_FIXED=1` gate. `Some(true)` means
+    /// only built-in cameras may authenticate; `None` when unreadable or
+    /// from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forbid_external_cameras: Option<bool>,
 }
 
 impl PreferencesState {
@@ -1199,6 +1234,12 @@ impl PreferencesState {
             enforce_biopolicy: config::enforce_biopolicy_visible(),
             consent_overridden: std::env::var_os("IRLUME_PRIVILEGED_FACE_CONSENT").is_some(),
             biopolicy_overridden: std::env::var_os("IRLUME_ENFORCE_BIOPOLICY").is_some(),
+            // The effective restriction: the setting, or the legacy
+            // IRLUME_CAMERA_REQUIRE_FIXED=1 gate the camera crate still
+            // honours before authentication.
+            forbid_external_cameras: config::forbid_external_cameras_visible().map(|forbid| {
+                forbid || std::env::var("IRLUME_CAMERA_REQUIRE_FIXED").is_ok_and(|v| v == "1")
+            }),
         }
     }
 }
@@ -1378,6 +1419,10 @@ pub enum Response {
         camera_groups: Vec<CameraGroupSummary>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         camera_store_error: Option<String>,
+        /// The primary enrollment's camera binding (ADR-0029): absent on
+        /// older daemons and for an enrollment captured before binding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        primary_camera: Option<PrimaryCameraBinding>,
     },
     /// Generic success ack for management operations, with a human message.
     Ok(String),
@@ -1745,6 +1790,48 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+    /// The observed prohibition is the effective one: the legacy
+    /// `IRLUME_CAMERA_REQUIRE_FIXED=1` gate counts, so a client never
+    /// presents an external pair as ready when the daemon would refuse it.
+    #[test]
+    fn observed_external_camera_prohibition_includes_the_legacy_fixed_gate() {
+        let _g = super::testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-prefs-fixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_FORBID_EXTERNAL_CAMERAS");
+        std::env::remove_var("IRLUME_CAMERA_REQUIRE_FIXED");
+
+        assert_eq!(
+            super::PreferencesState::observe().forbid_external_cameras,
+            Some(false)
+        );
+        // Only the exact legacy value engages the gate, as the camera crate
+        // reads it.
+        std::env::set_var("IRLUME_CAMERA_REQUIRE_FIXED", "yes");
+        assert_eq!(
+            super::PreferencesState::observe().forbid_external_cameras,
+            Some(false)
+        );
+        std::env::set_var("IRLUME_CAMERA_REQUIRE_FIXED", "1");
+        assert_eq!(
+            super::PreferencesState::observe().forbid_external_cameras,
+            Some(true)
+        );
+        // The setting turned off does not lift the legacy gate.
+        std::env::set_var("IRLUME_FORBID_EXTERNAL_CAMERAS", "0");
+        assert_eq!(
+            super::PreferencesState::observe().forbid_external_cameras,
+            Some(true)
+        );
+
+        std::env::remove_var("IRLUME_CAMERA_REQUIRE_FIXED");
+        std::env::remove_var("IRLUME_FORBID_EXTERNAL_CAMERAS");
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn enrollment_response_carries_camera_group_rows_optionally() {
         use super::{CameraGroupProfileSummary, CameraGroupSummary, ProfileSummary, Response};
@@ -1798,6 +1885,7 @@ mod tests {
             ir_ratio_calibrated: false,
             camera_groups: vec![row],
             camera_store_error: None,
+            primary_camera: None,
         };
         let encoded = serde_json::to_value(&response).unwrap();
         assert_eq!(
@@ -2264,6 +2352,7 @@ mod tests {
             ir_ratio_calibrated: false,
             camera_groups: Vec::new(),
             camera_store_error: None,
+            primary_camera: None,
         };
         let old: OldResponse = serde_json::from_value(
             serde_json::to_value(new).expect("serialize current enrollment response"),
@@ -2290,11 +2379,13 @@ mod tests {
             ir_ratio_calibrated,
             camera_groups,
             camera_store_error,
+            primary_camera,
         } = current
         else {
             panic!("old enrollment reply must remain Enrollment");
         };
         assert!(camera_groups.is_empty());
+        assert!(primary_camera.is_none());
         assert!(camera_store_error.is_none());
         assert!(profiles.is_empty());
         assert!(require_eyes_open);
