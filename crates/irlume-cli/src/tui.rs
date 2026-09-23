@@ -707,6 +707,11 @@ struct App {
     /// the Cameras info block — e.g. "sequential (source: measured; …)".
     /// `None` = not fetched / daemon refused: drawn as unknown, never blank.
     capture_mode: Option<CaptureObservation>,
+    /// The camera inventory epoch the installed enrollment reply's
+    /// `connected_handle`s were correlated under (ADR-0030 §4/§6): the
+    /// daemon correlates at reply time, so handles from one inventory are
+    /// never compared with a listing from another.
+    roles_epoch: Option<CameraEpoch>,
     camera_load: Option<mpsc::Receiver<CameraListing>>,
     activity: activity::Activity,
     input: Option<(String, String, Pending)>,
@@ -1447,11 +1452,19 @@ impl App {
             .is_some_and(|binding| binding.rgb.is_some() || binding.ir.is_some());
         let known = self.camera_store_error.is_none()
             && (bound_primary || (self.profiles_loaded && self.profiles.is_empty()));
+        // Handles correlate only within one inventory: after a docking
+        // event the reply's handles belong to the previous inventory, and a
+        // camera that was absent then is not "not enrolled" now — its role
+        // is unknown until the queued reply lands.
+        if pair.handle.is_some() && self.roles_epoch != self.camera_epoch {
+            return CameraRole::Unknown;
+        }
         camera_role_for(
             RoleCandidate {
                 identity: pair.identity.as_deref(),
                 id: pair.id.as_deref(),
                 serial_present: pair.serial_present,
+                handle: pair.handle.as_deref(),
             },
             self.primary_camera.as_ref(),
             &self.camera_groups,
@@ -1497,7 +1510,14 @@ impl App {
         let role = self.camera_role(p);
         let role_text = match role {
             CameraRole::Secondary(index) => format!("Secondary camera #{index}"),
-            CameraRole::Unknown => "role unknown (older daemon or no USB identity)".into(),
+            // Unknown for one of three reasons the details can name.
+            CameraRole::Unknown
+                if p.identity.is_none() && p.serial_present && p.handle.is_none() =>
+            {
+                "role unknown (serial shown to root only; a newer daemon resolves this)".into()
+            }
+            CameraRole::Unknown if p.id.is_none() => "role unknown (no USB identity)".into(),
+            CameraRole::Unknown => "role unknown (enrollment not observed yet)".into(),
             other => other.label().to_string(),
         };
         let mut lines = vec![section(&format!("{} — {role_text}", camera_row_name(p)))];
@@ -1673,6 +1693,11 @@ impl App {
             // Node paths are reused across hotplug, so an observation from
             // the previous inventory cannot be this hardware's.
             self.capture_mode = None;
+            // The daemon correlates roles at reply time (ADR-0030 §4/§6):
+            // a new inventory needs a new enrollment reply for its handles,
+            // and until it lands the installed handles are not this
+            // inventory's (`roles_epoch` keeps camera_role from using them).
+            self.freshness.cycle_mut(Worker::Profiles).invalidate();
             self.freshness.cycle_mut(Worker::Cameras).invalidate();
             self.freshness.cycle_mut(Worker::Qualification).invalidate();
             self.classified_epoch = None;
@@ -2089,6 +2114,7 @@ impl App {
             pairs: Vec::new(),
             pairs_known: false,
             capture_mode: None,
+            roles_epoch: None,
             camera_load: None,
             activity: activity::Activity::default(),
             input: None,
@@ -2474,6 +2500,7 @@ impl App {
                 &Request::ListProfiles {
                     user,
                     structured_errors: false,
+                    handles: true,
                 },
                 std::time::Duration::from_secs(60),
             ) {
@@ -3864,6 +3891,10 @@ impl App {
                         self.camera_groups = camera_groups;
                         self.camera_store_error = camera_store_error;
                         self.primary_camera = primary_camera;
+                        // A reply that outlived an inventory change was
+                        // discarded above, so this one was correlated
+                        // under the current epoch.
+                        self.roles_epoch = self.camera_epoch.clone();
                         if let Some(selected) = selected {
                             self.sel = self.rows().iter().position(|row| self.profile_row_name(*row) == selected).unwrap_or_else(|| {
                                 self.log('·', "the selected profile or scan was removed or renamed; select a row before acting");
@@ -9885,6 +9916,10 @@ struct RoleCandidate<'a> {
     id: Option<&'a str>,
     /// Whether the unit reports a serial (withheld from non-root peers).
     serial_present: bool,
+    /// The daemon's pair handle (ADR-0030 §4): when present, the daemon
+    /// has correlated roles itself and the enrollment reply names this
+    /// pair by `connected_handle`, so no identity matching is needed.
+    handle: Option<&'a str>,
 }
 
 /// Whether a binding names the candidate: `Some(true)` / `Some(false)`
@@ -9926,6 +9961,27 @@ fn camera_role_for(
     groups: &[irlume_common::CameraGroupSummary],
     enrollment_known: bool,
 ) -> CameraRole {
+    // A daemon that mints handles has done the correlation with the full
+    // identities (ADR-0030 §4): a pair is enrolled exactly when a binding
+    // carries its handle. The identity rule below is for older daemons
+    // only — with handles present, the redacted `vid:pid` sides such a
+    // daemon sends could not tell two units of one model apart.
+    if let Some(handle) = candidate.handle {
+        if primary.is_some_and(|binding| binding.connected_handle.as_deref() == Some(handle)) {
+            return CameraRole::Primary;
+        }
+        if let Some(index) = groups
+            .iter()
+            .position(|group| group.connected_handle.as_deref() == Some(handle))
+        {
+            return CameraRole::Secondary(index + 1);
+        }
+        return if enrollment_known {
+            CameraRole::Unenrolled
+        } else {
+            CameraRole::Unknown
+        };
+    }
     if candidate.identity.is_none() && candidate.id.is_none() {
         return CameraRole::Unknown;
     }
@@ -11966,6 +12022,7 @@ mod tests {
             pairs: Vec::new(),
             pairs_known: false,
             capture_mode: None,
+            roles_epoch: None,
             camera_load: None,
             activity: activity::Activity::default(),
             input: None,
@@ -13605,6 +13662,7 @@ mod tests {
                 name: None,
                 identity: None,
                 serial_present: false,
+                handle: None,
             },
             irlume_common::CameraPairInfo {
                 rgb: "/dev/video4".into(),
@@ -13615,6 +13673,7 @@ mod tests {
                 name: None,
                 identity: None,
                 serial_present: false,
+                handle: None,
             },
         ];
         app.on_key(KeyCode::Up);
@@ -13971,6 +14030,7 @@ mod tests {
             name: None,
             identity: None,
             serial_present: false,
+            handle: None,
         }];
         app.cam_sel = 0;
         // Enter opens the details panel and changes nothing (ADR-0029);
@@ -14010,21 +14070,25 @@ mod tests {
             identity: Some(identity),
             id: None,
             serial_present: identity.matches(':').count() > 1,
+            handle: None,
         };
         // An ordinary account's candidate: vid:pid only.
         let redacted = |id: &'static str, serial_present: bool| RoleCandidate {
             identity: None,
             id: Some(id),
             serial_present,
+            handle: None,
         };
         let none = RoleCandidate {
             identity: None,
             id: None,
             serial_present: false,
+            handle: None,
         };
         let primary = PrimaryCameraBinding {
             rgb: Some("046d:085e:e179cb54".into()),
             ir: Some("046d:085e:e179cb54".into()),
+            connected_handle: None,
         };
         let group = |id: &str, rgb: Option<&str>, ir: Option<&str>| CameraGroupSummary {
             id: id.into(),
@@ -14034,6 +14098,7 @@ mod tests {
             selected: false,
             stale: false,
             generation: 1,
+            connected_handle: None,
             profiles: Vec::new(),
         };
         let groups = vec![
@@ -14093,6 +14158,38 @@ mod tests {
             camera_role_for(redacted("3443:c803", false), Some(&primary), &groups, true),
             CameraRole::Secondary(1)
         );
+        // ADR-0030 §4: with the daemon's handles the client matches by
+        // handle alone — an ordinary account gets the right label for a
+        // serial-bearing unit, a twin with another handle is not enrolled,
+        // and redacted vid:pid sides are never consulted.
+        let handled = |handle: &'static str| RoleCandidate {
+            identity: None,
+            id: Some("046d:085e"),
+            serial_present: true,
+            handle: Some(handle),
+        };
+        let mut correlated = primary.clone();
+        correlated.rgb = Some("046d:085e".into());
+        correlated.ir = Some("046d:085e".into());
+        correlated.connected_handle = Some("h-brio".into());
+        let mut desk = groups.clone();
+        desk[0].connected_handle = Some("h-desk".into());
+        assert_eq!(
+            camera_role_for(handled("h-brio"), Some(&correlated), &desk, true),
+            CameraRole::Primary
+        );
+        assert_eq!(
+            camera_role_for(handled("h-desk"), Some(&correlated), &desk, true),
+            CameraRole::Secondary(1)
+        );
+        assert_eq!(
+            camera_role_for(handled("h-twin"), Some(&correlated), &desk, true),
+            CameraRole::Unenrolled
+        );
+        assert_eq!(
+            camera_role_for(handled("h-twin"), Some(&correlated), &desk, false),
+            CameraRole::Unknown
+        );
     }
 
     /// ADR-0029: the row leads with the camera's name and its role; the
@@ -14112,6 +14209,7 @@ mod tests {
         app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
             rgb: Some("3277:0059".into()),
             ir: Some("3277:0059".into()),
+            connected_handle: None,
         });
         app.pairs = vec![
             irlume_common::CameraPairInfo {
@@ -14123,6 +14221,7 @@ mod tests {
                 name: Some("ASUS Integrated Camera".into()),
                 identity: Some("3277:0059".into()),
                 serial_present: false,
+                handle: None,
             },
             irlume_common::CameraPairInfo {
                 rgb: "/dev/video4".into(),
@@ -14133,6 +14232,7 @@ mod tests {
                 name: None,
                 identity: Some("3443:c803".into()),
                 serial_present: false,
+                handle: None,
             },
         ];
         // The external-camera policy is observed and off, so the external
@@ -14269,6 +14369,7 @@ mod tests {
             selected: false,
             stale: true,
             generation: 4,
+            connected_handle: None,
             profiles: Vec::new(),
         }];
         app.pairs[1].identity = Some("3443:c803".into());
@@ -14296,6 +14397,7 @@ mod tests {
         app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
             rgb: Some("3277:0059".into()),
             ir: Some("3277:0059".into()),
+            connected_handle: None,
         });
         app.pairs[0].identity = Some("3277:0059".into());
         app.pairs[0].name =
@@ -14359,6 +14461,7 @@ mod tests {
         app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
             rgb: None,
             ir: None,
+            connected_handle: None,
         });
         app.camera_groups.clear();
         let text = render(&mut app);
@@ -14369,6 +14472,7 @@ mod tests {
         app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
             rgb: None,
             ir: None,
+            connected_handle: None,
         });
         app.camera_groups = vec![irlume_common::CameraGroupSummary {
             id: "desk".into(),
@@ -14378,6 +14482,7 @@ mod tests {
             selected: false,
             stale: false,
             generation: 1,
+            connected_handle: None,
             profiles: Vec::new(),
         }];
         app.pairs[1].identity = Some("3443:c803".into());
@@ -14389,6 +14494,7 @@ mod tests {
         app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
             rgb: Some("3277:0059".into()),
             ir: Some("3277:0059".into()),
+            connected_handle: None,
         });
         app.camera_store_error = Some("store unreadable".into());
         let text = render(&mut app);
@@ -14439,6 +14545,36 @@ mod tests {
         app.pairs[0].name = Some("ASUS Integrated Camera".into());
         let text = render(&mut app);
         assert!(text.contains("not enrolled"), "{text}");
+        // With the daemon's handles, a docking event makes the roles unknown
+        // until the re-issued enrollment reply lands: handles from the old
+        // inventory are never compared with the new listing.
+        app.pairs[0].handle = Some("h-asus".into());
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: Some("3277:0059".into()),
+            ir: Some("3277:0059".into()),
+            connected_handle: Some("h-asus".into()),
+        });
+        app.roles_epoch = app.camera_epoch.clone();
+        // The docking snapshot invalidates the listing (pairs are cleared
+        // until re-listed); the row under test is kept aside.
+        let asus = app.pairs[0].clone();
+        assert_eq!(app.camera_role(&asus), CameraRole::Primary);
+        let mut docked = live_test_snapshot();
+        docked.cameras.revision = docked.cameras.revision.wrapping_add(7);
+        let now = app.now();
+        app.apply_live_snapshot(docked, now);
+        assert_eq!(
+            app.camera_role(&asus),
+            CameraRole::Unknown,
+            "old handles, new inventory: no claim"
+        );
+        assert!(
+            app.freshness.cycle(Worker::Profiles).pending(),
+            "the enrollment reload is queued"
+        );
+        app.roles_epoch = app.camera_epoch.clone();
+        assert_eq!(app.camera_role(&asus), CameraRole::Primary);
+        app.primary_camera = None;
         // A hotplug (new inventory revision) drops the capture observation:
         // node paths are reused, so it cannot be this hardware's.
         app.capture_mode = Some(CaptureObservation {
@@ -14472,6 +14608,7 @@ mod tests {
         app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
             rgb: Some("3277:0059".into()),
             ir: Some("3277:0059".into()),
+            connected_handle: None,
         });
         app.pairs = vec![irlume_common::CameraPairInfo {
             rgb: "/dev/video0".into(),
@@ -14482,6 +14619,7 @@ mod tests {
             name: Some("ASUS Integrated Camera".into()),
             identity: Some("3277:0059".into()),
             serial_present: false,
+            handle: None,
         }];
         let render = |app: &mut App, w: u16| {
             let mut term = Terminal::new(TestBackend::new(w, 40)).unwrap();
@@ -16298,6 +16436,7 @@ mod tests {
             name: None,
             identity: None,
             serial_present: false,
+            handle: None,
         }];
         let text = draw_text(&app);
         // No name from the daemon: the node pair is the row's name; the USB
@@ -18418,6 +18557,7 @@ mod tests {
             name: None,
             identity: None,
             serial_present: false,
+            handle: None,
         }];
         app.on_key(KeyCode::F(6));
         app.on_key(KeyCode::Down); // keyboard focus is on another control, not the selected camera row

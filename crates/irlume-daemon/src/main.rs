@@ -3766,7 +3766,151 @@ fn primary_digest_now(user: &str) -> PrimaryDigest {
     }
 }
 
+/// The daemon's opaque handle for a camera pair (ADR-0030 §4): a keyed
+/// digest of the pair's binding identity under a 32-byte secret drawn
+/// once per daemon instance. Stable for the life of this instance, so
+/// `ListCameras` and the enrollment reply agree on it without shared
+/// mutable state; different after every restart, so it means nothing off
+/// the machine or to another instance; and, being keyed, it reveals
+/// nothing about the serial it is derived from.
+fn pair_handle(identity: &str) -> String {
+    pair_handle_keyed(b"irlume-pair-handle\0", identity)
+}
+
+/// The opaque group id a handle-correlating non-root peer is given in
+/// place of the store's id, which `derive_group_id` builds from the camera
+/// identity, serial included. Same construction as [`pair_handle`] under
+/// its own domain separator, so a group handle never equals a pair handle.
+fn group_handle(id: &str) -> String {
+    pair_handle_keyed(b"irlume-group-handle\0", id)
+}
+
+/// The store id a peer's `group` names: the id itself, or the id whose
+/// group handle it is. An unknown value passes through unchanged so the
+/// store's own "no such group" refusal names what the peer sent.
+fn resolve_group_id(user: &str, group: &str) -> String {
+    let store = irlume_core::multi_camera::load_secondary(
+        &irlume_core::multi_camera::secondary_store_path(user),
+    );
+    let Ok(Some(store)) = store else {
+        return group.to_owned();
+    };
+    resolve_group_id_in(store.groups.iter().map(|g| g.id.as_str()), group)
+}
+
+/// A refusal that names the store id names the peer's own value instead:
+/// what the peer did not send, it does not learn from an error.
+fn scrub_group_id(message: &str, store_id: &str, as_sent: &str) -> String {
+    if store_id == as_sent {
+        message.to_owned()
+    } else {
+        message.replace(store_id, as_sent)
+    }
+}
+
+fn resolve_group_id_in<'a>(ids: impl Iterator<Item = &'a str>, group: &str) -> String {
+    let mut handle_match = None;
+    for id in ids {
+        if id == group {
+            return id.to_owned();
+        }
+        if handle_match.is_none() && group_handle(id) == group {
+            handle_match = Some(id.to_owned());
+        }
+    }
+    handle_match.unwrap_or_else(|| group.to_owned())
+}
+
+fn pair_handle_keyed(domain: &[u8], value: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    static SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let secret = SECRET.get_or_init(|| {
+        use std::io::Read as _;
+        let mut secret = [0u8; 32];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut secret))
+            .expect("read 32 bytes from /dev/urandom");
+        secret
+    });
+    let mut h = Sha256::new();
+    h.update(secret);
+    h.update(domain);
+    h.update(value.as_bytes());
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `vid:pid` of a binding identity (`vid:pid[:serial]`): what an ordinary
+/// peer receives in place of the identity (ADR-0030 §4).
+fn identity_without_serial(identity: &str) -> String {
+    match identity.match_indices(':').nth(1) {
+        Some((at, _)) => identity[..at].to_owned(),
+        None => identity.to_owned(),
+    }
+}
+
+/// The handle of the connected pair a binding names (ADR-0030 §4): the
+/// binding's bound sides must name one identity (a pair is one device)
+/// and that identity must be present in sysfs. Computed at response time
+/// from `present`, so hotplug is seen without a cache invalidation.
+fn connected_handle_for(rgb: Option<&str>, ir: Option<&str>, present: &[String]) -> Option<String> {
+    let mut sides = [rgb, ir].into_iter().flatten();
+    let first = sides.next()?;
+    if sides.any(|side| side != first) {
+        return None;
+    }
+    present
+        .iter()
+        .any(|p| p == first)
+        .then(|| pair_handle(first))
+}
+
+/// Correlate the summary's bindings with the connected pairs (every
+/// client may use the handles) and, for a non-root peer that asked for
+/// handles, reduce the binding identities to `vid:pid` and the group ids
+/// to group handles (ADR-0030 §4: the serial travels to root only). A
+/// client that did not ask keeps the identities it matches on itself, so
+/// its labels keep their meaning across the upgrade. Pure over `present`
+/// so it is testable without sysfs.
+fn correlate_handles(
+    summary: &mut EnrollmentSummary,
+    present: &[String],
+    root: bool,
+    handles: bool,
+) {
+    let redact = !root && handles;
+    if let Some(binding) = summary.primary_camera.as_mut() {
+        binding.connected_handle =
+            connected_handle_for(binding.rgb.as_deref(), binding.ir.as_deref(), present);
+        if redact {
+            binding.rgb = binding.rgb.as_deref().map(identity_without_serial);
+            binding.ir = binding.ir.as_deref().map(identity_without_serial);
+        }
+    }
+    for group in &mut summary.camera_groups {
+        group.connected_handle =
+            connected_handle_for(group.rgb.as_deref(), group.ir.as_deref(), present);
+        if redact {
+            group.rgb = group.rgb.as_deref().map(identity_without_serial);
+            group.ir = group.ir.as_deref().map(identity_without_serial);
+            group.id = group_handle(&group.id);
+        }
+    }
+}
+
 impl EnrollmentSummary {
+    /// The reply for `peer`: handles correlated against the identities
+    /// sysfs reports now (no device opens); identities and group ids
+    /// redacted for a non-root peer that correlates by handle. The cached
+    /// summary itself is never redacted.
+    fn into_response_for(mut self, peer: &Peer, handles: bool) -> Response {
+        let present = irlume_auth::present_device_identities();
+        correlate_handles(&mut self, &present, peer.uid == 0, handles);
+        self.into_response()
+    }
+
     fn into_response(self) -> Response {
         Response::Enrollment {
             profiles: self.profiles,
@@ -3868,6 +4012,7 @@ fn summarize_enrollment(
                 irlume_common::PrimaryCameraBinding {
                     rgb: binding.rgb.clone(),
                     ir: binding.ir.clone(),
+                    connected_handle: None,
                 }
             }),
             primary_digest: PrimaryDigest::Absent,
@@ -4272,7 +4417,7 @@ fn dispatch_status_with_diagnostics(
                 key_present: irlume_core::template_key::has_key(user),
             }
         }
-        Request::ListProfiles { user, .. } => {
+        Request::ListProfiles { user, handles, .. } => {
             // Cache HIT only: the summary the worker published after its
             // last load or mutation of this enrollment. A miss returns None
             // and the request queues to the worker, whose ListProfiles arm
@@ -4293,7 +4438,7 @@ fn dispatch_status_with_diagnostics(
                     // not be hidden by the cache: refresh the volatile
                     // facts (sysfs + two file reads, no opens/TPM).
                     refresh_camera_group_flags(user, &mut sum);
-                    sum.into_response()
+                    sum.into_response_for(peer, *handles)
                 }
                 None => return None,
             }
@@ -5431,6 +5576,7 @@ fn dispatch_scoped_session_inner(
         Request::ListProfiles {
             user,
             structured_errors,
+            handles,
         } => {
             // Only ever answer with a typed error when the request asked for
             // one. An older client cannot deserialize an unknown response
@@ -5468,7 +5614,7 @@ fn dispatch_scoped_session_inner(
                     sum.primary_digest =
                         PrimaryDigest::settled(digest_before, primary_digest_now(&user));
                     publish_enrollment_summary(&user, sum.clone());
-                    sum.into_response()
+                    sum.into_response_for(peer, handles)
                 }
                 Err(e) => fail(
                     irlume_common::OperationErrorCode::OperationFailed,
@@ -5810,11 +5956,15 @@ fn dispatch_scoped_session_inner(
             add_camera_group(engine, peer, &user, profile, want, scope)
         }
         Request::RemoveCameraGroup { user, group } => {
-            match remove_camera_group(engine, peer, &user, &group) {
+            // A handle-correlating client names the group by its handle;
+            // the store id it resolves to may carry the serial, so the
+            // replies name the group as the peer named it.
+            let store_id = resolve_group_id(&user, &group);
+            match remove_camera_group(engine, peer, &user, &store_id) {
                 Ok(()) => Response::Ok(format!(
                     "camera group '{group}' removed; in-flight use refuses at its boundary"
                 )),
-                Err(e) => Response::Error(e.to_string()),
+                Err(e) => Response::Error(scrub_group_id(&e.to_string(), &store_id, &group)),
             }
         }
         Request::TuneCaptureMode {
@@ -6333,6 +6483,10 @@ fn dispatch_scoped_session_inner(
             irlume_auth::list_pairs()
                 .into_iter()
                 .map(|p| irlume_common::CameraPairInfo {
+                    // The opaque handle every peer may correlate on
+                    // (ADR-0030 §4); the enrollment reply carries the same
+                    // value for the binding this pair matches.
+                    handle: p.identity.as_deref().map(pair_handle),
                     // Privacy is read HERE, on the camera worker, for the
                     // same reason the enumeration is: the control read opens
                     // the node (#187).
@@ -8870,6 +9024,7 @@ mod tests {
         ListProfiles => Request::ListProfiles {
             user: u(),
             structured_errors: false,
+            handles: false,
         },
         DeleteProfile => Request::DeleteProfile {
             user: u(),
@@ -9292,6 +9447,9 @@ mod tests {
             &Request::ListProfiles {
                 user: SAMPLE_USER.into(),
                 structured_errors: true,
+                // The two opt-ins are independent: handles must not cost
+                // the client its typed authorization error.
+                handles: true,
             },
             &stranger,
         );
@@ -9309,6 +9467,7 @@ mod tests {
             &Request::ListProfiles {
                 user: SAMPLE_USER.into(),
                 structured_errors: false,
+                handles: false,
             },
             &stranger,
         );
@@ -10355,6 +10514,7 @@ mod tests {
             Request::ListProfiles {
                 user: u(),
                 structured_errors: false,
+                handles: false,
             },
             Request::SupportSnapshot { since_ms: 60_000 },
         ] {
@@ -10413,6 +10573,7 @@ mod tests {
         let req = Request::ListProfiles {
             user: me.clone(),
             structured_errors: false,
+            handles: false,
         };
         invalidate_enrollment_summary(&me);
         // MISS: the status path must NOT answer (None queues it to the
@@ -10584,6 +10745,144 @@ mod tests {
     /// ADR-0029: a legacy rewrite of the primary sends no request, so a
     /// cached summary published against the old bytes is a miss once the
     /// file changes (the worker reloads); an unchanged file still hits.
+    /// ADR-0030 §4: the pair handle is stable within the instance, keyed
+    /// (the serial is not recoverable from it), and distinct per identity.
+    #[test]
+    fn pair_handles_are_stable_keyed_and_distinct() {
+        let a = pair_handle("046d:085e:e179cb54");
+        assert_eq!(a, pair_handle("046d:085e:e179cb54"));
+        assert_eq!(a.len(), 16);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!a.contains("e179cb54"));
+        assert_ne!(a, pair_handle("046d:085e:e179cb55"));
+        assert_ne!(a, pair_handle("046d:085e"));
+    }
+
+    /// The daemon correlates a binding with the connected pair by full
+    /// identity and hands the client the handle; an ordinary peer's copy
+    /// carries vid:pid only, root's the identities. A binding that names
+    /// two devices, or an absent one, has no connected pair.
+    #[test]
+    fn enrollment_reply_correlates_handles_and_redacts_identities_for_ordinary_peers() {
+        let summary = || EnrollmentSummary {
+            profiles: Vec::new(),
+            ir_ratio_calibrated: false,
+            camera_groups: vec![
+                irlume_common::CameraGroupSummary {
+                    id: "desk".into(),
+                    rgb: Some("3443:c803".into()),
+                    ir: Some("3443:c803".into()),
+                    connected: true,
+                    selected: false,
+                    stale: false,
+                    generation: 1,
+                    connected_handle: None,
+                    profiles: Vec::new(),
+                },
+                irlume_common::CameraGroupSummary {
+                    id: "split".into(),
+                    rgb: Some("1bcf:28c4:aa".into()),
+                    ir: Some("3443:c803".into()),
+                    connected: true,
+                    selected: false,
+                    stale: false,
+                    generation: 1,
+                    connected_handle: None,
+                    profiles: Vec::new(),
+                },
+            ],
+            camera_store_error: None,
+            primary_camera: Some(irlume_common::PrimaryCameraBinding {
+                rgb: Some("046d:085e:e179cb54".into()),
+                ir: Some("046d:085e:e179cb54".into()),
+                connected_handle: None,
+            }),
+            primary_digest: PrimaryDigest::Absent,
+        };
+        let present = vec![
+            "046d:085e:e179cb54".to_string(),
+            "1bcf:28c4:aa".to_string(),
+            "3443:c803".to_string(),
+        ];
+        let mut ordinary = summary();
+        correlate_handles(&mut ordinary, &present, false, true);
+        let primary = ordinary.primary_camera.as_ref().unwrap();
+        assert_eq!(
+            primary.connected_handle.as_deref(),
+            Some(pair_handle("046d:085e:e179cb54").as_str())
+        );
+        assert_eq!(primary.rgb.as_deref(), Some("046d:085e"), "serial redacted");
+        assert_eq!(primary.ir.as_deref(), Some("046d:085e"));
+        assert_eq!(
+            ordinary.camera_groups[0].connected_handle.as_deref(),
+            Some(pair_handle("3443:c803").as_str())
+        );
+        assert_eq!(
+            ordinary.camera_groups[1].connected_handle, None,
+            "two devices are not one pair"
+        );
+        assert_eq!(ordinary.camera_groups[1].rgb.as_deref(), Some("1bcf:28c4"));
+        // The identity-derived group id is replaced by its handle, which
+        // the removal path resolves back to the store id.
+        assert_eq!(ordinary.camera_groups[0].id, group_handle("desk"));
+        assert_ne!(ordinary.camera_groups[0].id, pair_handle("desk"));
+        assert_eq!(
+            resolve_group_id_in(["desk", "split"].into_iter(), &group_handle("desk")),
+            "desk"
+        );
+        assert_eq!(resolve_group_id_in(["desk"].into_iter(), "desk"), "desk");
+        assert_eq!(resolve_group_id_in(["desk"].into_iter(), "nope"), "nope");
+        // A refusal about the resolved id is reworded in the peer's terms.
+        let handle = group_handle("cam-046d-085e-e179cb54");
+        assert_eq!(
+            scrub_group_id(
+                "no such camera group 'cam-046d-085e-e179cb54'",
+                "cam-046d-085e-e179cb54",
+                &handle
+            ),
+            format!("no such camera group '{handle}'")
+        );
+        assert_eq!(scrub_group_id("kept", "same", "same"), "kept");
+
+        // A client that did not ask for handles keeps the identities it
+        // matches on (and the store ids), handles included for free.
+        let mut legacy = summary();
+        correlate_handles(&mut legacy, &present, false, false);
+        assert_eq!(
+            legacy.primary_camera.as_ref().unwrap().rgb.as_deref(),
+            Some("046d:085e:e179cb54")
+        );
+        assert_eq!(legacy.camera_groups[0].id, "desk");
+        assert!(legacy
+            .primary_camera
+            .as_ref()
+            .unwrap()
+            .connected_handle
+            .is_some());
+
+        let mut root = summary();
+        correlate_handles(&mut root, &present, true, true);
+        assert_eq!(
+            root.primary_camera.as_ref().unwrap().rgb.as_deref(),
+            Some("046d:085e:e179cb54"),
+            "root keeps the identity"
+        );
+        assert_eq!(
+            root.primary_camera.as_ref().unwrap().connected_handle,
+            ordinary.primary_camera.as_ref().unwrap().connected_handle,
+            "the same handle for every peer"
+        );
+
+        // Unplugged: no handle, the identity rule still redacts.
+        let mut gone = summary();
+        correlate_handles(&mut gone, &["3443:c803".to_string()], false, true);
+        assert_eq!(gone.primary_camera.as_ref().unwrap().connected_handle, None);
+        assert_eq!(
+            gone.primary_camera.as_ref().unwrap().rgb.as_deref(),
+            Some("046d:085e")
+        );
+    }
+
     #[test]
     fn cached_summary_misses_when_the_primary_file_changed() {
         let _guard = env_lock();
@@ -10602,6 +10901,7 @@ mod tests {
                 primary_camera: Some(irlume_common::PrimaryCameraBinding {
                     rgb: Some("046d:085e".into()),
                     ir: Some("046d:085e".into()),
+                    connected_handle: None,
                 }),
                 primary_digest: primary_digest_now(user),
             },
@@ -10609,6 +10909,7 @@ mod tests {
         let request = Request::ListProfiles {
             user: user.into(),
             structured_errors: false,
+            handles: false,
         };
         assert!(
             matches!(
@@ -12209,6 +12510,7 @@ mod tests {
             Request::ListProfiles {
                 user: "../root".into(),
                 structured_errors: false,
+                handles: false,
             },
             Request::Authenticate {
                 structured_errors: false,
@@ -12946,6 +13248,7 @@ mod tests {
             Request::ListProfiles {
                 user: "carol".into(),
                 structured_errors: false,
+                handles: false,
             },
             &peer(0),
             &mut e,
@@ -12972,6 +13275,7 @@ mod tests {
             Request::ListProfiles {
                 user: "ghost".into(),
                 structured_errors: false,
+                handles: false,
             },
             &peer(0),
             &mut e,
@@ -12984,6 +13288,7 @@ mod tests {
             Request::ListProfiles {
                 user: "carol".into(),
                 structured_errors: false,
+                handles: false,
             },
             &peer(NOBODY),
             &mut e,
@@ -13027,6 +13332,7 @@ mod tests {
             Request::ListProfiles {
                 user: "carol".into(),
                 structured_errors: false,
+                handles: false,
             },
             &peer(0),
             &mut e,
@@ -13773,6 +14079,7 @@ mod tests {
             Request::ListProfiles {
                 user: "carol".into(),
                 structured_errors: false,
+                handles: false,
             },
             &root,
             &mut e,
@@ -15437,6 +15744,7 @@ mod tests {
                 selected: false,
                 stale: false,
                 generation: 1,
+                connected_handle: None,
                 profiles: Vec::new(),
             }],
             camera_store_error: None,
@@ -15479,6 +15787,7 @@ mod tests {
                 selected: true,
                 stale: false,
                 generation: 1,
+                connected_handle: None,
                 profiles: Vec::new(),
             }],
             camera_store_error: None,
@@ -15566,6 +15875,7 @@ mod tests {
             Request::ListProfiles {
                 user: "carol".into(),
                 structured_errors: false,
+                handles: false,
             },
             &peer(0),
             &mut e,
@@ -15603,6 +15913,7 @@ mod tests {
             Request::ListProfiles {
                 user: "carol".into(),
                 structured_errors: false,
+                handles: false,
             },
             &peer(0),
             &mut e,

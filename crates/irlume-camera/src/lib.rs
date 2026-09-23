@@ -4186,11 +4186,24 @@ pub fn camera_display_name(dev_dir: &std::path::Path, node: &str) -> Option<Stri
     std::fs::read_to_string(format!("/sys/class/video4linux/{node}/name"))
         .ok()
         .and_then(clean)
+        .map(|name| collapse_repeated_name(&name))
         .or_else(|| {
             std::fs::read_to_string(dev_dir.join("product"))
                 .ok()
                 .and_then(clean)
         })
+}
+
+/// The UVC driver names a node `"<product>: <product>"` and then cuts the
+/// whole to 31 bytes, so a built-in camera reads "ASUS FHD webcam: ASUS FHD
+/// webca". The part before the first `": "` is the complete product; only
+/// the tail can be cut, so the name collapses to the head exactly when the
+/// tail is a prefix of it. (`Cam: Camera` is two facts and stays.)
+fn collapse_repeated_name(name: &str) -> String {
+    match name.split_once(": ") {
+        Some((head, tail)) if !tail.is_empty() && head.starts_with(tail) => head.to_owned(),
+        _ => name.to_owned(),
+    }
 }
 
 /// Every physical camera that exposes both an RGB and an IR node (a Hello pair),
@@ -16533,6 +16546,27 @@ mod tests {
     /// the USB `product` string, then nothing; it is trimmed and bounded
     /// and never feeds identification. The fixture has no sysfs node, so
     /// the product fallback is what these cases exercise.
+    #[test]
+    fn repeated_node_names_collapse_to_one_copy() {
+        assert_eq!(
+            collapse_repeated_name("ASUS FHD webcam: ASUS FHD webca"),
+            "ASUS FHD webcam"
+        );
+        assert_eq!(
+            collapse_repeated_name("Logitech BRIO: Logitech BRIO"),
+            "Logitech BRIO"
+        );
+        // Different halves are two facts: keep both.
+        assert_eq!(
+            collapse_repeated_name("Integrated Camera: IR Camera"),
+            "Integrated Camera: IR Camera"
+        );
+        assert_eq!(collapse_repeated_name("NexiGo N930W"), "NexiGo N930W");
+        assert_eq!(collapse_repeated_name("Cam: "), "Cam: ");
+        // The head is never the cut part: a longer tail is a second fact.
+        assert_eq!(collapse_repeated_name("Cam: Camera"), "Cam: Camera");
+    }
+
     #[test]
     fn camera_display_name_prefers_node_name_then_product_and_bounds_it() {
         let dir = std::env::temp_dir().join(format!("irlume-camname-{}", std::process::id()));

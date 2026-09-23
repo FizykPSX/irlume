@@ -621,7 +621,8 @@ pub enum Request {
     /// the group refuses at its grant boundary. PRIVILEGED.
     RemoveCameraGroup {
         user: String,
-        /// The immutable group id (as reported when it was enrolled).
+        /// The immutable group id (as reported when it was enrolled), or
+        /// the opaque group id a handle-correlating client was given.
         group: String,
     },
     /// List enrolled profiles + their scans for `user`.
@@ -641,6 +642,17 @@ pub enum Request {
         /// replies with the prose `Error` the new client still handles.
         #[serde(default)]
         structured_errors: bool,
+        /// The client correlates camera roles by the daemon's pair handles
+        /// (ADR-0030 §4) and does not need binding identities: a non-root
+        /// peer that sets this receives `vid:pid` binding sides and an
+        /// opaque group id in place of the store's identity-derived one
+        /// (which [`Request::RemoveCameraGroup`] accepts). A client that
+        /// omits it — one that predates handles and matches roles on the
+        /// identities itself — keeps receiving exactly what it did, so its
+        /// labels do not silently change meaning across the upgrade. Same
+        /// compatibility shape as `structured_errors`.
+        #[serde(default)]
+        handles: bool,
     },
     /// Delete a whole profile (and its scans). PRIVILEGED, same rule as Enroll.
     DeleteProfile { user: String, profile: String },
@@ -967,17 +979,34 @@ pub struct CameraPairInfo {
     /// model cannot be told apart (ADR-0024 §6).
     #[serde(default)]
     pub serial_present: bool,
+    /// The daemon's opaque handle for this pair (ADR-0030 §4): a keyed
+    /// digest of the pair's binding identity under a secret this daemon
+    /// instance drew at start, so it names the unit without revealing the
+    /// serial and means nothing off the machine or to another daemon
+    /// instance. The enrollment reply carries the same handle as
+    /// `connected_handle` on the binding it matches, which is how a client
+    /// labels roles without ever seeing the identity. Absent on older
+    /// daemons and for nodes without USB descriptors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
 }
 
 /// The primary enrollment's camera binding, by identity (`vid:pid[:serial]`
 /// per side), for the client's role labels (ADR-0029). Same shape as a
-/// camera group's pair; an unbound side is `None`.
+/// camera group's pair; an unbound side is `None`. The sides carry the
+/// full identity for a root peer and `vid:pid` for others (ADR-0030 §4);
+/// `connected_handle` is what an ordinary client correlates on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrimaryCameraBinding {
     #[serde(default)]
     pub rgb: Option<String>,
     #[serde(default)]
     pub ir: Option<String>,
+    /// The handle of the connected pair whose identity this binding names
+    /// (ADR-0030 §4), correlated by the daemon from sysfs; `None` when no
+    /// connected pair matches, or from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_handle: Option<String>,
 }
 
 /// A profile and the names of its scans, for `ListProfiles`.
@@ -1250,7 +1279,11 @@ impl PreferencesState {
 /// connection-thread cache path serves it memory-only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CameraGroupSummary {
-    /// The immutable group id (as reported when it was enrolled).
+    /// The group id as this peer may name it: the store's immutable id for
+    /// root and for clients that did not ask for handles; for a non-root
+    /// client that did, an opaque group handle (the store id is derived
+    /// from the camera identity, serial included). Either form is accepted
+    /// by [`Request::RemoveCameraGroup`].
     pub id: String,
     /// The bound RGB identity (`vid:pid[:serial]`), if any.
     pub rgb: Option<String>,
@@ -1267,6 +1300,11 @@ pub struct CameraGroupSummary {
     pub stale: bool,
     pub generation: u64,
     pub profiles: Vec<CameraGroupProfileSummary>,
+    /// The handle of the connected pair this group is bound to (ADR-0030
+    /// §4), correlated by the daemon; `None` when not connected or from
+    /// an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_handle: Option<String>,
 }
 
 /// One profile's row within one camera group.
@@ -1862,6 +1900,7 @@ mod tests {
             selected: false,
             stale: false,
             generation: 3,
+            connected_handle: None,
             profiles: vec![CameraGroupProfileSummary {
                 profile: "Face Profile 1".into(),
                 scans: 10,
@@ -2503,9 +2542,11 @@ mod tests {
             Request::ListProfiles {
                 user,
                 structured_errors,
+                handles,
             } => {
                 assert_eq!(user, "alice");
                 assert!(!structured_errors, "absent field must default to opted-out");
+                assert!(!handles, "absent field: the client matches on identities");
             }
             other => panic!("expected ListProfiles, got {other:?}"),
         }
@@ -2528,6 +2569,7 @@ mod tests {
         let new_wire = serde_json::to_string(&Request::ListProfiles {
             user: "alice".into(),
             structured_errors: true,
+            handles: true,
         })
         .unwrap();
         let parsed: OldRequest =
