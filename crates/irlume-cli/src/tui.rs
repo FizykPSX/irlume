@@ -671,6 +671,10 @@ struct App {
     primary_camera: Option<irlume_common::PrimaryCameraBinding>,
     /// The Cameras details panel is open for the selected pair.
     cam_details: bool,
+    /// A keyring re-check was asked for while one was in flight.
+    keyring_refresh_queued: bool,
+    /// The generation the in-flight keyring request was started with.
+    keyring_running_generation: u64,
     keyring_armed: Option<bool>,
     /// Seal-tier label from envelope metadata (e.g. "pcrlock NV 0x… (Tier 2)");
     /// `None` when not armed or the daemon predates the request.
@@ -1844,6 +1848,34 @@ impl App {
         lines.join("\n")
     }
 
+    /// The daemon's state in one word for the page caption: what the
+    /// bottom bar used to carry as "F4 Daemon …".
+    fn daemon_state_label(&self) -> &'static str {
+        if !self.source_usable(Source::Live) || self.live.is_none() {
+            "unavailable"
+        } else if self
+            .live
+            .as_ref()
+            .is_some_and(|live| !live.tracking_available)
+        {
+            "activity unknown"
+        } else if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.worker.is_some() || !live.background.is_empty())
+        {
+            "working"
+        } else if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.stage == irlume_common::live::LiveStage::Ready)
+        {
+            "ready"
+        } else {
+            "changing state"
+        }
+    }
+
     fn page_observation(&self) -> String {
         let sources: &[Source] = match self.screen {
             SC_PROFILES => &[Source::Profiles],
@@ -1854,11 +1886,20 @@ impl App {
             SC_SETTINGS => &[Source::Preferences],
             SC_PAM => &[Source::Machine, Source::Apps],
             SC_REPAIR => &[Source::Health, Source::Machine, Source::Profiles],
-            SC_IDENTIFY => return "last test only · F4 current status".into(),
+            SC_IDENTIFY => {
+                return format!(
+                    "daemon {} · last test only · F4 current status",
+                    self.daemon_state_label()
+                )
+            }
             _ => &[Source::Health, Source::Profiles, Source::Machine],
         };
+        // One freshness indicator (ADR-0030 §1.9): the daemon's state and
+        // the observation age share this caption; the bottom line is the
+        // Activity log alone.
+        let daemon = self.daemon_state_label();
         if sources.iter().any(|source| !self.source_usable(*source)) {
-            "some observations unavailable · F4 details".into()
+            format!("daemon {daemon} · some observations unavailable · F4 details")
         } else {
             let age = sources
                 .iter()
@@ -1866,7 +1907,7 @@ impl App {
                 .map(|at| self.now().saturating_duration_since(at).as_secs())
                 .max()
                 .unwrap_or(0);
-            format!("observations ≤{age}s old · F4 details")
+            format!("daemon {daemon} · observations ≤{age}s old · F4 details")
         }
     }
 
@@ -2031,6 +2072,8 @@ impl App {
             camera_store_error: None,
             primary_camera: None,
             cam_details: false,
+            keyring_refresh_queued: false,
+            keyring_running_generation: 0,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -2542,11 +2585,20 @@ impl App {
     /// with authentication; this independent receiver cannot delay light status.
     fn refresh_keyring_diagnostic(&mut self) {
         if self.keyring_load.is_some() {
+            // An in-flight reply of an older generation will be discarded:
+            // run again when it lands rather than dropping the request the
+            // person just made. A reply of the current generation is this
+            // request's answer already; a second identical measurement on
+            // the serialized TPM queue would be waste.
+            if self.keyring_running_generation != self.keyring_generation {
+                self.keyring_refresh_queued = true;
+            }
             return;
         }
         let (tx, rx) = mpsc::channel();
         let user = self.user.clone();
         let generation = self.keyring_generation;
+        self.keyring_running_generation = generation;
         std::thread::spawn(move || {
             let reply = crate::daemon_poll(&Request::KeyringInfo { user });
             let _ = tx.send((generation, reply));
@@ -3348,7 +3400,7 @@ impl App {
                     GotoFix::RecoveryRestore => {
                         (SC_RECOVERY, KeyCode::Char('t'), "restore the template key")
                     }
-                    GotoFix::KeyringReseal => (SC_KEYRING, KeyCode::Char('r'), "reseal the wallet"),
+                    GotoFix::KeyringReseal => (SC_KEYRING, KeyCode::Char('b'), "reseal the wallet"),
                     GotoFix::RecoveryPass => (
                         SC_RECOVERY,
                         KeyCode::Char('s'),
@@ -3361,44 +3413,37 @@ impl App {
                 self.on_key(key);
             }
             // Emitter setup writes the persisted UVC control, a root op now.
-            Fix::Root(RootFix::RestartDaemon) => {
-                self.log(
-                    '→',
-                    "sudo systemctl enable --now irlumed (you'll be asked for your password)",
-                );
-                self.suspend = Some(Suspend::RestartDaemon);
-            }
-            Fix::Root(RootFix::RestartFprintd) => {
-                self.log(
-                    '→',
-                    "sudo systemctl restart fprintd: releases a stale reader claim",
-                );
-                self.suspend = Some(Suspend::RestartFprintd);
-            }
-            Fix::Root(RootFix::LoginEnable) => {
-                self.log(
-                    '→',
-                    "sudo irlume login enable --apply: wires the login stack for your method",
-                );
-                self.suspend = Some(Suspend::LoginEnable);
-            }
-            Fix::Root(RootFix::FingerprintAdd) => {
-                self.log('→', "enrolling a finger (interactive)");
-                self.suspend = Some(Suspend::FingerprintAdd);
-            }
-            Fix::Root(RootFix::LoginReconcile) => {
-                self.log(
-                    '→',
-                    "sudo irlume login reconcile: re-applies the face-auth PAM wiring",
-                );
-                self.suspend = Some(Suspend::LoginReconcile);
-            }
-            Fix::Root(RootFix::SelinuxLoad) => {
-                self.log(
-                    '→',
-                    "sudo irlume selinux load (you'll be asked for your password)",
-                );
-                self.suspend = Some(Suspend::SelinuxLoad);
+            // A root fix runs as root: it is confirmed like every other
+            // root operation (ADR-0030 §1.1), whether reached by [f] or by
+            // Enter on the F6-focused chip, and the dialog names the command.
+            Fix::Root(root) => {
+                let (command, suspend) = match root {
+                    RootFix::RestartDaemon => (
+                        "sudo sh -c 'systemctl enable irlumed; systemctl restart irlumed' (enables the service and restarts it, so a running but outdated daemon is replaced)",
+                        Suspend::RestartDaemon,
+                    ),
+                    RootFix::RestartFprintd => (
+                        "sudo sh -c 'systemctl restart fprintd || pkill fprintd' (releases a stale reader claim; stops the process if the unit will not restart)",
+                        Suspend::RestartFprintd,
+                    ),
+                    RootFix::LoginEnable => (
+                        "sudo irlume login enable --apply (wires the login stack for your method)",
+                        Suspend::LoginEnable,
+                    ),
+                    RootFix::FingerprintAdd => {
+                        ("enroll a finger (interactive)", Suspend::FingerprintAdd)
+                    }
+                    RootFix::LoginReconcile => (
+                        "sudo irlume login reconcile (re-applies the face-auth PAM wiring)",
+                        Suspend::LoginReconcile,
+                    ),
+                    RootFix::SelinuxLoad => ("sudo irlume selinux load", Suspend::SelinuxLoad),
+                };
+                self.confirm = Some((
+                    format!("Run this fix? {command}. You'll be asked for your password."),
+                    "Fix",
+                    ConfirmAct::Sus(suspend),
+                ));
             }
         }
     }
@@ -3774,6 +3819,7 @@ impl App {
         }
         if let Some(result) = receive_finished(&self.keyring_load) {
             self.keyring_load = None;
+            let queued = std::mem::take(&mut self.keyring_refresh_queued);
             match result {
                 Ok((generation, reply)) if generation == self.keyring_generation => {
                     self.keyring_drift = match reply {
@@ -3789,6 +3835,9 @@ impl App {
                     self.log('!', "wallet check ended without a result; current PCR state is unavailable. Check again to retry.");
                 }
                 _ => {}
+            }
+            if queued {
+                self.refresh_keyring_diagnostic();
             }
         }
         if let Some(result) = receive_finished(&self.profiles_load) {
@@ -4750,8 +4799,12 @@ impl App {
             // worker returns, up to the 120s daemon budget. Keep a quit escape
             // hatch so a stalled probe can never trap the user; the worker result
             // is harmlessly dropped when we exit.
-            if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
+            // q remains the one escape hatch (ADR-0030 §1.2: Esc never
+            // quits); Esc says so instead of ending the session.
+            if code == KeyCode::Char('q') {
                 self.quit = true;
+            } else if code == KeyCode::Esc {
+                self.log('·', "a task is running; q quits, other keys wait for it");
             }
             return;
         }
@@ -4891,6 +4944,30 @@ impl App {
             }
             KeyCode::Tab | KeyCode::Right => self.step(1),
             KeyCode::BackTab | KeyCode::Left => self.step(-1),
+            // ADR-0030 §1.3: digits jump to sections by a fixed table, so a
+            // digit means the same thing whatever the sidebar shows; a
+            // section this machine hides is named, not silently ignored.
+            KeyCode::Char(digit @ '1'..='9') => {
+                let target = match digit {
+                    '1' => SC_WELCOME,
+                    '2' => SC_PROFILES,
+                    '3' => SC_KEYRING,
+                    '4' => SC_RECOVERY,
+                    '5' => SC_PAM,
+                    '6' => SC_REPAIR,
+                    '7' => SC_CAMERAS,
+                    '8' => SC_SETTINGS,
+                    _ => SC_FINGERPRINT,
+                };
+                if self.visible.contains(&target) {
+                    self.enter_screen(target);
+                } else {
+                    let reason = self.hidden_section_reason(target);
+                    self.log('·', format!("{} is hidden: {reason}", SCREENS[target]));
+                }
+            }
+            KeyCode::Char('g') => self.move_sel_to_end(false),
+            KeyCode::Char('G') => self.move_sel_to_end(true),
             KeyCode::Up | KeyCode::Char('k') if self.focused_action().is_some() => {
                 self.move_action_focus(-1)
             }
@@ -5057,6 +5134,8 @@ impl App {
         }
     }
 
+    /// Move the current page's selection; pages without a selectable list
+    /// are left alone (the Faces selection is not theirs to move).
     fn move_sel(&mut self, d: i32) {
         if self.screen == SC_REPAIR {
             self.page_view.set((usize::MAX, Rect::default(), 0, 0));
@@ -5065,7 +5144,8 @@ impl App {
             SC_REPAIR => self.repair.len(),
             SC_CAMERAS => self.pairs.len(),
             SC_WELCOME => self.hub_rows().len(),
-            _ => self.rows().len(),
+            SC_PROFILES => self.rows().len(),
+            _ => return,
         };
         let n = len.max(1) as i32;
         let cur = match self.screen {
@@ -5085,6 +5165,48 @@ impl App {
         };
     }
 
+    /// Why a fixed-digit section is absent from the sidebar, in the terms
+    /// of `compute_visible`: a capability this machine lacks (no toggle
+    /// brings it back), or the technical view being off (v does).
+    fn hidden_section_reason(&self, target: usize) -> String {
+        let rgb = self.caps.rgb || self.reported_caps.rgb;
+        let ir = self.caps.ir_pair || self.reported_caps.ir_pair;
+        match target {
+            SC_PROFILES | SC_RECOVERY => "no camera was found on this machine".into(),
+            SC_CAMERAS | SC_IDENTIFY if !rgb => "no camera was found on this machine".into(),
+            SC_CAMERAS | SC_IDENTIFY => "it is a technical tool (v shows them)".into(),
+            SC_FINGERPRINT => "no fingerprint reader was found on this machine".into(),
+            SC_KEYRING if !ir => {
+                "it needs an IR camera pair or a fingerprint reader, and neither was found".into()
+            }
+            _ => "it is not available in this view".into(),
+        }
+    }
+
+    /// First (`last == false`) or last row of the current page's list.
+    /// Pages without a selectable list (wallet, recovery, fingerprint,
+    /// Login & Apps, preferences, Test Recognition) are left alone: the
+    /// Faces selection is not theirs to move.
+    fn move_sel_to_end(&mut self, last: bool) {
+        if self.screen == SC_REPAIR {
+            self.page_view.set((usize::MAX, Rect::default(), 0, 0));
+        }
+        let len = match self.screen {
+            SC_REPAIR => self.repair.len(),
+            SC_CAMERAS => self.pairs.len(),
+            SC_WELCOME => self.hub_rows().len(),
+            SC_PROFILES => self.rows().len(),
+            _ => return,
+        };
+        let cur = match self.screen {
+            SC_REPAIR => &mut self.repair_sel,
+            SC_CAMERAS => &mut self.cam_sel,
+            SC_WELCOME => &mut self.hub_sel,
+            _ => &mut self.sel,
+        };
+        *cur = if last { len.saturating_sub(1) } else { 0 };
+    }
+
     fn on_action(&mut self, code: KeyCode) {
         match (self.screen, code) {
             // Hub: Enter opens the selected section (the summary IS the nav).
@@ -5098,6 +5220,69 @@ impl App {
             (SC_WELCOME, KeyCode::Char('r')) | (SC_DONE, KeyCode::Char('r')) => {
                 self.log('·', "refreshing status…");
                 self.refresh();
+            }
+            // ADR-0030 §1.3: r refreshes the current page's observations on
+            // every page; Diagnostics and Cameras have their own arms below.
+            // Each page refreshes only the observations it shows: the light
+            // status poll for the wallet/recovery/preferences facts, the
+            // machine probes for fingerprint and login wiring, the app scan
+            // for Login & Apps, the profile listing for Faces. Never the
+            // full refresh, which would also start a TPM-backed profile load
+            // the page does not need.
+            (SC_PROFILES, KeyCode::Char('r')) => {
+                self.log('·', "refreshing faces…");
+                // Invalidate first: a load already running (the TPM-backed
+                // startup load, typically) then cannot publish a reply older
+                // than this key press, and a replacement is queued.
+                self.freshness.cycle_mut(Worker::Profiles).invalidate();
+                self.refresh_profiles();
+            }
+            (SC_KEYRING | SC_RECOVERY | SC_SETTINGS, KeyCode::Char('r')) => {
+                self.log('·', "refreshing this page…");
+                // Only the light sources these pages show; never the
+                // profile source, whose reload unseals through the TPM.
+                for source in [Source::Wallet, Source::Recovery, Source::Preferences] {
+                    self.invalidate_source(source);
+                }
+                self.freshness.cycle_mut(Worker::Light).invalidate();
+                self.refresh_light();
+                if self.screen == SC_KEYRING {
+                    // The wallet page also shows the machine (TPM) row.
+                    self.invalidate_source(Source::Machine);
+                    self.freshness.cycle_mut(Worker::Machine).invalidate();
+                    self.request_probes();
+                    self.invalidate_keyring_diagnostic();
+                    self.refresh_keyring_diagnostic();
+                }
+            }
+            (SC_FINGERPRINT, KeyCode::Char('r')) => {
+                self.log('·', "refreshing this page…");
+                for source in [Source::Machine, Source::FingerprintReader, Source::Fingerprint] {
+                    self.invalidate_source(source);
+                }
+                self.freshness.cycle_mut(Worker::Machine).invalidate();
+                self.refresh_light();
+                self.request_probes();
+            }
+            (SC_PAM, KeyCode::Char('r')) => {
+                self.log('·', "refreshing this page…");
+                // The tier explanation and the AppArmor row read Health.
+                for source in [Source::Machine, Source::Apps, Source::Health] {
+                    self.invalidate_source(source);
+                }
+                self.freshness.cycle_mut(Worker::Machine).invalidate();
+                self.freshness.cycle_mut(Worker::Apps).invalidate();
+                self.freshness.cycle_mut(Worker::Light).invalidate();
+                self.request_probes();
+                self.refresh_heavy();
+                self.refresh_light();
+            }
+            (SC_IDENTIFY, KeyCode::Char('r')) => {
+                self.log('·', "refreshing daemon status…");
+                // As for Faces: a poll already in flight cannot stand as
+                // this refresh; invalidating queues a replacement.
+                self.freshness.cycle_mut(Worker::Live).invalidate();
+                self.refresh_live();
             }
             // Welcome: start the uninstall challenge (capital U, so a stray
             // lower-case key can't begin it). The user must TYPE the word to
@@ -5117,6 +5302,31 @@ impl App {
             (SC_WELCOME, KeyCode::Char('e')) if self.caps.rgb => {
                 self.screen = SC_PROFILES;
                 self.begin_enroll();
+            }
+            // ADR-0030 §1.3: i is Test Recognition on every page. Pages with
+            // their own arm (Overview, Identify) keep it; the rest route
+            // here to the same operation.
+            (
+                SC_PROFILES | SC_KEYRING | SC_RECOVERY | SC_FINGERPRINT | SC_PAM | SC_SETTINGS
+                | SC_REPAIR | SC_CAMERAS,
+                KeyCode::Char('i'),
+            ) if self.caps.rgb => {
+                if self.visible.contains(&SC_IDENTIFY) {
+                    self.screen = SC_IDENTIFY;
+                }
+                self.start_async(
+                    "Identify (1:N)",
+                    OpTag::Identify,
+                    Request::Identify,
+                    map_identify,
+                );
+            }
+            (
+                SC_PROFILES | SC_KEYRING | SC_RECOVERY | SC_FINGERPRINT | SC_PAM | SC_SETTINGS
+                | SC_REPAIR | SC_CAMERAS,
+                KeyCode::Char('i'),
+            ) => {
+                self.log('·', "current camera availability is unconfirmed; inspect Cameras or Diagnostics before face enrollment/identify");
             }
             (SC_WELCOME, KeyCode::Char('i')) if self.caps.rgb => {
                 // Only jump to the Identify tab where it exists (advanced
@@ -5187,15 +5397,23 @@ impl App {
             (SC_REPAIR, KeyCode::Char('r')) => {
                 self.log('·', "re-running diagnostics…");
                 self.refresh();
+                // The camera check reads the classified pairs and their
+                // privacy switches: re-list them too, superseding a listing
+                // already in flight.
+                self.freshness.cycle_mut(Worker::Cameras).invalidate();
+                self.invalidate_source(Source::Cameras);
+                self.refresh_camera_listing();
                 self.refresh_keyring_diagnostic();
             }
-            (SC_REPAIR, KeyCode::Char('f')) | (SC_REPAIR, KeyCode::Enter) => {
-                self.apply_fix(self.repair_sel)
-            }
+            (SC_REPAIR, KeyCode::Char('f')) => self.apply_fix(self.repair_sel),
+            // Enter on a check row opens nothing further today (the box
+            // below already shows the selected row); it never runs the fix
+            // (ADR-0030 §1.1). The fix is [f].
+            (SC_REPAIR, KeyCode::Enter) => {}
             // View the face-auth journal to see WHY a check failed. `logs debug
             // on` (a console step) adds per-stage tracing when a number is needed.
             // Key is 'g'; 'v' is the global basic/all-tabs toggle (on_key).
-            (SC_REPAIR, KeyCode::Char('g')) => {
+            (SC_REPAIR, KeyCode::Char('w')) => {
                 self.log(
                     '→',
                     "sudo irlume logs: the daemon/PAM/keyring journal in one view",
@@ -5243,8 +5461,17 @@ impl App {
                 self.freshness.cycle_mut(Worker::Cameras).invalidate();
                 self.invalidate_source(Source::Cameras);
                 self.refresh_camera_listing();
-                // The role labels read the enrollment: refresh it too.
+                // The role labels read the enrollment: refresh it too, and
+                // as on Faces, a load already in flight is superseded.
+                self.freshness.cycle_mut(Worker::Profiles).invalidate();
                 self.refresh_profiles();
+                // The configured marker reads Health and the policy status
+                // reads Preferences: both are this page's too.
+                for source in [Source::Health, Source::Preferences] {
+                    self.invalidate_source(source);
+                }
+                self.freshness.cycle_mut(Worker::Light).invalidate();
+                self.refresh_light();
             }
             (SC_CAMERAS, KeyCode::Char('c')) => {
                 self.confirm = Some(("Inspect capture qualification? This opens camera controls when available; it does not capture frames. The result is a dated observation, not a live readiness guarantee.".into(), "Inspect", ConfirmAct::CameraQualification));
@@ -5290,7 +5517,7 @@ impl App {
                 Some(p) => self.start_enroll(Some(p)),
                 None => self.log('·', "select a profile first (↑↓), then [a] to add scans"),
             },
-            (SC_PROFILES, KeyCode::Char('r')) => self.begin_rename(),
+            (SC_PROFILES, KeyCode::Char('n')) => self.begin_rename(),
             (SC_PROFILES, KeyCode::Char('d')) => self.begin_delete(),
             // Identify: 1:N who-is-this.
             (SC_IDENTIFY, KeyCode::Char('i')) => self.start_async(
@@ -5300,7 +5527,12 @@ impl App {
                 map_identify,
             ),
             // Keyring: masked in-TUI entry (goes to the root daemon; no sudo).
-            (SC_KEYRING, KeyCode::Char('d')) => self.refresh_keyring_diagnostic(),
+            // An explicit measurement is a new generation: it supersedes a
+            // check already running rather than reusing its answer.
+            (SC_KEYRING, KeyCode::Char('d')) => {
+                self.invalidate_keyring_diagnostic();
+                self.refresh_keyring_diagnostic();
+            }
             (SC_KEYRING, KeyCode::Char('a')) => {
                 self.input = Some((
                     "Login password to seal (••):".into(),
@@ -5321,7 +5553,7 @@ impl App {
                 self.suspend = Some(Suspend::PcrlockMakePolicy);
             }
             // The CLI owns seal-kind recovery (token seals must not be re-armed here).
-            (SC_KEYRING, KeyCode::Char('r')) if self.keyring_armed == Some(true) => {
+            (SC_KEYRING, KeyCode::Char('b')) if self.keyring_armed == Some(true) => {
                 self.prepare_action(actions::Invocation { action: &actions::WALLET_RESEAL, values: Vec::new() });
             }
             (SC_KEYRING, KeyCode::Char('f')) => {
@@ -5448,7 +5680,7 @@ impl App {
                 None => self.log('·', "Bitwarden is not installed on this system"),
             },
             // Sensor selection is explicit; an unknown observation never guesses a toggle.
-            (SC_SETTINGS, KeyCode::Char('i')) => {
+            (SC_SETTINGS, KeyCode::Char('o')) => {
                 use irlume_common::config::FaceSensorPolicy;
                 match self.preference_state().face_sensor_policy.resolve() {
                     Ok(FaceSensorPolicy::IrOnlyExperimental) => self.suspend = Some(Suspend::FaceSensorPolicy(false)),
@@ -5459,7 +5691,7 @@ impl App {
                     Err(_) => self.log('·', "Sensor policy is unavailable or invalid. Open Repair and inspect the settings before changing it."),
                 }
             }
-            (SC_SETTINGS, KeyCode::Char('r')) => self.prepare_action(actions::Invocation { action: &actions::SENSOR_PREFLIGHT, values: Vec::new() }),
+            (SC_SETTINGS, KeyCode::Char('c')) => self.prepare_action(actions::Invocation { action: &actions::SENSOR_PREFLIGHT, values: Vec::new() }),
             // Settings.
             (SC_SETTINGS, KeyCode::Char('p')) => {
                 if self.preference_state().consent_overridden {
@@ -6216,7 +6448,10 @@ impl App {
     /// stops working. Deliberately no sidebar — nothing to parse on run one.
     fn draw_firstrun(&self, f: &mut Frame, area: Rect) {
         let block = Block::bordered()
-            .title(" Set up face unlock ")
+            .title(format!(
+                " Set up face unlock · daemon {} ",
+                self.daemon_state_label()
+            ))
             .title_bottom(if self.focused_action().is_some() {
                 " PgUp/Dn read · F6 back "
             } else {
@@ -6592,11 +6827,22 @@ impl App {
         if self.enroll.is_some() || self.op.is_some() {
             // Only the visible flow footer can cancel/exit. In particular,
             // normal page controls and the header never act behind a flow.
-            let flow_control = self.click_targets.borrow().iter().any(|(rect, click)| {
-                rect.contains((col, row).into()) && matches!(click, Click::Key(KeyCode::Esc))
-            });
-            if flow_control {
-                self.on_key(KeyCode::Esc);
+            // The footer registers Esc (cancel enrollment) or q (quit
+            // during a task); nothing else is clickable behind a flow.
+            let flow_control = self
+                .click_targets
+                .borrow()
+                .iter()
+                .find_map(|(rect, click)| match click {
+                    Click::Key(key @ (KeyCode::Esc | KeyCode::Char('q')))
+                        if rect.contains((col, row).into()) =>
+                    {
+                        Some(*key)
+                    }
+                    _ => None,
+                });
+            if let Some(key) = flow_control {
+                self.on_key(key);
             }
             return;
         }
@@ -6634,15 +6880,12 @@ impl App {
                     }
                 }
                 Click::Select(i) => match self.screen {
-                    // Click a Diagnostics row once to select it, again to run
-                    // its fix ([f]): mouse users never need the keyboard.
+                    // Click a Diagnostics row to select it; the fix stays
+                    // behind [f] and its confirmation (ADR-0030 §1.1: a
+                    // second click, like Enter, never runs a side effect).
                     SC_REPAIR if i < self.repair.len() => {
-                        if self.repair_sel == i {
-                            self.on_key(KeyCode::Enter);
-                        } else {
-                            self.repair_sel = i;
-                            self.page_view.set((usize::MAX, Rect::default(), 0, 0));
-                        }
+                        self.repair_sel = i;
+                        self.page_view.set((usize::MAX, Rect::default(), 0, 0));
                     }
                     SC_CAMERAS if i < self.pairs.len() => {
                         if self.cam_sel == i {
@@ -6710,7 +6953,7 @@ impl App {
         let title = Line::from(left);
         let remaining = area.width.saturating_sub(exit_width);
         let account = if self.advanced {
-            format!("advanced · {} ", self.user)
+            format!("advanced (v) · {} ", self.user)
         } else {
             format!("{} ", self.user)
         };
@@ -6815,10 +7058,16 @@ impl App {
         } else {
             blk
         };
+        // During enrollment the observation caption gives way to the
+        // capture flow, but the daemon's state stays visible (ADR-0030
+        // §1.9): a daemon that stops mid-capture must not vanish from view.
         let blk = if self.enroll.is_none() {
             blk.title(self.page_observation())
         } else {
-            blk
+            blk.title(format!(
+                " daemon {} · enrolling ",
+                self.daemon_state_label()
+            ))
         };
         let inner = blk.inner(area);
         f.render_widget(blk.clone(), area);
@@ -6870,7 +7119,7 @@ impl App {
         let chk = |ok: bool, label: &str| {
             Line::from(vec![
                 Span::styled(
-                    if ok { "  ✓ " } else { "  ○ " },
+                    if ok { "  ● " } else { "  ○ " },
                     if ok {
                         Style::new().fg(th().ok)
                     } else {
@@ -7297,14 +7546,14 @@ impl App {
                 &mut page_actions,
                 &[
                     (
-                        "i",
+                        "o",
                         match ir_only {
                             Some(true) => "turn IR-only off (use dual cameras)",
                             Some(false) => "turn IR-only on (experimental; asks first)",
                             None => "IR-only unavailable (inspect settings)",
                         },
                     ),
-                    ("r", "check IR-only readiness for this account"),
+                    ("c", "check IR-only readiness for this account"),
                 ],
             );
             v.push(Line::raw(
@@ -7403,7 +7652,26 @@ impl App {
         self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
+    /// The details column (ADR-0030 §1.8) appears when the content area
+    /// holds both a list that still shows its status column and a readable
+    /// details column: about 135 terminal columns with the sidebar open.
+    const CAMERA_LIST_MIN_WIDTH: u16 = 72;
+    const CAMERA_DETAILS_WIDTH: u16 = 42;
+
     fn draw_cameras(&self, f: &mut Frame, area: Rect) {
+        // Wide terminals get the selected camera's details in a right-hand
+        // column, always; narrower ones keep the Enter panel below the list.
+        let wide = area.width >= Self::CAMERA_LIST_MIN_WIDTH + Self::CAMERA_DETAILS_WIDTH;
+        let (area, details_area) = if wide {
+            let [left, right] = Layout::horizontal([
+                Constraint::Fill(1),
+                Constraint::Length(Self::CAMERA_DETAILS_WIDTH),
+            ])
+            .areas(area);
+            (left, Some(right))
+        } else {
+            (area, None)
+        };
         let mut page_actions = Vec::new();
         // The active pair comes from the daemon's Health, NOT from
         // select_pair(): that helper falls through to discovery when no
@@ -7518,7 +7786,16 @@ impl App {
                                 _ => Style::new().fg(th().accent),
                             },
                         ),
-                        Span::styled(format!("{kind:<10}"), Style::new().dim()),
+                        // The kind column yields to the details column on
+                        // wide terminals so the status stays visible.
+                        Span::styled(
+                            if wide {
+                                String::new()
+                            } else {
+                                format!("{kind:<10}")
+                            },
+                            Style::new().dim(),
+                        ),
                         if priv_on {
                             Span::styled("⚠ privacy ON", Style::new().fg(th().err))
                         } else if !p.fixed && external_blocked == Some(true) {
@@ -7651,28 +7928,29 @@ impl App {
             }
             None => Span::styled("not fetched yet".to_string(), Style::new().dim()),
         };
-        if self.cam_details {
-            if let Some(p) = pairs.get(self.cam_sel) {
-                let configured = argb == p.rgb && air == p.ir;
-                let mut lines = self.camera_details_lines(p, configured);
-                // The schedule observation belongs to the configured pair;
-                // another camera's details do not borrow it.
-                lines.push(Line::from(vec![
-                    Span::styled("  capture schedule  ", Style::new().dim()),
-                    if configured {
-                        capture
-                    } else {
-                        Span::styled(
-                            "measured for the configured pair only; use this camera (u) to qualify it"
-                                .to_string(),
-                            Style::new().dim(),
-                        )
-                    },
-                ]));
+        let details_for = |p: &irlume_common::CameraPairInfo, with_actions: bool| {
+            let configured = argb == p.rgb && air == p.ir;
+            let mut lines = self.camera_details_lines(p, configured);
+            // The schedule observation belongs to the configured pair;
+            // another camera's details do not borrow it.
+            lines.push(Line::from(vec![
+                Span::styled("  capture schedule  ", Style::new().dim()),
+                if configured {
+                    capture.clone()
+                } else {
+                    Span::styled(
+                        "measured for the configured pair only; use this camera (u) to qualify it"
+                            .to_string(),
+                        Style::new().dim(),
+                    )
+                },
+            ]));
+            let mut actions = Vec::new();
+            if with_actions {
                 lines.push(Line::raw(""));
                 push_page_actions(
                     &mut lines,
-                    &mut page_actions,
+                    &mut actions,
                     &[
                         (
                             "u",
@@ -7684,6 +7962,32 @@ impl App {
                         ("esc", "back to the list"),
                     ],
                 );
+            }
+            (lines, actions)
+        };
+        if let Some(details_area) = details_area {
+            let lines = match pairs.get(self.cam_sel) {
+                Some(p) => details_for(p, false).0,
+                None => vec![Line::from(Span::styled(
+                    "  select a camera to see its details",
+                    Style::new().dim(),
+                ))],
+            };
+            f.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::new().borders(ratatui::widgets::Borders::LEFT)),
+                details_area,
+            );
+        }
+        // Enter opens the full panel below the list in either layout: on a
+        // wide terminal it is the readable, scrollable copy of the column
+        // (a short window clips the column) with the camera's actions, so
+        // the state Esc closes is always one the person can see.
+        if self.cam_details {
+            if let Some(p) = pairs.get(self.cam_sel) {
+                let (lines, actions) = details_for(p, true);
+                page_actions = actions;
                 self.draw_action_paragraph(f, info_area, lines, &page_actions);
                 return;
             }
@@ -7725,7 +8029,7 @@ impl App {
             &mut lines,
             &mut page_actions,
             &[
-                ("r", "inspect attached candidates"),
+                ("r", "refresh the camera list"),
                 ("c", "inspect capture qualification (asks first)"),
                 ("s", "set up emitter"),
                 ("t", "tune capture (holds the camera ~1 min)"),
@@ -7754,7 +8058,8 @@ impl App {
         let reader = match (&self.fp.device, self.fp.available) {
             (Some(n), _) => Span::styled(format!("● {n}"), Style::new().fg(th().ok)),
             (None, true) => Span::styled("● present (unnamed)", Style::new().fg(th().ok)),
-            (None, false) => Span::styled("○ none detected", Style::new().dim()),
+            // Observed absence is ✕, not ○: nothing is switched off here.
+            (None, false) => Span::styled("✕ none detected", Style::new().dim()),
         };
         let enrolled = if !self.source_usable(Source::Fingerprint) {
             Span::styled(
@@ -7802,9 +8107,9 @@ impl App {
                 )));
                 for (_, label, reaches) in &self.fp_coverage {
                     let mark = if *reaches {
-                        Span::styled("✓ ", Style::new().fg(th().ok))
+                        Span::styled("● ", Style::new().fg(th().ok))
                     } else {
-                        Span::styled("✗ ", Style::new().dim())
+                        Span::styled("○ ", Style::new().dim())
                     };
                     lines.push(Line::from(vec![
                         Span::raw("    "),
@@ -7853,9 +8158,9 @@ impl App {
             ),
             Some(r) if r.encrypted => Span::styled(
                 if r.recovery_set {
-                    "✗ encrypted, TEMPLATE KEY MISSING (restore with passphrase)"
+                    "⚠ encrypted, TEMPLATE KEY MISSING (restore with passphrase)"
                 } else {
-                    "✗ encrypted, TEMPLATE KEY MISSING (re-enroll; no recovery set)"
+                    "⚠ encrypted, TEMPLATE KEY MISSING (re-enroll; no recovery set)"
                 },
                 Style::new().fg(th().err).add_modifier(Modifier::BOLD),
             ),
@@ -8005,7 +8310,7 @@ impl App {
                 } else if tpm {
                     Span::styled("● present", Style::new().fg(th().ok))
                 } else {
-                    Span::styled("✗ none", Style::new().fg(th().err))
+                    Span::styled("✕ none", Style::new().fg(th().err))
                 },
             ]),
             Line::from(vec![
@@ -8059,7 +8364,7 @@ impl App {
                     Style::new().fg(th().warn),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "    press [r] to reseal (re-bind to the current PCRs, same password).",
+                    "    press [b] to reseal (re-bind to the current PCRs, same password).",
                     Style::new().dim(),
                 )));
             }
@@ -8078,7 +8383,7 @@ impl App {
             )));
         }
         lines.push(Line::raw(""));
-        // [r] reseal is shown only once armed (re-bind needs an existing seal);
+        // [b] reseal is shown only once armed (re-bind needs an existing seal);
         // it re-enters the password and re-seals to the current PCRs, the CLI
         // `irlume reseal` a keyboard-only user would otherwise have no way to run.
         if armed {
@@ -8087,7 +8392,7 @@ impl App {
                 &mut page_actions,
                 &[
                     ("a", "re-arm (new password)"),
-                    ("r", "reseal (re-bind to current PCRs)"),
+                    ("b", "reseal (re-bind to current PCRs)"),
                     ("f", "forget"),
                     ("d", "check current PCRs"),
                 ],
@@ -8376,9 +8681,9 @@ impl App {
             .iter()
             .map(|c| {
                 let (icon, color) = match c.sev {
-                    Sev::Ok => ("✓", th().ok),
+                    Sev::Ok => ("●", th().ok),
                     Sev::Warn => ("⚠", th().warn),
-                    Sev::Fail => ("✗", th().err),
+                    Sev::Fail => ("✕", th().err),
                     Sev::Unknown => ("◐", th().warn),
                 };
                 let tag = match &c.fix {
@@ -8388,6 +8693,12 @@ impl App {
                     Fix::Goto(_) => " · [f] fix",
                     Fix::Action(_) => " · [f] review action",
                 };
+                // The detail is clipped to what the row can show, with an
+                // ellipsis (ADR-0030 §1.7); the full text is in the box
+                // below for the selected row.
+                let fixed = 3 + 19 + 3 + tag.chars().count();
+                let room = (list_area.width as usize).saturating_sub(fixed);
+                let detail = clip_columns(&c.detail, room);
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!(" {icon} "),
@@ -8397,7 +8708,7 @@ impl App {
                         format!("{:<19} · ", c.label),
                         Style::new().add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(c.detail.clone(), Style::new().dim()),
+                    Span::styled(detail, Style::new().dim()),
                     Span::styled(tag.to_string(), Style::new().fg(th().accent)),
                 ]))
             })
@@ -8490,9 +8801,9 @@ impl App {
                     if !self.probes_landed {
                         "unknown"
                     } else if self.probes.tpm_present {
-                        "✓"
+                        "●"
                     } else {
-                        "✗"
+                        "✕"
                     }
                 ),
                 Style::new(),
@@ -8545,7 +8856,7 @@ impl App {
                 ("f", "fix selected"),
                 ("r", "re-check"),
                 ("d", "doctor"),
-                ("g", "logs"),
+                ("w", "watch logs"),
             ],
         );
         let blk = Block::bordered()
@@ -8581,7 +8892,7 @@ impl App {
             Some((true, who)) => {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "  ✓ Recognized  ",
+                        "  ● Recognized  ",
                         Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(who.clone(), Style::new().fg(th().ok)),
@@ -8596,7 +8907,7 @@ impl App {
                 )));
             }
             Some((false, why)) => lines.push(Line::from(vec![
-                Span::styled("  ✗ ", Style::new().fg(th().err)),
+                Span::styled("  ✕ ", Style::new().fg(th().err)),
                 Span::styled(why.clone(), Style::new().fg(th().err)),
             ])),
             None => lines.push(Line::from(Span::styled(
@@ -8654,7 +8965,7 @@ impl App {
         if self.pam_cache.selinux_present {
             let sel = match self.pam_cache.selinux {
                 Some(true) => Span::styled("● loaded", Style::new().fg(th().ok)),
-                Some(false) => Span::styled("✗ not loaded", Style::new().fg(th().err)),
+                Some(false) => Span::styled("✕ not loaded", Style::new().fg(th().err)),
                 None => Span::styled("unknown (needs root)", Style::new().dim()),
             };
             lines.push(Line::from(vec![
@@ -8670,7 +8981,7 @@ impl App {
             let aa = self.health.as_ref().and_then(|h| h.apparmor.as_deref());
             let val = match aa {
                 Some(l) if l.contains("unconfined") => Some(Span::styled(
-                    "✗ daemon UNCONFINED (profile installed but not loaded)",
+                    "⚠ daemon UNCONFINED (profile installed but not loaded)",
                     Style::new().fg(th().err),
                 )),
                 Some(l) if l.contains("(complain)") => Some(Span::styled(
@@ -8867,7 +9178,7 @@ impl App {
                 match self.recovery {
                     Some(r) if r.encrypted && r.key_present => onoff(true),
                     Some(r) if r.encrypted => Span::styled(
-                        "✗ key missing",
+                        "⚠ key missing",
                         Style::new().fg(th().err).add_modifier(Modifier::BOLD),
                     ),
                     Some(_) => onoff(false),
@@ -8955,30 +9266,7 @@ impl App {
             }
             (None, false, _) => " Session activity · [A] expand · [L] full history ".to_string(),
         };
-        let live_label = if !self.source_usable(Source::Live) || self.live.is_none() {
-            "unavailable"
-        } else if self
-            .live
-            .as_ref()
-            .is_some_and(|live| !live.tracking_available)
-        {
-            "activity unknown"
-        } else if self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.worker.is_some() || !live.background.is_empty())
-        {
-            "working"
-        } else if self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.stage == irlume_common::live::LiveStage::Ready)
-        {
-            "worker ready"
-        } else {
-            "changing state"
-        };
-        let title = format!(" [F4] Daemon {live_label} ·{history_title}");
+        let title = format!(" [F4] details ·{history_title}");
         self.hit(
             Rect::new(
                 area.x.saturating_add(1),
@@ -9195,13 +9483,13 @@ impl App {
                 ("T", "Record Trace (60s)"),
                 ("s", "Create Support Report"),
                 ("l", "Test Infrared Camera"),
-                ("g", "Show Logs"),
+                ("w", "Show Logs"),
                 ("t", "Toggle Debug Logs"),
             ],
             SC_CAMERAS => &[
                 ("enter", "Camera Details"),
                 ("u", "Use This Camera…"),
-                ("r", "Inspect Candidates"),
+                ("r", "Refresh Cameras"),
                 ("c", "Inspect Qualification"),
                 ("s", "Set Up Emitter…"),
                 ("p", "List Units"),
@@ -9210,11 +9498,11 @@ impl App {
             SC_PROFILES => &[
                 ("e", "Enroll Face…"),
                 ("a", "Improve Recognition"),
-                ("r", "Rename…"),
+                ("n", "Rename…"),
                 ("d", "Delete…"),
             ],
             SC_IDENTIFY => &[("i", "Test Recognition")],
-            // Both [r] and [p] are guarded in the handler: [r] reseals a seal that
+            // Both [b] and [p] are guarded in the handler: [b] reseals a seal that
             // must already exist, and [p] refreshes the boot-measurement policy a
             // Tier 2 seal is bound to. Advertising either where its guard cannot
             // pass offered a key that did nothing and said nothing.
@@ -9226,14 +9514,14 @@ impl App {
             ) {
                 (true, true) => &[
                     ("a", "Connect Wallet…"),
-                    ("r", "Reseal…"),
+                    ("b", "Reseal…"),
                     ("f", "Forget…"),
                     ("p", "Refresh PCR Policy…"),
                     ("d", "Check Current PCRs"),
                 ],
                 (true, false) => &[
                     ("a", "Connect Wallet…"),
-                    ("r", "Reseal…"),
+                    ("b", "Reseal…"),
                     ("f", "Forget…"),
                     ("d", "Check Current PCRs"),
                 ],
@@ -9261,8 +9549,8 @@ impl App {
                 ("s", "Show Status"),
             ],
             SC_SETTINGS => &[
-                ("i", "IR-only…"),
-                ("r", "Readiness…"),
+                ("o", "IR-only…"),
+                ("c", "Readiness…"),
                 ("p", "Privileged consent…"),
                 ("b", "Biopolicy…"),
             ],
@@ -9290,13 +9578,15 @@ impl App {
         // These controls replay the same state-specific keys as the keyboard.
         // Leaving a generic operation does not retract its daemon request.
         if self.enroll.is_some() || self.op.is_some() {
-            let label = if self.enroll.is_some() {
-                " cancel enrollment"
+            // Esc cancels an enrollment; during a generic task only q leaves
+            // (ADR-0030 §1.2: Esc never quits).
+            let (chip, code, label) = if self.enroll.is_some() {
+                ("esc", KeyCode::Esc, " cancel enrollment")
             } else {
-                " quit · task keeps running"
+                ("q", KeyCode::Char('q'), " quit · task keeps running")
             };
             let line = Line::from(vec![
-                key("esc"),
+                key(chip),
                 Span::raw(label),
                 Span::raw(if self.op.is_some() && area.width >= 60 {
                     " · working…"
@@ -9312,10 +9602,7 @@ impl App {
             f.render_widget(block, area);
             f.render_widget(Paragraph::new(line), inner);
             if width > 0 && inner.height > 0 {
-                self.hit(
-                    Rect::new(inner.x, inner.y, width, 1),
-                    Click::Key(KeyCode::Esc),
-                );
+                self.hit(Rect::new(inner.x, inner.y, width, 1), Click::Key(code));
             }
             return;
         }
@@ -9408,7 +9695,7 @@ impl App {
     /// of the CURRENT screen (tier two of the disclosure ladder).
     fn help_body(&self) -> String {
         let mut b = String::from(
-            "Global\n              F4  current daemon, camera inventory and observation age\n              F3  choose a section (click or arrows + Enter)\n              F6  focus page actions / return to page selection\n          ↑↓ + Enter/Space  choose and activate a focused action\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193}  select\n               v  show/hide technical tools\n               A  expand/collapse activity history\n               L  full session history and wrapped details\n         PgUp/Dn  read page with F6 focus; otherwise Activity\n               h  Overview              q  quit\n           click  rows and action chips\n        Dialogs  ↑↓ / PgUp/Dn scroll long messages\n               M  release mouse (highlight/copy)\n\nThis screen\n",
+            "Global\n              F4  current daemon, camera inventory and observation age\n              F3  choose a section (click or arrows + Enter)\n              F6  focus page actions / return to page selection\n          ↑↓ + Enter/Space  choose and activate a focused action\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193} / j k  select (pages with a list)\n            1-9  section: 1 Overview 2 Faces 3 Wallet 4 Recovery 5 Login 6 Diagnostics 7 Cameras 8 Preferences 9 Fingerprint\n            g / G  first / last row (pages with a list)\n               v  show/hide technical tools\n               r  refresh this page         i  test recognition\n               A  expand/collapse activity history\n               L  full session history and wrapped details\n         PgUp/Dn  read page with F6 focus; otherwise Activity\n               h  Overview              q  quit\n           click  rows and action chips\n        Dialogs  ↑↓ / PgUp/Dn scroll long messages\n               M  release mouse (highlight/copy)\n\nThis screen\n",
         );
         for (k, d) in self.screen_actions() {
             b.push_str(&format!("  {k:<7} {d}\n"));
@@ -9762,8 +10049,9 @@ fn state_row(label: &str, w: usize, value: Span<'static>) -> Line<'static> {
     Line::from(vec![Span::raw(format!("  {label:<w$}")), value])
 }
 
-/// Explicit authored actions: one separated row per action. The row metadata
-/// travels with the text so labels and wrapped continuations share one target.
+/// Explicit authored actions: one row per action, no spacer rows (ADR-0030
+/// §1.4). The row metadata travels with the text so labels and wrapped
+/// continuations share one target.
 fn push_page_actions(
     lines: &mut Vec<Line<'_>>,
     actions: &mut Vec<(usize, KeyCode)>,
@@ -9781,12 +10069,6 @@ fn push_page_action(
     label: &str,
     detail: &str,
 ) {
-    if actions
-        .last()
-        .is_some_and(|(row, _)| *row + 1 == lines.len())
-    {
-        lines.push(Line::raw(""));
-    }
     if let Some(code) = footer_keycode(key) {
         actions.push((lines.len(), code));
     }
@@ -10508,7 +10790,10 @@ mod tests {
         ] {
             assert!(!text.contains(removed), "{text}");
         }
-        for key in [KeyCode::Char('c'), KeyCode::Char('g'), KeyCode::Enter] {
+        // Retired gesture keys and Enter launch nothing; `c` is now the
+        // readiness check, which arms a confirmation, so it is not in
+        // this "does nothing" set.
+        for key in [KeyCode::Char('g'), KeyCode::Char('G'), KeyCode::Enter] {
             app.on_key(key);
             assert!(app.suspend.is_none() && app.op.is_none() && app.confirm.is_none());
         }
@@ -11668,6 +11953,8 @@ mod tests {
             camera_store_error: None,
             primary_camera: None,
             cam_details: false,
+            keyring_refresh_queued: false,
+            keyring_running_generation: 0,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -11958,7 +12245,7 @@ mod tests {
         click_text(&mut app, "[a] re-arm");
         assert!(matches!(app.input, Some((_, _, Pending::KeyringPw(_)))));
         app.on_key(KeyCode::Esc);
-        click_text(&mut app, "[r] reseal");
+        click_text(&mut app, "[b] reseal");
         assert!(
             matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::MoreAction(invocation)))) if invocation.action.args == ["reseal"])
         );
@@ -12011,7 +12298,7 @@ mod tests {
                     ("[f] fix selected", 'f'),
                     ("[r] re-check", 'r'),
                     ("[d] doctor", 'd'),
-                    ("[g] logs", 'g'),
+                    ("[w] watch logs", 'w'),
                 ],
             ),
             (SC_IDENTIFY, vec![("[i] identify now", 'i')]),
@@ -12922,7 +13209,7 @@ mod tests {
         assert!(app.advanced, "[v] is the global view toggle");
         assert!(app.suspend.is_none(), "[v] must not open the logs view");
         app.screen = SC_REPAIR;
-        app.on_key(KeyCode::Char('g'));
+        app.on_key(KeyCode::Char('w'));
         assert!(
             matches!(app.suspend, Some(Suspend::Logs)),
             "the advertised logs key must actually reach the Repair action"
@@ -13358,13 +13645,15 @@ mod tests {
         assert!(!app.quit);
         app.on_key(KeyCode::Char('q'));
         assert!(app.quit, "q must stay a live escape hatch during an op");
-        // A stalled op keeps the Esc exit: it is the only way out of a hung
-        // camera probe, so the op-running branch keeps Esc-quit (not home).
+        // Esc never quits (ADR-0030 §1.2), not even during a stalled op: q
+        // is the escape hatch, and Esc says so.
         let mut app = test_app();
         let (_tx, op) = fake_op();
         app.op = Some(op);
         app.on_key(KeyCode::Esc);
-        assert!(app.quit, "Esc still exits during a stalled op");
+        assert!(!app.quit, "Esc must not exit during an op; q does");
+        let (_, msg) = app.activity.last().expect("Esc explains itself");
+        assert!(msg.contains("q quits"), "{msg}");
     }
 
     #[test]
@@ -13516,7 +13805,7 @@ mod tests {
         let mut app = test_app();
         app.profiles = vec![profile("p1", &["s1", "s2"])];
         app.screen = SC_PROFILES;
-        app.on_key(KeyCode::Char('r'));
+        app.on_key(KeyCode::Char('n'));
         match &app.input {
             Some((prompt, _, Pending::RenameProfile(old))) => {
                 assert!(prompt.contains("Rename profile 'p1'"), "got: {prompt}");
@@ -13526,7 +13815,7 @@ mod tests {
         }
         app.input = None;
         app.sel = 2; // second scan
-        app.on_key(KeyCode::Char('r'));
+        app.on_key(KeyCode::Char('n'));
         match &app.input {
             Some((prompt, _, Pending::RenameScan(p, s))) => {
                 assert!(prompt.contains("Rename scan 's2'"), "got: {prompt}");
@@ -13572,10 +13861,10 @@ mod tests {
         app.input = None;
         // Reseal delegates credential handling to the shared CLI only when armed.
         app.keyring_armed = Some(false);
-        app.on_key(KeyCode::Char('r'));
+        app.on_key(KeyCode::Char('b'));
         assert!(app.input.is_none() && app.confirm.is_none());
         app.keyring_armed = Some(true);
-        app.on_key(KeyCode::Char('r'));
+        app.on_key(KeyCode::Char('b'));
         assert!(
             matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::MoreAction(invocation)))) if invocation.args("bob") == ["reseal", "--user", "bob"])
         );
@@ -13861,8 +14150,10 @@ mod tests {
         app.freshness
             .observation_mut(Source::Preferences)
             .record(true, now);
+        // Below the details-column threshold, so the Enter panel is what
+        // this test exercises (the column has its own test).
         let render = |app: &mut App| {
-            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            let mut term = Terminal::new(TestBackend::new(119, 40)).unwrap();
             term.draw(|f| app.draw(f)).unwrap();
             rendered(&term)
         };
@@ -14162,6 +14453,62 @@ mod tests {
         assert!(app.capture_mode.is_none(), "hotplug keeps no observation");
     }
 
+    /// ADR-0030 §1.8: at 120 columns the selected camera's details sit in a
+    /// right-hand column without Enter; at 80 they appear only after Enter.
+    #[test]
+    fn cameras_details_column_appears_only_on_wide_terminals() {
+        let mut app = live_test_app();
+        let mut snapshot = live_test_snapshot();
+        snapshot.cameras.candidates[0].endpoint_paths =
+            vec!["/dev/video0".into(), "/dev/video2".into()];
+        app.apply_live_snapshot(snapshot, app.now());
+        app.screen = SC_CAMERAS;
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Cameras)
+            .record(true, now);
+        // The enrollment is described, so the row's status column shows
+        // the privacy state rather than an unknown role.
+        app.primary_camera = Some(irlume_common::PrimaryCameraBinding {
+            rgb: Some("3277:0059".into()),
+            ir: Some("3277:0059".into()),
+        });
+        app.pairs = vec![irlume_common::CameraPairInfo {
+            rgb: "/dev/video0".into(),
+            ir: "/dev/video2".into(),
+            id: Some("3277:0059".into()),
+            fixed: true,
+            privacy: false,
+            name: Some("ASUS Integrated Camera".into()),
+            identity: Some("3277:0059".into()),
+            serial_present: false,
+        }];
+        let render = |app: &mut App, w: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, 40)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            rendered(&term)
+        };
+        let narrow = render(&mut app, 80);
+        assert!(
+            !narrow.contains("(RGB) +"),
+            "no details before Enter at 80 cols: {narrow}"
+        );
+        let wide = render(&mut app, 150);
+        assert!(wide.contains("/dev/video0 (RGB)"), "{wide}");
+        assert!(wide.contains("connection  built-in"), "{wide}");
+        // The status column survives beside the details column.
+        assert!(wide.contains("privacy unobserved"), "{wide}");
+        // Just under the threshold the page keeps the single column.
+        let mid = render(&mut app, 120);
+        assert!(!mid.contains("(RGB) +"), "no column at 120 cols: {mid}");
+        app.on_key(KeyCode::Enter);
+        let narrow = render(&mut app, 80);
+        assert!(
+            narrow.contains("(RGB) +"),
+            "Enter opens the panel at 80 cols: {narrow}"
+        );
+    }
+
     #[test]
     fn cameras_emitter_keys_route_setup_and_probe() {
         let _sock = dead_socket();
@@ -14302,10 +14649,19 @@ mod tests {
             app.activity.last().unwrap().1.contains("run `foo --bar`"),
             "a manual fix must echo the exact command"
         );
+        // A root fix arms the confirmation dialog; the dialog's action is
+        // the suspend (ADR-0030 §1.1: root operations always ask first).
         let suspended_by = |app: &mut App, idx: usize| {
             app.suspend = None;
             app.apply_fix(idx);
-            app.suspend.take()
+            assert!(
+                app.suspend.is_none(),
+                "a root fix never suspends before the dialog"
+            );
+            match app.confirm.take() {
+                Some((_, _, ConfirmAct::Sus(suspend))) => Some(suspend),
+                _ => None,
+            }
         };
         assert!(matches!(
             suspended_by(&mut app, 2),
@@ -15459,6 +15815,153 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// A keyring check already running for the current generation is the
+    /// answer to a screen-entry request: no second identical measurement is
+    /// queued. Only a stale generation (explicit invalidation) queues one.
+    #[test]
+    fn keyring_recheck_is_queued_only_when_the_running_check_is_stale() {
+        let mut app = test_app();
+        let (_tx, rx) = mpsc::channel::<(u64, Result<Response, String>)>();
+        app.keyring_running_generation = app.keyring_generation;
+        app.keyring_load = Some(rx);
+        app.refresh_keyring_diagnostic();
+        assert!(
+            !app.keyring_refresh_queued,
+            "a current in-flight check answers this request"
+        );
+        app.invalidate_keyring_diagnostic();
+        app.refresh_keyring_diagnostic();
+        assert!(
+            app.keyring_refresh_queued,
+            "a check begun before invalidation is stale: queue a replacement"
+        );
+        app.keyring_load = None;
+    }
+
+    /// j/k, like g/G, move the selection only on pages that show a list.
+    #[test]
+    fn j_and_k_leave_rowless_pages_alone() {
+        let mut app = test_app();
+        app.profiles = vec![profile("A", &["a"]), profile("B", &["b"])];
+        app.screen = SC_PROFILES;
+        app.sel = 1;
+        for screen in [
+            SC_KEYRING,
+            SC_RECOVERY,
+            SC_FINGERPRINT,
+            SC_PAM,
+            SC_SETTINGS,
+            SC_IDENTIFY,
+        ] {
+            app.screen = screen;
+            app.on_key(KeyCode::Char('j'));
+            app.on_key(KeyCode::Down);
+            assert_eq!(app.sel, 1, "screen {screen}: j must not touch Faces");
+            app.on_key(KeyCode::Char('k'));
+            assert_eq!(app.sel, 1, "screen {screen}: k must not touch Faces");
+        }
+        app.screen = SC_PROFILES;
+        app.on_key(KeyCode::Char('j'));
+        assert_eq!(app.sel, 2, "Faces: j moves");
+    }
+
+    /// r on Cameras and on Login & Apps re-polls the light sources those
+    /// pages draw from (Health; Preferences on Cameras), not only their
+    /// own workers.
+    #[test]
+    fn cameras_and_pam_refresh_invalidate_the_light_sources_they_show() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        let now = app.now();
+        for source in [Source::Health, Source::Preferences] {
+            app.freshness.observation_mut(source).record(true, now);
+        }
+        app.screen = SC_CAMERAS;
+        app.on_key(KeyCode::Char('r'));
+        assert!(!app.source_usable(Source::Health));
+        assert!(!app.source_usable(Source::Preferences));
+        assert!(app.light_load.is_some(), "the light poll is relaunched");
+        drain_loads(&mut app);
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Health)
+            .record(true, now);
+        app.screen = SC_PAM;
+        app.on_key(KeyCode::Char('r'));
+        assert!(!app.source_usable(Source::Health));
+        assert!(app.light_load.is_some(), "the light poll is relaunched");
+        drain_loads(&mut app);
+    }
+
+    /// ADR-0030 §1.3: r on Password Wallet refreshes the machine (TPM) row
+    /// it shows, not only the light wallet facts.
+    #[test]
+    fn wallet_refresh_requests_the_machine_snapshot() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        assert!(app.probes_load.is_none());
+        app.on_key(KeyCode::Char('r'));
+        assert!(
+            app.probes_load.is_some(),
+            "the wallet page's refresh must relaunch the machine probe"
+        );
+        drain_loads(&mut app);
+    }
+
+    /// r on Faces while a profile load is already running queues a
+    /// replacement instead of letting the older reply stand as the refresh.
+    #[test]
+    fn faces_refresh_during_a_running_load_queues_a_replacement() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.refresh_profiles();
+        assert!(app.profiles_load.is_some(), "premise: a load is in flight");
+        assert!(!app.freshness.cycle(Worker::Profiles).pending());
+        app.on_key(KeyCode::Char('r'));
+        drain_loads(&mut app);
+        assert!(
+            app.freshness.cycle(Worker::Profiles).pending(),
+            "the pre-keypress reply is discarded and a replacement is queued"
+        );
+        assert!(
+            !app.freshness
+                .observation(Source::Profiles)
+                .last_request_failed(),
+            "the stale reply must not be published as this refresh's result"
+        );
+    }
+
+    /// r on Test Recognition while the periodic live poll is in flight
+    /// queues a replacement rather than accepting the older reply.
+    #[test]
+    fn identify_refresh_during_a_running_poll_queues_a_replacement() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_IDENTIFY;
+        app.refresh_live();
+        assert!(app.live_load.is_some(), "premise: a poll is in flight");
+        app.on_key(KeyCode::Char('r'));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.live_load.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.live_load.is_none(), "the poll must finish");
+        drain_loads(&mut app);
+        assert!(
+            app.freshness.cycle(Worker::Live).pending(),
+            "the pre-keypress reply is discarded and a replacement is queued"
+        );
+        assert!(
+            !app.freshness
+                .observation(Source::Live)
+                .last_request_failed(),
+            "the stale reply must not be published as this refresh's result"
+        );
+    }
+
     #[test]
     fn full_refresh_requests_the_machine_snapshot() {
         let _guard = dead_socket();
@@ -15650,7 +16153,7 @@ mod tests {
             method: "face".into(),
         };
         let text = draw_text(&app);
-        assert!(text.contains("○ none detected"));
+        assert!(text.contains("✕ none detected"));
         assert!(text.contains("No usable reader"));
         app.fp = FpInfo {
             available: true,
@@ -15678,12 +16181,12 @@ mod tests {
         let text = draw_text(&app);
         assert!(text.contains("alice · Face Profile 1 · match score 0.912"));
         assert!(
-            text.contains("✓ Recognized") && text.contains("not a login or a probability estimate"),
+            text.contains("● Recognized") && text.contains("not a login or a probability estimate"),
             "the hit shows a verdict without presenting similarity as a probability"
         );
         app.identify_result = Some((false, "no live face (flat depth)".into()));
         let text = draw_text(&app);
-        assert!(text.contains("✗"));
+        assert!(text.contains("✕"));
         assert!(text.contains("no live face (flat depth)"));
     }
 
@@ -16034,6 +16537,205 @@ mod tests {
             "the step counter must track visible tabs, got:\n{text}"
         );
         assert!(text.contains("testuser"), "the managed user is shown");
+    }
+
+    /// ADR-0030 §1.3: the global letters keep one meaning everywhere; no
+    /// page's action table reuses one of them.
+    #[test]
+    fn page_action_keys_never_collide_with_global_keys() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.advanced = true;
+        app.keyring_armed = Some(true);
+        app.keyring_policy = Some("pcrlock NV 0x1 (Tier 2)".into());
+        const GLOBAL: [&str; 10] = ["1", "j", "k", "g", "G", "r", "i", "?", "q", "v"];
+        for (screen, name) in SCREENS.iter().enumerate() {
+            app.screen = screen;
+            for (key, label) in app.screen_actions() {
+                let allowed = match *key {
+                    // `r` is the global refresh: a page may advertise it only
+                    // with that meaning; `i` only as Test Recognition.
+                    "r" => label.contains("Refresh") || label.contains("Recheck"),
+                    "i" => label.contains("Test Recognition"),
+                    other => !GLOBAL.contains(&other),
+                };
+                assert!(allowed, "screen {name} reuses global key {key} for {label}");
+            }
+        }
+    }
+
+    /// ADR-0030 §1.3: a digit reaches its fixed section whatever the
+    /// sidebar shows; a hidden section's digit explains instead of jumping.
+    #[test]
+    fn digits_reach_fixed_sections_regardless_of_sidebar_order() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.advanced = true;
+        app.visible = vec![
+            SC_WELCOME,
+            SC_PROFILES,
+            SC_KEYRING,
+            SC_RECOVERY,
+            SC_PAM,
+            SC_REPAIR,
+            SC_CAMERAS,
+            SC_SETTINGS,
+        ];
+        app.on_key(KeyCode::Char('7'));
+        assert_eq!(app.screen, SC_CAMERAS);
+        app.on_key(KeyCode::Char('2'));
+        assert_eq!(app.screen, SC_PROFILES);
+        // With Cameras hidden, 7 still means Cameras: it explains and stays,
+        // and the explanation is the actual reason. A camera exists here,
+        // so the technical view is what hides it.
+        app.visible = vec![SC_WELCOME, SC_PROFILES, SC_KEYRING];
+        app.caps.rgb = true;
+        app.on_key(KeyCode::Char('7'));
+        assert_eq!(app.screen, SC_PROFILES);
+        let (_, msg) = app.activity.last().expect("hidden section explained");
+        assert!(
+            msg.contains("Cameras") && msg.contains("technical tool"),
+            "{msg}"
+        );
+        // A hardware-gated page names the missing hardware and never
+        // points at v.
+        app.fp_present = false;
+        app.on_key(KeyCode::Char('9'));
+        let (_, msg) = app.activity.last().unwrap();
+        assert!(
+            msg.contains("no fingerprint reader") && !msg.contains("(v"),
+            "{msg}"
+        );
+        app.caps.rgb = false;
+        app.reported_caps.rgb = false;
+        app.visible = vec![SC_WELCOME, SC_KEYRING];
+        app.on_key(KeyCode::Char('2'));
+        let (_, msg) = app.activity.last().unwrap();
+        assert!(msg.contains("no camera") && !msg.contains("(v"), "{msg}");
+    }
+
+    /// ADR-0030 §1.1: Enter opens things; it never arms a confirmation,
+    /// a prompt or a suspend on any page.
+    #[test]
+    fn enter_never_mutates_on_any_page() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.advanced = true;
+        app.repair = vec![check_row(
+            "Keyring seal",
+            Sev::Warn,
+            Fix::Goto(GotoFix::KeyringReseal),
+        )];
+        app.repair_sel = 0;
+        for (screen, name) in SCREENS.iter().enumerate() {
+            app.screen = screen;
+            app.sel = 0;
+            app.on_key(KeyCode::Enter);
+            assert!(
+                app.confirm.is_none() && app.input.is_none() && app.suspend.is_none(),
+                "Enter on {name} must not arm a side effect"
+            );
+            app.confirm = None;
+            app.input = None;
+            app.suspend = None;
+        }
+        // The documented exception: Enter on an F6-focused chip does what
+        // the chip's letter does, and a root fix's letter opens the
+        // confirmation dialog rather than running.
+        app.screen = SC_REPAIR;
+        app.repair = vec![check_row(
+            "daemon",
+            Sev::Fail,
+            Fix::Root(RootFix::RestartDaemon),
+        )];
+        app.repair_sel = 0;
+        app.on_key(KeyCode::F(6));
+        app.on_key(KeyCode::Enter);
+        assert!(
+            app.suspend.is_none(),
+            "focused Enter never suspends into sudo directly"
+        );
+        assert!(
+            matches!(
+                app.confirm,
+                Some((_, _, ConfirmAct::Sus(Suspend::RestartDaemon)))
+            ),
+            "focused Enter on the fix chip opens its confirmation"
+        );
+        // The dialog names the command that actually runs: enable AND
+        // restart, so a running but outdated daemon is replaced.
+        let (text, _, _) = app.confirm.as_ref().unwrap();
+        assert!(
+            text.contains("systemctl enable irlumed; systemctl restart irlumed"),
+            "{text}"
+        );
+        // The fprintd fix discloses its fallback too (reached by [f]).
+        app.confirm = None;
+        app.repair = vec![check_row(
+            "reader",
+            Sev::Fail,
+            Fix::Root(RootFix::RestartFprintd),
+        )];
+        app.repair_sel = 0;
+        app.on_key(KeyCode::Char('f'));
+        let (text, _, _) = app.confirm.as_ref().expect("the fix confirms first");
+        assert!(
+            text.contains("systemctl restart fprintd || pkill fprintd"),
+            "{text}"
+        );
+    }
+
+    /// g/G move the selection only on pages that show a list; elsewhere
+    /// the Faces selection is not theirs to change.
+    #[test]
+    fn g_and_shift_g_leave_rowless_pages_alone() {
+        let mut app = test_app();
+        app.profiles = vec![profile("A", &["a"]), profile("B", &["b"])];
+        app.screen = SC_PROFILES;
+        app.sel = 0;
+        app.on_key(KeyCode::Char('G'));
+        let last = app.sel;
+        assert!(last > 0, "Faces: G reaches the last row");
+        app.on_key(KeyCode::Char('g'));
+        assert_eq!(app.sel, 0);
+        app.sel = last;
+        for screen in [
+            SC_KEYRING,
+            SC_RECOVERY,
+            SC_FINGERPRINT,
+            SC_PAM,
+            SC_SETTINGS,
+            SC_IDENTIFY,
+        ] {
+            app.screen = screen;
+            app.on_key(KeyCode::Char('g'));
+            assert_eq!(app.sel, last, "screen {screen}: g must not touch Faces");
+            app.on_key(KeyCode::Char('G'));
+            assert_eq!(app.sel, last, "screen {screen}: G must not touch Faces");
+        }
+    }
+
+    /// The daemon's state stays visible while enrollment runs.
+    #[test]
+    fn enrollment_frame_keeps_the_daemon_state_visible() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.enroll = Some(EnrollUi {
+            rx: mpsc::channel().1,
+            stop: Arc::new(AtomicBool::new(false)),
+            profile: "BEN".into(),
+            last: None,
+            count: None,
+            stalled: None,
+            captured: 1,
+            target: 5,
+            base: 0,
+            ambient_base: 0,
+            session_merge: None,
+        });
+        let text = draw_text(&app);
+        assert!(text.contains("daemon "), "{text}");
+        assert!(text.contains("enrolling"), "{text}");
     }
 
     #[test]
@@ -17825,9 +18527,9 @@ mod tests {
             assert!(row_with(&text, "Hands-free:").contains("ON"), "{text}");
             assert!(text.contains("ON — ENFORCING"), "{text}");
             if mouse {
-                click_text(&mut app, "[i] turn IR-only off");
+                click_text(&mut app, "[o] turn IR-only off");
             } else {
-                app.on_key(KeyCode::Char('i'));
+                app.on_key(KeyCode::Char('o'));
             }
             assert!(matches!(
                 app.suspend,
@@ -17837,15 +18539,15 @@ mod tests {
             app.suspend = None;
             app.preferences = Some(preference_fixture(false));
             if mouse {
-                click_text(&mut app, "[i] turn IR-only on");
+                click_text(&mut app, "[o] turn IR-only on");
             } else {
-                app.on_key(KeyCode::Char('i'));
+                app.on_key(KeyCode::Char('o'));
             }
             assert!(app.suspend.is_none());
             assert!(app.confirm.as_ref().unwrap().0.contains("not qualified"));
             app.on_key(KeyCode::Esc);
             assert!(app.suspend.is_none() && app.confirm.is_none());
-            app.on_key(KeyCode::Char('i'));
+            app.on_key(KeyCode::Char('o'));
             app.on_key(KeyCode::Char('y'));
             assert!(matches!(app.suspend, Some(Suspend::FaceSensorPolicy(true))));
         }
@@ -17877,7 +18579,7 @@ mod tests {
             assert!(app.confirm.is_none() && app.suspend.is_none());
         }
         assert!(draw_text(&app).contains("environment override"));
-        app.on_key(KeyCode::Char('r'));
+        app.on_key(KeyCode::Char('c'));
         assert!(
             matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::MoreAction(invocation)))) if invocation.args("bob") == ["auth", "sensor", "preflight", "--user", "bob"])
         );
@@ -17890,11 +18592,11 @@ mod tests {
         app.screen = SC_SETTINGS;
         let text = draw_text(&app);
         assert!(
-            text.contains("[i]"),
+            text.contains("[o]"),
             "IR-only needs an in-app control: {text}"
         );
         assert!(
-            text.contains("[r]"),
+            text.contains("[c]"),
             "readiness needs an in-app control: {text}"
         );
         assert!(!text.contains("Change as root:"), "{text}");

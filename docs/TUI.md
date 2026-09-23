@@ -54,6 +54,37 @@ If a command fails or is interrupted, some changes may already have been
 applied. Review its terminal output and the refreshed status before retrying.
 An unsuccessful daemon-start command does not automatically resume enrollment.
 
+## Keys that mean the same thing on every page
+
+The TUI keeps a small set of global keys that no page reuses with another
+meaning (ADR-0030 §1.3): `1`–`9` jump to sections by a fixed table — `1`
+Overview, `2` Faces, `3` Password Wallet, `4` Recovery, `5` Login & Apps, `6`
+Diagnostics, `7` Cameras, `8` Preferences, `9` Fingerprint — whatever the
+sidebar currently shows (a hidden section's digit says why it is hidden: missing hardware, or the technical view being off), `Tab`/`Shift-Tab` and `←`/`→` step through them, `↑`/`↓`
+and `j`/`k` move the selection and `g`/`G` go to the first and last row on
+pages that show a list, `r`
+refreshes the current page's observations (Diagnostics re-runs its checks,
+Cameras re-lists the pairs, every other page re-polls its sources), `i` runs Test Recognition, `v` shows or
+hides the technical tools, `?` opens the help for the current page, `h`
+returns to Overview and `q` quits. Enter opens things — a row, a details
+panel, a section — and never changes state; every action that writes or
+runs as root has its own letter and asks first. Esc closes the innermost
+open thing (help, a dialog, a details panel) and, with nothing open, goes to
+Overview; it never quits. Because of this rule a few page letters moved:
+rename on Faces is `n`, reseal on Password Wallet is `b`, IR-only on
+Preferences is `o` and its readiness check `c`, and the logs on Diagnostics
+are `w`. Status uses five glyphs everywhere: `●` ready or on, `○` off or
+not selected, `◐` unobserved or pending, `✕` absent or not connected, `⚠`
+needs attention (a failed check is `✕`: the check failed, whatever the
+component's presence); the same glyphs mark a Test Recognition result and
+the enrollment checklist, and they read the same with `NO_COLOR`. When the content
+area has room for both a list and a details column (about 135 terminal
+columns with the sidebar open), Cameras shows the selected camera's details
+in a right-hand column; Enter still opens the full panel with the camera's
+actions below the list (the readable copy on a short window), and narrower
+terminals have only the Enter panel. `r` on a page refreshes only what
+that page shows.
+
 ## Activity and device transparency
 
 **A** expands or collapses recent Activity. **Shift+L** opens full-height
@@ -159,9 +190,9 @@ daemon state. Environment overrides are identified and block misleading toggles.
 
 Click an action or use its key:
 
-- **i** switches IR-only on or restores dual-camera authentication. Enabling
+- **o** switches IR-only on or restores dual-camera authentication. Enabling
   experimental IR-only requires the displayed warning to be accepted.
-- **r** checks IR-only prerequisites for the account shown in the header,
+- **c** checks IR-only prerequisites for the account shown in the header,
   without opening a camera. Enabled policy and readiness are separate facts.
 - **p** switches hands-free privileged authentication on or restores required
   confirmation. Enabling hands-free explains its scope and asks first.
@@ -285,8 +316,8 @@ scan lists. Rename and Delete confirmations name their exact target.
 | `profiles forget-model`, `profiles eyes-open off` | F2: remove recognizer scans or clear the legacy blocker |
 | `identify` | Overview / Test Recognition |
 | `auth consent status/required/hands-free` | Preferences (`p`); F2 status |
-| `auth sensor status/dual/ir-only` | Preferences (`i`); F2 status |
-| `auth sensor preflight [--user U]` | Preferences (`r`); F2 readiness for the selected account |
+| `auth sensor status/dual/ir-only` | Preferences (`o`); F2 status |
+| `auth sensor preflight [--user U]` | Preferences (`c`); F2 readiness for the selected account |
 | `retry status/reset`, administrator `retry reset` | F2: status, password-verified reset or administrator reset |
 | `auth test` | F2: Test authentication for this account; JSON `granted` is the verdict |
 | `keyring arm/status/forget`, `reseal` | Password Wallet |
