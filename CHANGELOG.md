@@ -286,6 +286,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- On KDE, a fingerprint login's wallet is still started during auth when
+  `/run/user/<uid>` already exists. When it does not, which is the first
+  login after a cold boot, `irlume-kwallet-init` now reports that with a
+  dedicated exit status instead of failing outright, and the key is
+  stashed during auth and handed off from the session's `reseal` line
+  instead, the same handoff already used for the GNOME keyring token. A
+  stack without that session line keeps the previous cold boot
+  behaviour. Face `unseal` logins are unchanged, and the NixOS module,
+  which wires only the face path, is unaffected.
+
 - `set-cameras` no longer rebuilds `/etc/irlume/cameras.conf` from
   nothing when the file exists but cannot be read. A file holding bytes
   that are not UTF-8, or one whose read failed with an I/O error, was
