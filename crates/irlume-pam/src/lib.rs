@@ -159,10 +159,11 @@ const GKR_TOKEN_STASH_KEY: &str = "pam_irlume_gkr_token";
 /// `irlume-kwallet-init` reports the session is not ready yet (a cold-boot
 /// first login). Delivered from the `reseal` session line irlume wires after
 /// the include that runs `pam_systemd`, so `/run/user/<uid>` exists there. A
-/// stack without that line (the NixOS module) never picks up the stash, so it
-/// keeps the pre-fix cold-boot behaviour. The face `unseal` path never
-/// defers: it decides the login outcome, so a stack without the `reseal` line
-/// would turn a stash into a face login with a locked wallet.
+/// stack with the `keyring` auth line but no `reseal` session line (a
+/// hand-written one) never picks up the stash, so its wallet stays locked
+/// after a cold boot. The face `unseal` path never defers: it decides the
+/// login outcome, so a stack without the `reseal` line would turn a stash
+/// into a face login with a locked wallet.
 const KWALLET_KEY_STASH_KEY: &str = "pam_irlume_kwallet_key";
 
 struct IrlumePam;
@@ -294,10 +295,18 @@ impl PamServiceModule for IrlumePam {
                 // password envelope it answers KeyringUnlockNotNeeded without
                 // spending a TPM unseal, which is the old early return, moved
                 // to where the deciding fact lives.
+                //
+                // A wallet daemon that an earlier irlume line started in this
+                // login (a warm face `unseal` ahead of this line) counts too.
+                // In the auth phase only such a start sets
+                // `PAM_KWALLET5_LOGIN`, and with the flag set the daemon
+                // answers KeyringUnlockNotNeeded for a wallet key without a
+                // second TPM unseal, instead of sending the key into this
+                // process again. A GNOME token is still released.
                 let have_password = matches!(
                     pamh.get_cached_authtok(),
                     Ok(Some(tok)) if !tok.to_bytes().is_empty()
-                );
+                ) || kwallet_login_set(&pamh);
                 let service = pamh
                     .get_service()
                     .ok()
@@ -316,7 +325,27 @@ impl PamServiceModule for IrlumePam {
                     // always stashed for the session helper; and only a login
                     // password becomes an AUTHTOK. Best-effort either way;
                     // the IGNORE below never becomes a failed login.
-                    let _ = release_secret(&pamh, &user, &secret, kind, true);
+                    if kind == irlume_common::KeyringSecretKind::KdeWalletKey {
+                        // On a cold-boot first login `/run/user/<uid>` does
+                        // not exist yet: stash the key rather than lose it,
+                        // so `open_session`'s `reseal` line can start the
+                        // daemon once the session (and that directory)
+                        // exist. Only this line defers: its result decides
+                        // nothing, so a stash no session line picks up
+                        // changes nothing. The `unseal` path goes through
+                        // `release_secret`, which never stashes a wallet key.
+                        if matches!(
+                            hand_key_to_wallet_daemon(&pamh, &user, secret.expose()),
+                            WalletHandoff::NotReady
+                        ) {
+                            let _ = pamh.send_secret(
+                                KWALLET_KEY_STASH_KEY,
+                                pamsm::PamSecretBytes::new(secret.expose().to_vec()),
+                            );
+                        }
+                    } else {
+                        let _ = release_secret(&pamh, &user, &secret, kind);
+                    }
                 }
                 return PamError::IGNORE;
             }
@@ -653,13 +682,15 @@ fn deliver_gnome_token(pamh: &Pam, user: &str) {
 /// SESSION-phase delivery of a KDE wallet key deferred by the auth phase: the
 /// fingerprint `keyring` path stashes only when `irlume-kwallet-init` reported
 /// the session was not ready yet (a cold-boot first login), because
-/// `/run/user/<uid>` did not exist there. The face `unseal` path is unchanged
-/// and never defers. A warm login starts the daemon straight from auth and
-/// leaves no stash, so this is a no-op then. No daemon fallback here, unlike
-/// the GNOME token: a stash-less KDE login either already has a typed
-/// password driving `pam_kwallet5` normally, or auth already started the
-/// daemon, or the helper failed outright, or the stash could not be written,
-/// or nothing was released at all.
+/// `/run/user/<uid>` did not exist there. The face `unseal` path never
+/// defers. A warm login starts the daemon straight from auth and leaves no
+/// stash, so this is a no-op then. A stash is delivered at most once, and not
+/// at all when `PAM_KWALLET5_LOGIN` already names a running daemon (see
+/// [`hand_key_to_wallet_daemon`]). No daemon fallback here, unlike the GNOME
+/// token: a stash-less KDE login either already has a typed password driving
+/// `pam_kwallet5` normally, or auth already started the daemon, or the helper
+/// failed outright, or the stash could not be written, or nothing was
+/// released at all.
 fn deliver_kde_wallet_key(pamh: &Pam, user: &str) {
     // SAFETY: the key was registered by this module in the same PAM
     // transaction and is not replaced while the borrow is live; the borrow
@@ -668,6 +699,14 @@ fn deliver_kde_wallet_key(pamh: &Pam, user: &str) {
         Ok(stash) if !stash.is_empty() => SecretBytes::new(stash.expose().to_vec()),
         _ => return,
     };
+    // Overwrite the stash with an empty value, which the check above reads
+    // as absent, so a second `open_session` on this handle cannot start
+    // another daemon with the same key. The replacement also wipes the
+    // stashed copy.
+    let _ = pamh.send_secret(
+        KWALLET_KEY_STASH_KEY,
+        pamsm::PamSecretBytes::new(Vec::new()),
+    );
     let _ = hand_key_to_wallet_daemon(pamh, user, key.expose());
 }
 
@@ -990,7 +1029,7 @@ fn try_unseal(pamh: &Pam, user: &str) -> UnsealAttempt {
         service,
     }) {
         Ok(Response::PasswordUnsealed { secret, kind }) => {
-            UnsealAttempt::Delivered(release_secret(pamh, user, &secret, kind, false))
+            UnsealAttempt::Delivered(release_secret(pamh, user, &secret, kind))
         }
         Ok(Response::UnsealUnavailable { .. }) => UnsealAttempt::Unavailable,
         _ => UnsealAttempt::Failed,
@@ -1009,10 +1048,9 @@ fn try_unseal(pamh: &Pam, user: &str) -> UnsealAttempt {
 /// someone states which of the two it is.
 fn code_for(delivered: Released) -> PamError {
     match delivered {
-        Released::AuthtokSet
-        | Released::WalletStarted
-        | Released::WalletKeyStashed
-        | Released::TokenStashed => PamError::SUCCESS,
+        Released::AuthtokSet | Released::WalletStarted | Released::TokenStashed => {
+            PamError::SUCCESS
+        }
         Released::Failed => PamError::IGNORE,
     }
 }
@@ -1026,9 +1064,6 @@ enum Released {
     AuthtokSet,
     /// The KDE wallet daemon was started with the wallet key.
     WalletStarted,
-    /// The session was not ready for the wallet daemon yet; the key was
-    /// stashed for `open_session` to start it once it is.
-    WalletKeyStashed,
     /// A GNOME keyring token was stashed for `open_session` to deliver.
     TokenStashed,
     Failed,
@@ -1039,18 +1074,15 @@ enum Released {
 /// The kinds are not interchangeable. A login password becomes `PAM_AUTHTOK`,
 /// which `pam_gnome_keyring` reads. A KDE wallet key would be meaningless as an
 /// `AUTHTOK`: `pam_kwallet5` would run PBKDF2 over it a second time and hand
-/// `ksecretd` the wrong bytes; it goes straight to `ksecretd` on its startup
-/// pipe when `/run/user/<uid>` already exists, or is stashed in PAM data for
-/// `open_session` to deliver once it does. A GNOME keyring token is not the
-/// Unix password, so it must never sit where `pam_unix` might read it; it is
-/// stashed in PAM data the same way and `open_session` sends it to the
-/// keyring daemon's control socket via the unlock helper.
+/// `ksecretd` the wrong bytes; it goes to `ksecretd` on its startup pipe. A
+/// GNOME keyring token is not the Unix password, so it must never sit where
+/// `pam_unix` might read it; it is stashed in PAM data and `open_session`
+/// sends it to the keyring daemon's control socket via the unlock helper.
 fn release_secret(
     pamh: &Pam,
     user: &str,
     secret: &irlume_common::SecretBytes,
     kind: irlume_common::KeyringSecretKind,
-    defer_wallet: bool,
 ) -> Released {
     use irlume_common::KeyringSecretKind as K;
     match kind {
@@ -1074,29 +1106,13 @@ fn release_secret(
         }
         K::KdeWalletKey => match hand_key_to_wallet_daemon(pamh, user, secret.expose()) {
             WalletHandoff::Started => Released::WalletStarted,
-            // `/run/user/<uid>` did not exist yet: stash the key rather than
-            // lose it, so `open_session`'s `reseal` line can start the daemon
-            // once the session (and that directory) exist. Only the `keyring`
-            // path defers: it never decides the login, so a stash no session
-            // line picks up changes nothing. The `unseal` path's result
-            // decides the login, and a stack without a `reseal` session line
-            // (the NixOS module) would turn a stash into a face login with a
-            // locked wallet, so it keeps failing to the password as before.
-            WalletHandoff::NotReady if defer_wallet => {
-                if pamh
-                    .send_secret(
-                        KWALLET_KEY_STASH_KEY,
-                        pamsm::PamSecretBytes::new(secret.expose().to_vec()),
-                    )
-                    .is_ok()
-                {
-                    Released::WalletKeyStashed
-                } else {
-                    Released::Failed
-                }
-            }
-            WalletHandoff::NotReady => Released::Failed,
-            WalletHandoff::Failed => Released::Failed,
+            // Never stashed here: the face `unseal` path's result decides the
+            // login, and a stack without a `reseal` session line (the NixOS
+            // module) would turn a stash into a face login with a locked
+            // wallet. A session that is not ready yet falls to the password
+            // like any other failure. Only the fingerprint `keyring` line,
+            // whose result decides nothing, defers the key to `open_session`.
+            WalletHandoff::NotReady | WalletHandoff::Failed => Released::Failed,
         },
         K::GnomeKeyringToken => {
             if pamh
@@ -1125,8 +1141,21 @@ enum WalletHandoff {
     /// [`SESSION_NOT_READY_EXIT`]: irlume_common::kwallet_wire::SESSION_NOT_READY_EXIT
     NotReady,
     /// Anything else: missing helper, spawn failure, a non-zero exit that is
-    /// not the not-ready status, or a malformed reply.
+    /// not the not-ready status, or a malformed reply. Also a daemon already
+    /// named in `PAM_KWALLET5_LOGIN`, which this attempt leaves alone.
     Failed,
+}
+
+/// Whether `PAM_KWALLET5_LOGIN` in the PAM environment already names a wallet
+/// daemon for this login: the variable `pam_kwallet5` checks before it starts
+/// one, and the one [`hand_key_to_wallet_daemon`] exports. `pam_kwallet5`
+/// also falls back to the process environment, which a greeter does not
+/// carry, so only the PAM environment is read here.
+fn kwallet_login_set(pamh: &Pam) -> bool {
+    matches!(
+        pamh.getenv(irlume_common::kwallet_wire::LOGIN_ENV),
+        Ok(Some(sock)) if !sock.to_bytes().is_empty()
+    )
 }
 
 /// Attempt to start the KDE wallet daemon with `key`, via `irlume-kwallet-init`.
@@ -1135,11 +1164,27 @@ enum WalletHandoff {
 /// through `/proc`. On success the helper prints the socket it created, and
 /// that path is exported into the PAM environment under the name Plasma's
 /// `plasma-kwallet-pam.service` reads, so Plasma delivers the session
-/// environment to our daemon with no change on its side.
+/// environment to our daemon with no change on its side. When that variable
+/// is already set in the PAM environment, this stands down, as `pam_kwallet5`
+/// does on the same variable (see [`kwallet_login_set`]).
 fn hand_key_to_wallet_daemon(pamh: &Pam, user: &str, key: &[u8]) -> WalletHandoff {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    // pam_kwallet5's own interlock, honoured here too. A set variable means a
+    // wallet daemon already runs for this login: pam_kwallet5's session hook
+    // started it, which runs before irlume's `reseal` session line on the
+    // Arch include layout, or an earlier irlume line did. For the latter the
+    // `keyring` line already tells irlumed a wallet runs, so a warm face
+    // `unseal` ahead of it normally gets no second key; this check is the
+    // defence in depth for an irlumed that releases one anyway (one older
+    // than `have_password`, or a concurrent re-arm). A second helper would
+    // unlink that daemon's socket and leave it orphaned with the key in
+    // memory. Nothing is delivered, so on the face `unseal` path this is a
+    // failure like any other.
+    if kwallet_login_set(pamh) {
+        return WalletHandoff::Failed;
+    }
     let helper = secure_helper_path("IRLUME_KWALLET_INIT", irlume_common::KWALLET_INIT_PATH);
     if !std::path::Path::new(&helper).is_file() {
         return WalletHandoff::Failed;
@@ -1192,10 +1237,18 @@ fn hand_key_to_wallet_daemon(pamh: &Pam, user: &str, key: &[u8]) -> WalletHandof
     // setting it here stops pam_kwallet5's own hooks that run after this one
     // in the stack from launching a second wallet daemon or prompting for a
     // password a face or fingerprint login never had. On the deferred path
-    // pam_kwallet5's auth hook has already run without this variable, exactly
-    // as before this change; with no password to derive a key from, its
-    // session hook logs "open_session called without kwallet5_key" and does
-    // nothing (observed on plasma-login-manager 6.7.4 / kwallet-pam 6.7.5).
+    // pam_kwallet5's auth hook has already run without this variable, and
+    // what its session hook does depends on the stack order. Where irlume's
+    // `reseal` session line comes first (the Fedora and Debian layouts), it
+    // finds this variable and logs "we were already executed". Where
+    // irlume's line runs after it (the Arch include layout, or an openSUSE
+    // stack with pam_kwallet5 added to common-session, whose substack runs
+    // before irlume's line; the stock openSUSE stack has no pam_kwallet5
+    // line), it has already run: with no password from its own prompt it logs
+    // "open_session called without kwallet5_key" and does nothing (observed
+    // on plasma-login-manager 6.7.4 / kwallet-pam 6.7.5); with one, it started
+    // its own daemon and set this variable, and the check at the top of this
+    // function stood down.
     let entry = format!("{}={sock}", irlume_common::kwallet_wire::LOGIN_ENV);
     if pamh.putenv(&entry).is_ok() {
         WalletHandoff::Started
@@ -1230,7 +1283,6 @@ mod tests {
         for delivered in [
             Released::AuthtokSet,
             Released::WalletStarted,
-            Released::WalletKeyStashed,
             Released::TokenStashed,
         ] {
             assert_eq!(

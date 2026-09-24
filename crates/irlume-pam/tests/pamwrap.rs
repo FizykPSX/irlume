@@ -199,6 +199,10 @@ impl Harness {
             )
             .env_remove("IRLUME_CREDENTIAL_RELEASE_CHALLENGE")
             .env_remove("IRLUME_CONSENT_GESTURE")
+            // A Plasma session exports this, and pam_kwallet5 falls back to
+            // the process environment for it. The KDE wallet tests must see
+            // it only from a pam_env line in their stack or from the module.
+            .env_remove("PAM_KWALLET5_LOGIN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1639,14 +1643,22 @@ fn pamwrap_secret_stash_replaces_and_completes_without_printing() {
     }
 }
 
+/// Socket path the fake `irlume-kwallet-init` below prints on a delivery,
+/// which the module then exports as `PAM_KWALLET5_LOGIN`.
+const FAKE_KWALLET_SOCK: &str = "/tmp/fake-kwallet.sock";
+
 /// Writes a fake `IRLUME_KWALLET_INIT` helper for the KDE wallet tests below.
 /// `--read-salt` always fails (exit 3, matching the default salt-only
 /// fixture); a real key delivery reads the key off stdin, bumps `counter`,
-/// appends `<verb> <user> <bytes>` to `log`, then exits per `mode`:
+/// appends `<verb> <user> <bytes>` to `log`, then exits per `mode`. `<bytes>`
+/// is the key length, suffixed `-wrongkey` unless the key is the fake
+/// daemon's `0x42` bytes exactly.
 ///   * `cold`: the first delivery logs `notready` and exits with
 ///     `irlume_common::kwallet_wire::SESSION_NOT_READY_EXIT` (4); every later
-///     delivery logs `deliver`, prints a socket path, and exits 0.
-///   * `warm`: every delivery logs `deliver`, prints a socket path, exits 0.
+///     delivery logs `deliver`, prints [`FAKE_KWALLET_SOCK`], and exits 0.
+///   * `warm`: every delivery logs `deliver`, prints [`FAKE_KWALLET_SOCK`],
+///     exits 0.
+///   * `notready`: every delivery logs `notready` and exits 4.
 ///   * `fail`: every delivery logs `fail` and exits 1.
 fn write_kde_fake_helper(root: &Path, log: &Path, counter: &Path, mode: &str) -> PathBuf {
     let path = root.join(format!("kwallet-init-{mode}.sh"));
@@ -1656,7 +1668,9 @@ fn write_kde_fake_helper(root: &Path, log: &Path, counter: &Path, mode: &str) ->
          exit 3\n\
          fi\n\
          user=\"$1\"\n\
-         bytes=$(wc -c | tr -d ' ')\n\
+         key=$(od -An -v -tx1 | tr -d ' \\n')\n\
+         bytes=$((${{#key}} / 2))\n\
+         [ \"$key\" = '{expected}' ] || bytes=\"$bytes-wrongkey\"\n\
          count=0\n\
          [ -f '{counter}' ] && count=$(cat '{counter}')\n\
          count=$((count + 1))\n\
@@ -1668,13 +1682,17 @@ fn write_kde_fake_helper(root: &Path, log: &Path, counter: &Path, mode: &str) ->
          exit 4\n\
          fi\n\
          echo \"deliver $user $bytes\" >> '{log}'\n\
-         echo /tmp/fake-kwallet.sock\n\
+         echo {sock}\n\
          exit 0\n\
          ;;\n\
          warm)\n\
          echo \"deliver $user $bytes\" >> '{log}'\n\
-         echo /tmp/fake-kwallet.sock\n\
+         echo {sock}\n\
          exit 0\n\
+         ;;\n\
+         notready)\n\
+         echo \"notready $user $bytes\" >> '{log}'\n\
+         exit 4\n\
          ;;\n\
          fail)\n\
          echo \"fail $user $bytes\" >> '{log}'\n\
@@ -1684,6 +1702,8 @@ fn write_kde_fake_helper(root: &Path, log: &Path, counter: &Path, mode: &str) ->
         counter = counter.display(),
         mode = mode,
         log = log.display(),
+        sock = FAKE_KWALLET_SOCK,
+        expected = "42".repeat(irlume_common::kwallet_wire::KEY_LEN),
     );
     std::fs::write(&path, body).unwrap();
     use std::os::unix::fs::PermissionsExt as _;
@@ -1693,8 +1713,11 @@ fn write_kde_fake_helper(root: &Path, log: &Path, counter: &Path, mode: &str) ->
 
 /// Writes the `irlume-kwallet` service (AUTH `keyring` line plus a `session
 /// ... reseal` line) and the fake daemon answering `UnsealKeyring` with a
-/// 56-byte `KdeWalletKey`, shared by the three cold/warm/fail tests below.
-fn kde_wallet_service(h: &Harness) {
+/// 56-byte `KdeWalletKey`, shared by the `keyring` tests below. `earlier`
+/// session lines go ahead of the `reseal` line. A last pam_exec line fails
+/// the session unless `PAM_KWALLET5_LOGIN` in the PAM environment is
+/// `login_env`, or unset for `None`.
+fn kde_wallet_service(h: &Harness, earlier: &[String], login_env: Option<&str>) {
     serve(&h.socket, |req| match req {
         Request::UnsealKeyring { .. } => Response::PasswordUnsealed {
             secret: irlume_common::SecretBytes::new(vec![
@@ -1705,14 +1728,38 @@ fn kde_wallet_service(h: &Harness) {
         },
         _ => Response::Error("unexpected request".into()),
     });
-    h.write_service(
-        "irlume-kwallet",
-        &[
-            h.auth_line("optional", "keyring"),
-            "auth required pam_permit.so".into(),
-            format!("session optional {} reseal", h.module.display()),
-        ],
-    );
+    let check = h.root.join("check-kwallet-env.sh");
+    let test = match login_env {
+        Some(sock) => format!("[ \"$PAM_KWALLET5_LOGIN\" = '{sock}' ]"),
+        None => "[ -z \"$PAM_KWALLET5_LOGIN\" ]".into(),
+    };
+    std::fs::write(&check, format!("#!/bin/sh\n{test}\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&check, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut lines = vec![
+        h.auth_line("optional", "keyring"),
+        "auth required pam_permit.so".into(),
+    ];
+    lines.extend_from_slice(earlier);
+    lines.extend([
+        format!("session optional {} reseal", h.module.display()),
+        "session required pam_permit.so".into(),
+        format!("session required pam_exec.so quiet {}", check.display()),
+    ]);
+    h.write_service("irlume-kwallet", &lines);
+}
+
+/// Writes a pam_env config that sets `PAM_KWALLET5_LOGIN` to `value` and
+/// returns the session line reading it. An empty `value` unsets the variable
+/// instead: pam_env removes a variable whose `DEFAULT=` is empty.
+fn kwallet_env_line(h: &Harness, value: &str) -> String {
+    let conf = h.root.join("kwallet-env.conf");
+    std::fs::write(&conf, format!("PAM_KWALLET5_LOGIN DEFAULT={value}\n")).unwrap();
+    format!(
+        "session required pam_env.so readenv=0 conffile={}",
+        conf.display()
+    )
 }
 
 /// Cold boot: `irlume-kwallet-init` refuses to run before `/run/user/<uid>`
@@ -1725,7 +1772,7 @@ fn pamwrap_kde_wallet_cold_boot_defers_to_session() {
     let Some(mut h) = Harness::try_new("kwallet-cold") else {
         return;
     };
-    kde_wallet_service(&h);
+    kde_wallet_service(&h, &[], Some(FAKE_KWALLET_SOCK));
 
     let log = h.root.join("deliveries.log");
     let counter = h.root.join("deliveries.count");
@@ -1748,7 +1795,10 @@ fn pamwrap_kde_wallet_cold_boot_defers_to_session() {
         "",
         None,
     );
-    assert!(ok, "auth + session must pass: {out}");
+    assert!(
+        ok,
+        "auth + session must pass and export PAM_KWALLET5_LOGIN: {out}"
+    );
     assert_eq!(
         std::fs::read_to_string(&log).unwrap(),
         "notready tester 56\ndeliver tester 56\n",
@@ -1757,15 +1807,16 @@ fn pamwrap_kde_wallet_cold_boot_defers_to_session() {
 }
 
 /// Warm login: `/run/user/<uid>` already exists, so the AUTH `keyring` line
-/// starts the wallet directly and the session's `reseal` line has nothing
-/// left to do.
+/// starts the wallet directly and exports `PAM_KWALLET5_LOGIN`, on which the
+/// session's `reseal` line stands down. The next test checks that no stash
+/// is left behind either.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_kde_wallet_warm_login_starts_in_auth_only() {
     let Some(mut h) = Harness::try_new("kwallet-warm") else {
         return;
     };
-    kde_wallet_service(&h);
+    kde_wallet_service(&h, &[], Some(FAKE_KWALLET_SOCK));
 
     let log = h.root.join("deliveries.log");
     let counter = h.root.join("deliveries.count");
@@ -1777,23 +1828,61 @@ fn pamwrap_kde_wallet_warm_login_starts_in_auth_only() {
         "",
         None,
     );
-    assert!(ok, "auth + session must pass: {out}");
+    assert!(
+        ok,
+        "auth + session must pass and export PAM_KWALLET5_LOGIN: {out}"
+    );
     assert_eq!(
         std::fs::read_to_string(&log).unwrap(),
         "deliver tester 56\n",
-        "auth starts the wallet directly; no stash for the session to retry"
+        "auth starts the wallet directly and the session starts no second one"
+    );
+}
+
+/// Warm login with `PAM_KWALLET5_LOGIN` unset again ahead of the session's
+/// `reseal` line. The variable the auth phase exports would make that line
+/// stand down, which hides a key the `keyring` line stashed although it had
+/// already started the wallet. With the variable unset, such a stash is
+/// delivered a second time and fails the log and environment checks.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_kde_wallet_warm_login_leaves_no_stash() {
+    let Some(mut h) = Harness::try_new("kwallet-warm-unset") else {
+        return;
+    };
+    kde_wallet_service(&h, &[kwallet_env_line(&h, "")], None);
+
+    let log = h.root.join("deliveries.log");
+    let counter = h.root.join("deliveries.count");
+    h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "warm"));
+
+    let (ok, out) = h.run(
+        "irlume-kwallet",
+        &["authenticate", "open_session"],
+        "",
+        None,
+    );
+    assert!(
+        ok,
+        "auth + session must pass and leave PAM_KWALLET5_LOGIN unset: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "deliver tester 56\n",
+        "auth starts the wallet directly and stashes nothing for the session"
     );
 }
 
 /// A wallet-init helper that fails outright (not the not-ready exit code)
-/// must not be retried from the session, and must not fail the login.
+/// must not be retried from the session, must not fail the login, and must
+/// leave `PAM_KWALLET5_LOGIN` unset.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_kde_wallet_helper_failure_is_not_retried() {
     let Some(mut h) = Harness::try_new("kwallet-fail") else {
         return;
     };
-    kde_wallet_service(&h);
+    kde_wallet_service(&h, &[], None);
 
     let log = h.root.join("deliveries.log");
     let counter = h.root.join("deliveries.count");
@@ -1813,6 +1902,85 @@ fn pamwrap_kde_wallet_helper_failure_is_not_retried() {
         std::fs::read_to_string(&log).unwrap(),
         "fail tester 56\n",
         "a hard failure must not be retried from the session"
+    );
+}
+
+/// The stash is delivered at most once. A helper that keeps reporting the
+/// session not ready never exports `PAM_KWALLET5_LOGIN`, so that interlock
+/// cannot stop a later attempt here; only emptying the stash when the first
+/// `open_session` reads it does. A second `open_session` on the same handle
+/// must find nothing to deliver.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_kde_wallet_stash_is_delivered_once() {
+    let Some(mut h) = Harness::try_new("kwallet-once") else {
+        return;
+    };
+    kde_wallet_service(&h, &[], None);
+
+    let log = h.root.join("deliveries.log");
+    let counter = h.root.join("deliveries.count");
+    h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "notready"));
+
+    let (ok, out) = h.run(
+        "irlume-kwallet",
+        &[
+            "authenticate",
+            "open_session",
+            "close_session",
+            "open_session",
+        ],
+        "",
+        None,
+    );
+    assert!(
+        ok,
+        "a session that is never ready must not fail the login: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "notready tester 56\nnotready tester 56\n",
+        "auth stashes, the first open_session retries once, the second finds the stash empty"
+    );
+}
+
+/// Arch include layout: irlume's `reseal` session line is appended after
+/// pam_kwallet5's, and pam_kwallet5 may already have started its own daemon
+/// from a password typed at its prompt, which sets `PAM_KWALLET5_LOGIN`. A
+/// pam_env line stands in for it. irlume stands down on that variable, as
+/// pam_kwallet5 does: no second helper run, and the earlier socket stays the
+/// one exported.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_kde_wallet_session_stands_down_for_a_running_wallet() {
+    let Some(mut h) = Harness::try_new("kwallet-running") else {
+        return;
+    };
+    const EARLIER_SOCK: &str = "/tmp/earlier-kwallet.sock";
+    kde_wallet_service(
+        &h,
+        &[kwallet_env_line(&h, EARLIER_SOCK)],
+        Some(EARLIER_SOCK),
+    );
+
+    let log = h.root.join("deliveries.log");
+    let counter = h.root.join("deliveries.count");
+    h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "cold"));
+
+    let (ok, out) = h.run(
+        "irlume-kwallet",
+        &["authenticate", "open_session"],
+        "",
+        None,
+    );
+    assert!(
+        ok,
+        "auth + session must pass and keep the earlier PAM_KWALLET5_LOGIN: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "notready tester 56\n",
+        "a stash must not start a second daemon over the one PAM_KWALLET5_LOGIN names"
     );
 }
 
@@ -1883,6 +2051,83 @@ fn pamwrap_kde_wallet_face_unseal_is_not_deferred() {
         std::fs::read_to_string(&log).unwrap_or_default(),
         "notready tester 56\n",
         "the unseal path never stashes, so open_session has nothing to deliver"
+    );
+}
+
+/// A warm face `unseal` starts the wallet during auth and sets
+/// `PAM_KWALLET5_LOGIN`. The `keyring` line past the landing must then tell
+/// irlumed a wallet already runs (`have_password`), so a real irlumed
+/// unseals nothing a second time. The mock releases the key anyway, as an
+/// irlumed older than that flag would, and the line must still leave the
+/// running wallet alone: no second helper run, which would unlink the first
+/// daemon's socket and orphan it, and no stash either. The session unsets
+/// the variable ahead of its `reseal` line, so a stash would show up there
+/// as a second delivery instead of being hidden by the same interlock.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_kde_wallet_face_then_keyring_starts_one_daemon() {
+    let Some(mut h) = Harness::try_new("kwallet-face-keyring") else {
+        return;
+    };
+    let reqs = serve(&h.socket, |req| match req {
+        Request::UnsealPassword { .. } | Request::UnsealKeyring { .. } => {
+            Response::PasswordUnsealed {
+                secret: irlume_common::SecretBytes::new(vec![
+                    0x42;
+                    irlume_common::kwallet_wire::KEY_LEN
+                ]),
+                kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+            }
+        }
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    let log = h.root.join("deliveries.log");
+    let counter = h.root.join("deliveries.count");
+    h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "warm"));
+
+    h.write_service(
+        "irlume-face-keyring",
+        &[
+            h.auth_line("[success=1 default=ignore]", "unseal"),
+            "auth requisite pam_deny.so".into(),
+            "auth required pam_permit.so".into(),
+            h.auth_line("optional", "keyring"),
+            kwallet_env_line(&h, ""),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ],
+    );
+    let (ok, out) = h.run(
+        "irlume-face-keyring",
+        &["authenticate", "open_session"],
+        "\n",
+        None,
+    );
+    assert!(
+        ok,
+        "the face line must carry the login past pam_deny, and the session must open: {out}"
+    );
+    let keyring_reqs: Vec<bool> = reqs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| match r {
+            Request::UnsealKeyring { have_password, .. } => Some(*have_password),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        keyring_reqs,
+        [true, true],
+        "the keyring line must have run, or the single delivery below proves nothing, \
+         and must report the running wallet as have_password (the second request is \
+         the session's GNOME token lookup, which always sends true)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap_or_default(),
+        "deliver tester 56\n",
+        "the keyring line must leave the wallet the face line started alone and stash nothing"
     );
 }
 
