@@ -27,9 +27,12 @@
 //!
 //! The tests are `#[ignore]`d so a bare `cargo test` stays green on boxes
 //! without the tools; CI (and anyone with them installed) runs
-//! `cargo test -p irlume-pam -- --include-ignored`. Each test also returns
-//! early with a note if the tools are missing, so `--include-ignored` is safe
-//! everywhere.
+//! `cargo test -p irlume-pam -- --include-ignored --test-threads=1`. One
+//! at a time: pam_wrapper 1.1.5 (Ubuntu 24.04) can give two pamtester runs
+//! that start together the same config directory, and one of them then
+//! fails (see `write_kde_fake_helper`). Most tests also return early with
+//! a note if the tools are missing; the COSMIC ones in `pamwrap/cosmic.rs`
+//! fail instead.
 //!
 //! What pamtester cannot drive: `pam_sm_setcred` (pamtester has no `setcred`
 //! operation; the module's is a constant `SUCCESS` one-liner) and the
@@ -1660,10 +1663,22 @@ const FAKE_KWALLET_SOCK: &str = "/tmp/fake-kwallet.sock";
 ///     exits 0.
 ///   * `notready`: every delivery logs `notready` and exits 4.
 ///   * `fail`: every delivery logs `fail` and exits 1.
+///
+/// The script drops pam_wrapper from its environment before it runs any
+/// command. The module passes pamtester's `LD_PRELOAD` on to the helper, so
+/// `od`, `tr` and `cat` would each load pam_wrapper too. pam_wrapper 1.1.5,
+/// the version Ubuntu 24.04 ships, gives each process a `/tmp/pam.<letter>`
+/// directory by a check-then-create that two processes starting together can
+/// both pass, and `od` and `tr` start together. When they get the same
+/// directory, `od` can exit and delete it while `tr` is still setting up, and
+/// `tr` then exits 1 before its `main` runs, so the key reads as 0 bytes. A
+/// real login preloads nothing, so no test here depends on pam_wrapper
+/// reaching the helper's commands.
 fn write_kde_fake_helper(root: &Path, log: &Path, counter: &Path, mode: &str) -> PathBuf {
     let path = root.join(format!("kwallet-init-{mode}.sh"));
     let body = format!(
         "#!/bin/sh\n\
+         unset LD_PRELOAD PAM_WRAPPER\n\
          if [ \"$1\" = --read-salt ]; then\n\
          exit 3\n\
          fi\n\
@@ -1760,6 +1775,69 @@ fn kwallet_env_line(h: &Harness, value: &str) -> String {
         "session required pam_env.so readenv=0 conffile={}",
         conf.display()
     )
+}
+
+/// The fake helper keeps pam_wrapper to its own shell (see
+/// [`write_kde_fake_helper`]). This runs it as the module does, under the
+/// harness's pam_wrapper environment, with pam_wrapper's debug log on, in
+/// which every process that loads pam_wrapper logs its setup with its pid.
+/// The key-read race this guards against shows on pam_wrapper 1.1.5 and is
+/// rare even there, so the delivery tests below catch it only now and then;
+/// this check fails whenever a command the helper runs loads pam_wrapper, on
+/// any version.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_kde_wallet_fake_helper_commands_skip_pam_wrapper() {
+    let Some(h) = Harness::try_new("kwallet-fixture") else {
+        return;
+    };
+    let log = h.root.join("deliveries.log");
+    let counter = h.root.join("deliveries.count");
+    let helper = write_kde_fake_helper(&h.root, &log, &counter, "warm");
+    // An existing counter makes the helper read it with `cat`, so every
+    // command the helper can run runs here.
+    std::fs::write(&counter, "0\n").unwrap();
+
+    let mut child = Command::new(&helper)
+        .arg("tester")
+        .env("LD_PRELOAD", &h.wrapper)
+        .env("PAM_WRAPPER", "1")
+        .env("PAM_WRAPPER_SERVICE_DIR", &h.service_dir)
+        .env("PAM_WRAPPER_DEBUGLEVEL", "2")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the fake helper");
+    let own = format!(" ({})]", child.id());
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&[0x42; irlume_common::kwallet_wire::KEY_LEN])
+        .ok();
+    let out = child.wait_with_output().expect("wait for the fake helper");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let setups: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("Initialize pam_wrapper"))
+        .collect();
+    assert!(
+        setups.iter().any(|line| line.contains(&own)),
+        "the debug log must show the helper's own shell loading pam_wrapper, \
+         or the check below proves nothing: {stderr}"
+    );
+    assert_eq!(
+        setups.len(),
+        1,
+        "no command the helper runs may load pam_wrapper: {stderr}"
+    );
+    assert!(out.status.success(), "the helper must deliver: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "deliver tester 56\n",
+        "the helper must read the whole key"
+    );
 }
 
 /// Cold boot: `irlume-kwallet-init` refuses to run before `/run/user/<uid>`
